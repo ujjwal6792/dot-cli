@@ -7,9 +7,11 @@ import shutil
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ('dot', 'contract.py', 'engine.json', 'gitconfig.py', 'intent.py', 'init.py',
           'layout.py', 'migration.py', 'picker.py', 'preview.py', 'scope.py', 'skills.py',
-          'state.py', 'ui.sh', 'tracking.py', 'file_metadata.py', 'packages.py', 'updates.py')
-PUBLIC = ('README.md', 'bootstrap.sh', 'scripts/create-private-repo.sh',
-           'skills/setup-dots/SKILL.md', 'skills/dot/SKILL.md', 'docs/private-contract.md')
+           'state.py', 'ui.sh', 'tracking.py', 'file_metadata.py', 'packages.py', 'updates.py',
+           'install_state.py')
+PUBLIC = ('README.md', 'bootstrap.sh', 'install.sh', 'scripts/create-private-repo.sh',
+           'skills/setup-dots/SKILL.md', 'skills/dot/SKILL.md', 'docs/private-contract.md',
+           'docs/install-record-contract.md')
 BUILD = ('scripts/export-public.py', 'scripts/build-release.py', 'scripts/check-release.py')
 WORKFLOWS = ('.github/workflows/release.yml',)
 GO = ('go.mod', 'go.sum', 'client.go', 'json.go', 'model.go', 'packages.go', 'cmd/dot-browser/main.go')

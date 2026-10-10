@@ -58,7 +58,7 @@ def build(version, output, binaries):
             shutil.copy2(target, output / browser_name)
             browser_checksums.append(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + browser_name)
             (stage / 'release.json').write_text(json.dumps({
-                'version': version, 'platform': platform, 'engine_api': 1,
+                'format': 2, 'version': version, 'platform': platform, 'engine_api': 1,
                 'prebuilt_input': bool(binaries)}, sort_keys=True) + '\n')
             name = f'dot-cli-{version}-{platform}.tar.gz'
             archive = output / name
