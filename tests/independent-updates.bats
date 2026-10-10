@@ -423,27 +423,22 @@ PY
   cat > "$BATS_TEST_TMPDIR/review-bin/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-has_checkout=no; has_status=no; source_after_c=no; status_after_source=no; previous_arg=''
+has_checkout=no; has_status=no; has_porcelain=no; has_untracked=no; has_ignored=no
 for arg in "$@"; do
   [ "$arg" != "$REVIEW_SOURCE" ] || has_checkout=yes
   [ "$arg" != status ] || has_status=yes
-  if [ "$arg" = "$REVIEW_SOURCE" ]; then
-    [ "$previous_arg" != -C ] || source_after_c=yes
-  fi
-  if [ "$previous_arg" = "$REVIEW_SOURCE" ] && [ "$arg" = status ]; then
-    status_after_source=yes
-  fi
-  previous_arg=$arg
+  [ "$arg" != --porcelain=v1 ] || has_porcelain=yes
+  [ "$arg" != --untracked-files=all ] || has_untracked=yes
+  [ "$arg" != --ignored ] || has_ignored=yes
 done
-printf 'shim_call checkout_arg=%s status_arg=%s source_after_c=%s status_after_source=%s\n' \
-  "$has_checkout" "$has_status" "$source_after_c" "$status_after_source" >> "$REVIEW_DEBUG"
 "$REAL_GIT" "$@"
 # The second private status is after candidate preview and before revalidation.
-if [[ " $* " == *" -C $REVIEW_SOURCE status "* ]]; then
+if [ "$has_checkout" = yes ] && [ "$has_status" = yes ] &&
+   [ "$has_porcelain" = yes ] && [ "$has_untracked" = yes ] && [ "$has_ignored" = yes ]; then
   count=0
   [ ! -f "$REVIEW_COUNTER" ] || count=$(cat "$REVIEW_COUNTER")
   count=$((count + 1)); printf '%s\n' "$count" > "$REVIEW_COUNTER"
-  printf 'status_match=1 count=%s change=%s\n' "$count" "$REVIEW_CHANGE" >> "$REVIEW_DEBUG"
+  printf 'clean_status_match=1 count=%s change=%s\n' "$count" "$REVIEW_CHANGE" >> "$REVIEW_DEBUG"
   if [ "$count" = 2 ]; then
     case "$REVIEW_CHANGE" in
       bytes) printf 'concurrent target\n' > "$HOME/.config/example.conf"; printf 'mutation=bytes\n' >> "$REVIEW_DEBUG" ;;
