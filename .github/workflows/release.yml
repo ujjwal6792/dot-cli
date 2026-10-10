@@ -140,6 +140,8 @@ jobs:
         with:
           name: verified-release-assets
           path: candidate
+      - name: Restore browser executable modes after artifact download
+        run: python3 scripts/restore-release-executables.py candidate
       - name: Install isolated smoke-test tools
         run: brew install bats-core chezmoi gum tmux zsh
       - name: Verify all archives and exercise the extracted macOS package
