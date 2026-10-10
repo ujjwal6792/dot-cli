@@ -423,6 +423,12 @@ PY
   cat > "$BATS_TEST_TMPDIR/review-bin/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+has_checkout=no; has_status=no
+for arg in "$@"; do
+  [ "$arg" != "$REVIEW_SOURCE" ] || has_checkout=yes
+  [ "$arg" != status ] || has_status=yes
+done
+printf 'shim_call checkout_arg=%s status_arg=%s\n' "$has_checkout" "$has_status" >> "$REVIEW_DEBUG"
 "$REAL_GIT" "$@"
 # The second private status is after candidate preview and before revalidation.
 if [[ " $* " == *" -C $REVIEW_SOURCE status "* ]]; then
@@ -444,19 +450,24 @@ SH
   chmod +x "$BATS_TEST_TMPDIR/review-bin/git"
   for change in bytes mode approval; do
     : > "$REVIEW_DEBUG"
+    rm -f "$REVIEW_COUNTER.target" "$REVIEW_COUNTER.approval"
     printf 'old\n' > "$HOME/.config/example.conf"
     chmod 644 "$HOME/.config/example.conf"
     cp "$BATS_TEST_TMPDIR/approval-before" "$HOME/.local/state/dot/adoption.json"
     printf '0\n' > "$REVIEW_COUNTER"
     run env PATH="$BATS_TEST_TMPDIR/review-bin:$PATH" REVIEW_CHANGE="$change" "$ENGINE/dot" pull --yes
+    if [ ! -f "$REVIEW_COUNTER.target" ]; then
+      printf '[DEBUG-rc2] fixture_mutated=no change=%s pull_rc=%s\n' "$change" "$status" >&2
+      cat "$REVIEW_DEBUG" >&2
+    fi
     if [ "$status" -eq 0 ]; then
       printf '[DEBUG-rc2] pull_rc=%s change=%s target_exists=%s approval_sha256=%s\n' \
         "$status" "$change" "$(test -e "$HOME/.config/example.conf" && echo yes || echo no)" \
         "$(shasum -a 256 "$HOME/.local/state/dot/adoption.json" | cut -d ' ' -f 1)" >&2
       cat "$REVIEW_DEBUG" >&2
     fi
-    [ "$status" -ne 0 ]
     [ -f "$REVIEW_COUNTER.target" ]
+    [ "$status" -ne 0 ]
     [ "$before" = "$(git -C "$SOURCE" rev-parse HEAD)" ]
     [ "$public" = "$(git -C "$ENGINE/../.." rev-parse HEAD)" ]
     cmp "$REVIEW_COUNTER.target" "$HOME/.config/example.conf"
