@@ -423,12 +423,20 @@ PY
   cat > "$BATS_TEST_TMPDIR/review-bin/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
-has_checkout=no; has_status=no
+has_checkout=no; has_status=no; source_after_c=no; status_after_source=no; previous_arg=''
 for arg in "$@"; do
   [ "$arg" != "$REVIEW_SOURCE" ] || has_checkout=yes
   [ "$arg" != status ] || has_status=yes
+  if [ "$arg" = "$REVIEW_SOURCE" ]; then
+    [ "$previous_arg" != -C ] || source_after_c=yes
+  fi
+  if [ "$previous_arg" = "$REVIEW_SOURCE" ] && [ "$arg" = status ]; then
+    status_after_source=yes
+  fi
+  previous_arg=$arg
 done
-printf 'shim_call checkout_arg=%s status_arg=%s\n' "$has_checkout" "$has_status" >> "$REVIEW_DEBUG"
+printf 'shim_call checkout_arg=%s status_arg=%s source_after_c=%s status_after_source=%s\n' \
+  "$has_checkout" "$has_status" "$source_after_c" "$status_after_source" >> "$REVIEW_DEBUG"
 "$REAL_GIT" "$@"
 # The second private status is after candidate preview and before revalidation.
 if [[ " $* " == *" -C $REVIEW_SOURCE status "* ]]; then
