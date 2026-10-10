@@ -11,6 +11,8 @@ setup() {
   ln -s /bin/bash "$MINIMAL_BIN/bash"
   ln -s /usr/bin/dirname "$MINIMAL_BIN/dirname"
   ln -s /usr/bin/sed "$MINIMAL_BIN/sed"
+  ln -s /bin/cat "$MINIMAL_BIN/cat"
+  ln -s /usr/bin/readlink "$MINIMAL_BIN/readlink"
   cp "$REPO/tools/dot/dot" "$TMP/dot"
 }
 
