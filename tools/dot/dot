@@ -7,8 +7,64 @@ while [ -h "$SOURCE" ]; do
   case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
 done
 TOOL_DIR="${DOT_ENGINE:-$(cd -P "$(dirname "$SOURCE")" && pwd)}"
+case "${1:-}" in
+  --help|help)
+    cat <<'EOF'
+dot — independent configuration CLI
+usage: dot init [--check] [--rounds] [--profile personal|work]
+       dot --version | dot --help
+       dot status | diff | pull | self-update | browse | …
+
+Help and version do not require Python or private configuration. `dot init
+--check` performs read-only prerequisite and tracker detection.
+EOF
+    exit 0 ;;
+  --version|version)
+    echo 'dot public CLI (development build)'
+    exit 0 ;;
+esac
 if [ "${1:-}" = init ]; then
   shift
+  if [ "${1:-}" = --check ]; then
+    if command -v python3 >/dev/null 2>&1 && [ -n "${DOT_SOURCE:-}" ] && [ -n "${DOT_CONFIG:-}" ]; then
+      exec python3 -B "$TOOL_DIR/init.py" --check
+    fi
+    echo "Public engine: $TOOL_DIR"
+    if command -v python3 >/dev/null 2>&1; then
+      python_version="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || true)"
+      case "$python_version" in 3.1[1-9]*|3.[2-9]*) echo "Python 3.11+: available ($python_version)" ;; *) echo "Python 3.11+: unavailable or too old${python_version:+ ($python_version)}" ;; esac
+    else
+      echo 'Python 3.11+: missing; install it using your platform package manager, then rerun dot init. No dependency was installed.'
+    fi
+    for requirement in bash git curl gh python3 chezmoi gum; do
+      if command -v "$requirement" >/dev/null 2>&1; then
+        printf 'Requirement %s: available\n' "$requirement"
+      else
+        printf 'Requirement %s: missing (review/install through dot init only)\n' "$requirement"
+      fi
+    done
+    if [ -n "${DOT_SOURCE:-}" ] && [ -d "$DOT_SOURCE" ]; then
+      echo "Private checkout: $DOT_SOURCE"
+    else
+      echo 'Private checkout: not configured; dot init can offer retrieval only after explicit consent.'
+    fi
+    if [ -n "${DOT_CONFIG:-}" ] && [ -f "$DOT_CONFIG" ]; then
+      echo "Tracker config: $DOT_CONFIG (requires identity/compatibility validation)"
+    else
+      echo 'Tracker: not configured; dot init can offer creation only after separate explicit consent.'
+    fi
+    record="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot/install.json"
+    if [ -f "$record" ]; then echo "Install record: $record"; else echo 'Install record: not present'; fi
+    exit 0
+  fi
+  if ! command -v python3 >/dev/null 2>&1; then
+    echo 'dot init requires Python 3.11+ (tomllib). Install Python with your platform package manager, then rerun dot init. The public CLI bootstrap did not install dependencies.' >&2
+    exit 1
+  fi
+  if [ -z "${DOT_SOURCE:-}" ] || [ -z "${DOT_CONFIG:-}" ]; then
+    echo 'dot init needs a reviewed private checkout and tracker path. Run dot init --check for read-only detection; no repository was retrieved or created.' >&2
+    exit 1
+  fi
   exec python3 -B "$TOOL_DIR/init.py" "$@"
 fi
 # Migration validates the recorded legacy references itself: the normal split

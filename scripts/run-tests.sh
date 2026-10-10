@@ -48,6 +48,9 @@ case "$PART" in
       tests/installed-browser-update.bats tests/init.bats
     python3 tests/tracking-cli-test.py
     ;;
+  init-preflight)
+    run_bats tests/init-preflight.bats
+    ;;
   packaging)
     run_bats tests/public-export.bats tests/release-packaging.bats
     ;;
