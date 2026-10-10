@@ -1,0 +1,39 @@
+name: Public tests
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+permissions:
+  contents: read
+jobs:
+  test:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    env:
+      TERM: xterm-256color
+      HOMEBREW_NO_AUTO_UPDATE: '1'
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/dot/browser/go.mod
+          cache-dependency-path: tools/dot/browser/go.sum
+      - name: Install check tools
+        run: brew install bats-core chezmoi gitleaks gum tmux zsh
+      - name: Secret scan (tree only; history scanned before push by author)
+        run: gitleaks dir --redact .
+      - name: Python checks
+        run: bash scripts/run-tests.sh python
+      - name: Go browser tests
+        run: bash scripts/run-tests.sh go
+      - name: Contract seam
+        run: bash scripts/run-tests.sh contract
+      - name: CLI partitions
+        run: bash scripts/run-tests.sh cli
+      - name: Packaging boundary
+        run: bash scripts/run-tests.sh packaging

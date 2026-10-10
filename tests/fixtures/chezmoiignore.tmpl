@@ -1,0 +1,34 @@
+{{ $repo := .chezmoi.sourceDir -}}
+{{ $engine := env "DOT_ENGINE" -}}
+{{ if hasKey . "dotEngine" -}}
+{{ $engine = .dotEngine -}}
+{{ if not $engine -}}{{ fail "explicit public dotEngine is required" }}{{ end -}}
+{{ end -}}
+{{ if and (not $engine) (lstat (joinPath .chezmoi.homeDir ".local/state/dot/install.json")) -}}
+{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath .chezmoi.homeDir ".local/state/dot/install.json") | trim) "True" -}}
+{{ fail "split installation requires explicit public dotEngine" }}
+{{ end -}}
+{{ end -}}
+{{ if not $engine -}}{{ fail "explicit public dotEngine is required" }}{{ end -}}
+{{ if $engine -}}
+{{ $repo = joinPath .chezmoi.sourceDir ".." -}}
+{{ $contract := output "python3" "-B" (joinPath $engine "contract.py") "check" "--engine" $engine "--source" $repo -}}
+{{ $mask := "-1" -}}
+{{ $nativeArgs := .chezmoi.args -}}
+{{ if hasKey .chezmoi.config "verbose" -}}
+{{ $nativeArgs = append $nativeArgs (printf "--verbose=%v" .chezmoi.config.verbose) -}}
+{{ end -}}
+{{ if hasKey .chezmoi.config "umask" -}}
+{{ $mask = printf "%v" .chezmoi.config.umask -}}
+{{ end -}}
+{{ output "python3" "-B" (joinPath $engine "scope.py") "ignore" .chezmoi.sourceDir .chezmoi.homeDir .chezmoi.configFile .chezmoi.os $mask "check" ($nativeArgs | toJson) }}
+{{ end -}}
+.local/state/dot/
+.local/state/dot/**
+.config/secrets.env
+.ssh/
+.ssh/**
+.aws/
+.aws/**
+.zsh_history
+.bash_history

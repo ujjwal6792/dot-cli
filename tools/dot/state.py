@@ -77,7 +77,10 @@ def secrets(root, env_file):
         text = path.read_text(errors='replace')
         keys.update(re.findall(r'(?:\$\{?|\benv[:.])([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD)[A-Z0-9_]*)', text))
         keys.update(re.findall(r'\{env:([A-Z][A-Z0-9_]*)\}', text))
-        keys.update(re.findall(r'\benv\s+"([A-Z][A-Z0-9_]*)"', text))
+        # `env` is also used for non-secret runtime paths (e.g. DOT_ENGINE).
+        # Treat only credential-shaped names as references; arbitrary env
+        # lookups must not produce false secret requirements.
+        keys.update(re.findall(r'\benv\s+"([A-Z][A-Z0-9_]*(?:KEY|TOKEN|SECRET|PASSWORD|CREDENTIAL)[A-Z0-9_]*)"', text))
     missing = sorted(key for key in keys if not values.get(key))
     for key in missing:
         print(f'secrets: MISSING {key}', file=sys.stderr)

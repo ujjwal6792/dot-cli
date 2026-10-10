@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Build review-only public archives; this script never publishes a release."""
 import argparse
+import gzip
 import hashlib
 import json
 import os
@@ -58,7 +59,7 @@ def build(version, output, binaries):
             shutil.copy2(target, output / browser_name)
             browser_checksums.append(hashlib.sha256(target.read_bytes()).hexdigest() + '  ' + browser_name)
             (stage / 'release.json').write_text(json.dumps({
-                'version': version, 'platform': platform, 'engine_api': 1,
+                'format': 2, 'version': version, 'platform': platform, 'engine_api': 1,
                 'prebuilt_input': bool(binaries)}, sort_keys=True) + '\n')
             name = f'dot-cli-{version}-{platform}.tar.gz'
             archive = output / name
@@ -68,8 +69,12 @@ def build(version, output, binaries):
                 member.mtime = 0
                 member.pax_headers = {}
                 return member
-            with tarfile.open(archive, 'w:gz') as stream:
-                stream.add(stage, arcname='dot-cli', filter=public_metadata)
+            # Set both tar metadata (above) and gzip's header timestamp so a
+            # repeated build from the same source produces byte-identical assets.
+            with archive.open('wb') as raw:
+                with gzip.GzipFile(fileobj=raw, mode='wb', filename='', mtime=0) as compressed:
+                    with tarfile.open(fileobj=compressed, mode='w') as stream:
+                        stream.add(stage, arcname='dot-cli', filter=public_metadata)
             checksums.append(hashlib.sha256(archive.read_bytes()).hexdigest() + '  ' + name)
     (output / 'SHA256SUMS').write_text('\n'.join(checksums) + '\n')
     (output / 'BROWSER_SHA256SUMS').write_text('\n'.join(browser_checksums) + '\n')
