@@ -1,0 +1,38 @@
+# ADR 0006: the old per-harness skill silos die at adoption. The canonical
+# library lives at ~/.agents/skills (dot_agents/skills here); opencode and
+# codex read it natively, and agy gets a mirror from the skills router.
+# (Gemini's dir is rewritten by the router, not removed here.)
+{{ $skills := "yes" -}}
+{{ $repo := .chezmoi.sourceDir -}}
+{{ $engine := env "DOT_ENGINE" -}}
+{{ if hasKey . "dotEngine" -}}
+{{ $engine = .dotEngine -}}
+{{ if not $engine -}}{{ fail "explicit public dotEngine is required; run compatible dot init before applying" }}{{ end -}}
+{{ end -}}
+{{ if and (not $engine) (lstat (joinPath .chezmoi.homeDir ".local/state/dot/install.json")) -}}
+{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath .chezmoi.homeDir ".local/state/dot/install.json") | trim) "True" -}}
+{{ fail "split installation requires explicit public dotEngine; run compatible dot init before applying" }}
+{{ end -}}
+{{ end -}}
+{{ if $engine -}}
+{{ $repo = joinPath .chezmoi.sourceDir ".." -}}
+{{ $contract := output "python3" "-B" (joinPath $engine "contract.py") "check" "--engine" $engine "--source" $repo -}}
+{{ else -}}
+{{ if lstat (joinPath $repo ".." "tools/dot/scope.py") -}}
+{{ $repo = joinPath $repo ".." -}}
+{{ end -}}
+{{ $engine = joinPath $repo "tools/dot" -}}
+{{ end -}}
+{{ if lstat (joinPath .chezmoi.homeDir ".local/state/dot/adoption.json") -}}
+{{ output "python3" "-B" (joinPath $engine "scope.py") "exact-removals" $repo .chezmoi.homeDir (toJson .chezmoi.args) }}
+{{ end -}}
+{{ if lstat (joinPath .chezmoi.homeDir ".local/state/dot/adoption.json") -}}
+{{ $skills = output "python3" "-B" (joinPath $engine "scope.py") "skills" $repo .chezmoi.homeDir | trim -}}
+{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath .chezmoi.homeDir ".local/state/dot/adoption.json") | trim) "True" -}}
+{{ $skills = "no" -}}
+{{ end -}}
+{{ end -}}
+{{ if eq $skills "yes" -}}
+.config/opencode/skills
+.codex/skills
+{{ end -}}

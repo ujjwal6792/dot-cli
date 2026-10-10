@@ -1,0 +1,17 @@
+#!/bin/sh
+{{ $engine := env "DOT_ENGINE" -}}
+{{ if hasKey . "dotEngine" -}}
+{{ $engine = .dotEngine -}}
+{{ if not $engine -}}{{ fail "explicit public dotEngine is required; run compatible dot init before applying" }}{{ end -}}
+{{ end -}}
+{{ if and (not $engine) (lstat (joinPath .chezmoi.homeDir ".local/state/dot/install.json")) -}}
+{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath .chezmoi.homeDir ".local/state/dot/install.json") | trim) "True" -}}
+{{ fail "split installation requires explicit public dotEngine; run compatible dot init before applying" }}
+{{ end -}}
+{{ end -}}
+{{ if $engine -}}
+python3 -B {{ joinPath $engine "contract.py" | shellQuote }} check --engine {{ $engine | shellQuote }} --source {{ joinPath .chezmoi.sourceDir ".." | shellQuote }} >/dev/null || exit 1
+exec python3 -B {{ joinPath $engine "gitconfig.py" | shellQuote }} modify {{ .chezmoi.sourceDir | shellQuote }} {{ .chezmoi.homeDir | shellQuote }} {{ .chezmoi.configFile | shellQuote }} {{ .chezmoi.os | shellQuote }} {{ .chezmoi.args | toJson | b64enc }}
+{{ else -}}
+exec python3 -B {{ joinPath .chezmoi.sourceDir ".." "tools/dot/gitconfig.py" | shellQuote }} modify {{ .chezmoi.sourceDir | shellQuote }} {{ .chezmoi.homeDir | shellQuote }} {{ .chezmoi.configFile | shellQuote }} {{ .chezmoi.os | shellQuote }} {{ .chezmoi.args | toJson | b64enc }}
+{{ end -}}
