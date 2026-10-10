@@ -423,6 +423,7 @@ PY
   cat > "$BATS_TEST_TMPDIR/review-bin/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# Parse Git global options in order; runner-added -c overrides may follow -C.
 args=("$@")
 i=0; checkout_seen=no; checkout_matches=yes; subcommand=''; command_index=0
 while [ "$i" -lt "${#args[@]}" ]; do
@@ -511,6 +512,7 @@ SH
   chmod +x "$BATS_TEST_TMPDIR/review-bin/git"
   other="$BATS_TEST_TMPDIR/other-checkout"
   mkdir -p "$other"
+  git init -q "$other"
   run env REVIEW_PROBE=1 "$BATS_TEST_TMPDIR/review-bin/git" \
     -C "$other" --work-tree "$REVIEW_SOURCE" status \
     --porcelain=v1 --untracked-files=all --ignored
