@@ -204,6 +204,7 @@ jobs:
           python3 scripts/restore-release-executables.py candidate "$VERSION"
       - name: Stage verified assets as a draft, then publish atomically
         env:
+          GH_REPOSITORY: ${{ github.repository }}
           APPROVED_VERSION: ${{ inputs.approved_version }}
           GH_TOKEN: ${{ github.token }}
         run: |
