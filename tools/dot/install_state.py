@@ -19,6 +19,11 @@ def _record_path(state_dir, name):
     directory = Path(state_dir)
     if not directory.is_absolute():
         raise ValueError('state directory must be absolute')
+    for component in (directory, *directory.parents):
+        if component.is_symlink():
+            raise ValueError('state path must not traverse symlinks')
+    if directory.exists() and (not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) != 0o700):
+        raise ValueError('state directory must be a mode-0700 directory')
     path = directory / name
     if path.is_symlink():
         raise ValueError(f'{name} must not be a symlink')
@@ -30,6 +35,8 @@ def _read(path):
         return None
     if not path.is_file():
         raise ValueError(f'{path.name} must be a regular file')
+    if stat.S_IMODE(path.stat().st_mode) != 0o600:
+        raise ValueError(f'{path.name} must have mode 0600')
     try:
         value = json.loads(path.read_text(encoding='utf-8'))
     except (OSError, UnicodeError, json.JSONDecodeError) as error:
@@ -42,6 +49,8 @@ def _read(path):
 def _absolute(value, field):
     if not isinstance(value, str) or not value or not Path(value).is_absolute():
         raise ValueError(f'{field} must be an absolute path')
+    if os.path.normpath(value) != value:
+        raise ValueError(f'{field} must be normalized')
 
 
 def read_install_record(state_dir):
@@ -94,9 +103,14 @@ def write_connection(state_dir, private_source, config_path):
         raise ValueError('state directory must be absolute')
     if directory.is_symlink():
         raise ValueError('state directory must not be a symlink')
+    for component in directory.parents:
+        if component.is_symlink():
+            raise ValueError('state path must not traverse symlinks')
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not directory.is_dir():
         raise ValueError('state path must be a directory')
+    if stat.S_IMODE(directory.stat().st_mode) != 0o700:
+        raise ValueError('state directory must have mode 0700')
     path = _record_path(directory, 'connection.json')
     content = (json.dumps({'connection_version': 1, 'private_source': private_source,
                            'config_path': config_path}, sort_keys=True) + '\n').encode()

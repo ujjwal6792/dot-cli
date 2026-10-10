@@ -74,11 +74,12 @@ def check(root):
                 if relative == 'release.json':
                     data = json.loads(content)
                     if (not isinstance(data, dict) or
-                            set(data) != {'version', 'platform', 'engine_api', 'prebuilt_input'} or
+                            set(data) != {'format', 'version', 'platform', 'engine_api', 'prebuilt_input'} or
+                            type(data['format']) is not int or
                             type(data['engine_api']) is not int or
                             type(data['prebuilt_input']) is not bool):
                         raise ValueError('unexpected release metadata')
-                    if data.get('version') != version or data.get('platform') != platform or data.get('engine_api') != 1:
+                    if data.get('format') != 2 or data.get('version') != version or data.get('platform') != platform or data.get('engine_api') != 1:
                         raise ValueError('release identity mismatch')
                 if relative == 'bin/dot-browser' and not member.mode & 0o111:
                     raise ValueError('browser is not executable')

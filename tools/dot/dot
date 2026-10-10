@@ -7,9 +7,38 @@ while [ -h "$SOURCE" ]; do
   case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
 done
 TOOL_DIR="${DOT_ENGINE:-$(cd -P "$(dirname "$SOURCE")" && pwd)}"
+case "${1:-}" in
+  --help|-h|help)
+    echo 'usage: dot <command> [arguments]'
+    echo 'Standalone public CLI. Configuration commands require dot init and a private source.'
+    echo 'Commands: init, browse, status, diff, pull, self-update, intent, contract, migrate'
+    exit 0 ;;
+  --version|version)
+    VERSION_FILE="$(dirname "$(dirname "$TOOL_DIR")")/release.json"
+    if [ -r "$VERSION_FILE" ]; then
+      sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/dot \1/p' "$VERSION_FILE"
+    else
+      echo 'dot development build'
+    fi
+    exit 0 ;;
+esac
 if [ "${1:-}" = init ]; then
   shift
   exec python3 -B "$TOOL_DIR/init.py" "$@"
+fi
+if [ "${1:-}" = self-update ]; then
+  INSTALL_RECORD="${XDG_STATE_HOME:-$HOME/.local/state}/dot/install.json"
+  if [ -f "$INSTALL_RECORD" ] && grep -q '"kind"[[:space:]]*:[[:space:]]*"package-manager"' "$INSTALL_RECORD"; then
+    if grep -q '"manager"[[:space:]]*:[[:space:]]*"brew"' "$INSTALL_RECORD"; then echo 'dot self-update: package-manager-owned; run brew upgrade dots-cli' >&2; exit 1; fi
+    if grep -q '"manager"[[:space:]]*:[[:space:]]*"pacman"' "$INSTALL_RECORD"; then echo 'dot self-update: package-manager-owned; run pacman -Syu' >&2; exit 1; fi
+    echo 'dot self-update: unknown package-manager owner; refusing to write' >&2; exit 1
+  fi
+  if [ -f "$INSTALL_RECORD" ] && grep -q '"kind"[[:space:]]*:[[:space:]]*"artifact"' "$INSTALL_RECORD"; then
+    INSTALL_ROOT="$(sed -n 's/.*"engine_path":"\(.*\)\/current\/tools\/dot".*/\1/p' "$INSTALL_RECORD")"
+    [ -n "$INSTALL_ROOT" ] || { echo 'dot self-update: invalid artifact install record; refusing to write' >&2; exit 1; }
+    shift
+    exec sh "$TOOL_DIR/../../install.sh" --self-update "$@" --root "$INSTALL_ROOT"
+  fi
 fi
 # Migration validates the recorded legacy references itself: the normal split
 # tracker gate cannot be satisfied until those references are explicitly migrated.
