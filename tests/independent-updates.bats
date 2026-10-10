@@ -417,7 +417,7 @@ PY
   private_remote v3
   before=$(git -C "$SOURCE" rev-parse HEAD)
   public=$(git -C "$ENGINE/../.." rev-parse HEAD)
-  export REAL_GIT="$(command -v git)" REVIEW_COUNTER="$BATS_TEST_TMPDIR/counter"
+  export REAL_GIT="$(command -v git)" REVIEW_COUNTER="$BATS_TEST_TMPDIR/counter" REVIEW_DEBUG="$BATS_TEST_TMPDIR/review-debug"
   export REVIEW_SOURCE="$(cd "$SOURCE" && pwd -P)"
   mkdir -p "$BATS_TEST_TMPDIR/review-bin"
   cat > "$BATS_TEST_TMPDIR/review-bin/git" <<'SH'
@@ -429,11 +429,12 @@ if [[ " $* " == *" -C $REVIEW_SOURCE status "* ]]; then
   count=0
   [ ! -f "$REVIEW_COUNTER" ] || count=$(cat "$REVIEW_COUNTER")
   count=$((count + 1)); printf '%s\n' "$count" > "$REVIEW_COUNTER"
+  printf 'status_match=1 count=%s change=%s\n' "$count" "$REVIEW_CHANGE" >> "$REVIEW_DEBUG"
   if [ "$count" = 2 ]; then
     case "$REVIEW_CHANGE" in
-      bytes) printf 'concurrent target\n' > "$HOME/.config/example.conf" ;;
-      mode) chmod 600 "$HOME/.config/example.conf" ;;
-      approval) printf '\n' >> "$HOME/.local/state/dot/adoption.json" ;;
+      bytes) printf 'concurrent target\n' > "$HOME/.config/example.conf"; printf 'mutation=bytes\n' >> "$REVIEW_DEBUG" ;;
+      mode) chmod 600 "$HOME/.config/example.conf"; printf 'mutation=mode\n' >> "$REVIEW_DEBUG" ;;
+      approval) printf '\n' >> "$HOME/.local/state/dot/adoption.json"; printf 'mutation=approval\n' >> "$REVIEW_DEBUG" ;;
     esac
     cp -p "$HOME/.config/example.conf" "$REVIEW_COUNTER.target"
     cp "$HOME/.local/state/dot/adoption.json" "$REVIEW_COUNTER.approval"
@@ -442,11 +443,18 @@ fi
 SH
   chmod +x "$BATS_TEST_TMPDIR/review-bin/git"
   for change in bytes mode approval; do
+    : > "$REVIEW_DEBUG"
     printf 'old\n' > "$HOME/.config/example.conf"
     chmod 644 "$HOME/.config/example.conf"
     cp "$BATS_TEST_TMPDIR/approval-before" "$HOME/.local/state/dot/adoption.json"
     printf '0\n' > "$REVIEW_COUNTER"
     run env PATH="$BATS_TEST_TMPDIR/review-bin:$PATH" REVIEW_CHANGE="$change" "$ENGINE/dot" pull --yes
+    if [ "$status" -eq 0 ]; then
+      printf '[DEBUG-rc2] pull_rc=%s change=%s target_exists=%s approval_sha256=%s\n' \
+        "$status" "$change" "$(test -e "$HOME/.config/example.conf" && echo yes || echo no)" \
+        "$(shasum -a 256 "$HOME/.local/state/dot/adoption.json" | cut -d ' ' -f 1)" >&2
+      cat "$REVIEW_DEBUG" >&2
+    fi
     [ "$status" -ne 0 ]
     [ -f "$REVIEW_COUNTER.target" ]
     [ "$before" = "$(git -C "$SOURCE" rev-parse HEAD)" ]
