@@ -9,7 +9,49 @@ This is a staged review candidate, not a claim that a new release is published.
 The owner replaced the former `dots-installer` with independent `dots-cli` history;
 no bootstrap or export command deletes or publishes repositories.
 
-## Download, review, execute
+## Install the public CLI
+
+Releases contain complete `dot-cli-VERSION-PLATFORM.tar.gz` archives for
+`darwin-arm64`, `linux-amd64`, and `linux-arm64`, including the prebuilt browser
+and Python engine. Go is not required on the target. Python is needed only for
+engine commands; `dot --help` and `dot --version` work without Python or private
+configuration. The installer does not install dependencies or create a chezmoi tracker;
+it never installs Python or other dependencies.
+
+Use an immutable release URL and a checksum reviewed independently from the
+archive. The checksum provides integrity relative to that reviewed value, not
+publisher attestation:
+
+```sh
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
+  'https://raw.githubusercontent.com/ujjwal6792/dots-cli/REVIEWED_COMMIT/install.sh' \
+  -o install.sh
+less install.sh
+bash install.sh --version VERSION --platform PLATFORM \
+  --url 'https://github.com/ujjwal6792/dots-cli/releases/download/vVERSION/dot-cli-VERSION-PLATFORM.tar.gz' \
+  --sha256 REVIEWED_ARCHIVE_SHA256
+```
+
+Default locations are `~/.local/share/dot-cli` (versioned payload and atomic
+`current` pointer), `~/.local/bin/dot`, and
+`${XDG_STATE_HOME:-~/.local/state}/dot/install.json`. The mode-0600 local record
+uses schema `record_version: 1`: `owner` (`artifact/curl` or
+`package-manager/brew|pacman`), release repository/tag/platform/archive SHA-256,
+canonical `install_root` and `engine_path`, plus `browser_sha256`. Optional
+private/config connection lives separately in `connection.json` (see the
+[shared state contract](docs/install-record-contract.md)); neither checkout is
+needed to install or identify the public artifact. These are local mutable
+ownership/recovery records, not trust roots.
+The installer does not edit shell startup files; add `~/.local/bin` to PATH
+manually. `--root` and `--state-dir` accept absolute paths, including spaces.
+Package-manager-owned installs are never overwritten; use `brew upgrade` or
+`pacman -Syu` instead. No formula/AUR package is published by this project yet.
+
+The install is public tooling only: no private Git clone, chezmoi config/tracker,
+dependency or application installation, live configuration adoption, or startup
+file edits. Private config is connected only through `dot init`.
+
+## Download, review, execute (legacy config bootstrap)
 
 ```sh
 curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
@@ -22,9 +64,11 @@ bash bootstrap.sh --help
 Use immutable reviewed platform asset URLs and independently reviewed SHA-256
 values. Compare checksums before executing downloaded code. A checksum fetched
 beside an untrusted artifact is not publisher identity/provenance. Interactive
-questions use `/dev/tty`; `--yes` is explicit installer consent only. Bootstrap
-detects prerequisites, installs independent tooling/source checkouts and a
-launcher; it does not install dependencies or create a chezmoi tracker.
+questions use `/dev/tty`; `--yes` is explicit installer consent only. This legacy
+bootstrap remains for existing Git/config installations. New public CLI installs
+should use `install.sh` above. It does not install dependencies or create a
+chezmoi tracker (the installer does not install dependencies or create a
+chezmoi tracker either).
 
 ## Defaults and identity
 
@@ -89,10 +133,13 @@ No private package manifests are bundled; Packages is a browser view, not a
 blanket provision command. Stop tracking uses a reviewed `intent` untrack plan;
 it removes private source/scope entries while retaining live bytes and modes.
 
-`dot self-update` previews a clean public upstream fast-forward; `--yes`
-explicitly updates tooling only after candidate compatibility and payload checks.
-It never applies configuration, runs private hooks, changes approvals or invokes
-package managers, and does not require tracker initialization.
+For artifact installs, `dot self-update --version VERSION --sha256 REVIEWED_SHA256`
+downloads and verifies the requested immutable release, checks a present private
+connection read-only, and previews the public tooling switch. Add `--yes` to
+promote it atomically. It never applies configuration, runs private hooks, changes
+approvals or invokes package managers, and needs no private connection when none
+is configured. Existing Git-checkout installs retain their reviewed fast-forward
+path (`--yes` explicitly applies that tooling-only update).
 
 The installed `bin/dot-browser` is exempt from the dirty-check **only** when its
 regular-file bytes/mode match the matching version-2 local installation record.

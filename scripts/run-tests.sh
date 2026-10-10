@@ -53,9 +53,10 @@ case "$PART" in
     run_bats tests/init-preflight.bats
     ;;
   packaging)
-    run_bats tests/public-export.bats tests/release-packaging.bats
+    run_bats tests/public-export.bats tests/release-packaging.bats tests/standalone-install.bats
     ;;
   python)
+    python3 tests/install-state-test.py
     python3 tests/browser-api-test.py
     python3 tests/tracking-cli-test.py
     python3 tests/packages-test.py

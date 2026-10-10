@@ -6,21 +6,37 @@ while [ -h "$SOURCE" ]; do
   SOURCE="$(readlink "$SOURCE")"
   case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
 done
-TOOL_DIR="${DOT_ENGINE:-$(cd -P "$(dirname "$SOURCE")" && pwd)}"
+TOOL_DIR="${DOT_ENGINE:-$(cd -L "$(dirname "$SOURCE")" && pwd)}"
+find_compatible_python() {
+  for candidate in python3 python3.16 python3.15 python3.14 python3.13 python3.12 python3.11; do
+    candidate_path="$(command -v "$candidate" 2>/dev/null || true)"
+    case "$candidate_path" in /*) ;; *) continue ;; esac
+    if "$candidate_path" -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1; then
+      printf '%s\n' "$candidate_path"
+      return 0
+    fi
+  done
+  return 1
+}
 case "${1:-}" in
-  --help|help)
+  --help|-h|help)
     cat <<'EOF'
 dot — independent configuration CLI
-usage: dot init [--check] [--rounds] [--profile personal|work]
+usage: dot init [--check] [--source ABS] [--config ABS] [--rounds] [--profile personal|work]
        dot --version | dot --help
        dot status | diff | pull | self-update | browse | …
 
-Help and version do not require Python or private configuration. `dot init
---check` performs read-only prerequisite and tracker detection.
+Help and version are independent of Python and private configuration. `dot init
+--check` performs read-only prerequisite, connection, and tracker detection.
 EOF
     exit 0 ;;
   --version|version)
-    echo 'dot public CLI (development build)'
+    VERSION_FILE="$(dirname "$(dirname "$TOOL_DIR")")/release.json"
+    if [ -r "$VERSION_FILE" ]; then
+      sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/dot \1/p' "$VERSION_FILE"
+    else
+      echo 'dot development build'
+    fi
     exit 0 ;;
 esac
 if [ "${1:-}" = init ]; then
@@ -36,13 +52,18 @@ if [ "${1:-}" = init ]; then
       esac
       previous="$argument"
     done
-    if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1 && [ -n "$check_source" ] && [ -n "$check_config" ]; then
-      exec python3 -B "$TOOL_DIR/init.py" --check "$@"
+    PYTHON_BIN="$(find_compatible_python || true)"
+    state_dir="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot"
+    connection_record="$state_dir/connection.json"
+    if [ -n "$PYTHON_BIN" ] && { { [ -n "$check_source" ] && [ -n "$check_config" ]; } || [ -f "$connection_record" ]; }; then
+      DOT_ENGINE="${DOT_ENGINE:-$TOOL_DIR}" DOT_PYTHON="$PYTHON_BIN" exec "$PYTHON_BIN" -B "$TOOL_DIR/init.py" --check "$@"
     fi
     echo "Public engine: $TOOL_DIR"
-    if command -v python3 >/dev/null 2>&1; then
+    if [ -n "$PYTHON_BIN" ]; then
+      echo "Python 3.11+: available ($PYTHON_BIN)"
+    elif command -v python3 >/dev/null 2>&1; then
       python_version="$(python3 -c 'import sys; print(".".join(map(str, sys.version_info[:3])))' 2>/dev/null || true)"
-      case "$python_version" in 3.1[1-9]*|3.[2-9]*) echo "Python 3.11+: available ($python_version)" ;; *) echo "Python 3.11+: unavailable or too old${python_version:+ ($python_version)}" ;; esac
+      echo "Python 3.11+: unavailable or too old${python_version:+ (detected $python_version)}"
     else
       echo 'Python 3.11+: missing; install it using your platform package manager, then rerun dot init. No dependency was installed.'
     fi
@@ -63,22 +84,96 @@ if [ "${1:-}" = init ]; then
     else
       echo 'Tracker: not configured; dot init can offer creation only after separate explicit consent.'
     fi
-    record="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot/install.json"
+    record="$state_dir/install.json"
     if [ -f "$record" ]; then echo "Install record: $record"; else echo 'Install record: not present'; fi
+    if [ -f "$connection_record" ]; then echo "Private connection record: $connection_record (read-only; validation needs Python 3.11+)"; else echo 'Private connection: not recorded'; fi
     exit 0
   fi
-  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1; then
+  PYTHON_BIN="$(find_compatible_python || true)"
+  if [ -z "$PYTHON_BIN" ]; then
     exec bash "$TOOL_DIR/init-python-bootstrap.sh" "$TOOL_DIR" "$@"
   fi
-  export DOT_ENGINE="${DOT_ENGINE:-$TOOL_DIR}"
-  exec python3 -B "$TOOL_DIR/init.py" "$@"
+  export DOT_ENGINE="${DOT_ENGINE:-$TOOL_DIR}" DOT_PYTHON="$PYTHON_BIN"
+  exec "$PYTHON_BIN" -B "$TOOL_DIR/init.py" "$@"
+fi
+if [ "${1:-}" = self-update ]; then
+  INSTALL_RECORD="${XDG_STATE_HOME:-$HOME/.local/state}/dot/install.json"
+  if [ -f "$INSTALL_RECORD" ] && grep -q '"kind"[[:space:]]*:[[:space:]]*"package-manager"' "$INSTALL_RECORD"; then
+    if grep -q '"manager"[[:space:]]*:[[:space:]]*"brew"' "$INSTALL_RECORD"; then echo 'dot self-update: package-manager-owned; run brew upgrade dots-cli' >&2; exit 1; fi
+    if grep -q '"manager"[[:space:]]*:[[:space:]]*"pacman"' "$INSTALL_RECORD"; then echo 'dot self-update: package-manager-owned; run pacman -Syu' >&2; exit 1; fi
+    echo 'dot self-update: unknown package-manager owner; refusing to write' >&2; exit 1
+  fi
+  if [ -f "$INSTALL_RECORD" ] && grep -q '"kind"[[:space:]]*:[[:space:]]*"artifact"' "$INSTALL_RECORD"; then
+    INSTALL_ROOT="$(sed -n 's/.*"engine_path":"\(.*\)\/current\/tools\/dot".*/\1/p' "$INSTALL_RECORD")"
+    [ -n "$INSTALL_ROOT" ] || { echo 'dot self-update: invalid artifact install record; refusing to write' >&2; exit 1; }
+    shift
+    exec sh "$TOOL_DIR/../../install.sh" --self-update "$@" --root "$INSTALL_ROOT"
+  fi
+fi
+if [ -z "${DOT_ENGINE:-}" ] && [ ! -f "$TOOL_DIR/../../dot-contract.json" ] && [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migrate ]; then
+  echo 'dot: public engine requires explicit DOT_ENGINE and private DOT_SOURCE; use the installed dot launcher' >&2
+  exit 1
+fi
+if [ -n "${DOT_ENGINE:-}" ] && [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migrate ] && [ -z "${DOT_SOURCE:-}" ] && [ ! -f "${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot/connection.json" ]; then
+  echo 'dot: explicit DOT_SOURCE is required with DOT_ENGINE; run dot init to establish a private connection' >&2
+  exit 1
+fi
+PYTHON_BIN="$(find_compatible_python || true)"
+if [ "${1:-}" != self-update ] && [ -z "$PYTHON_BIN" ]; then
+  echo 'dot: engine commands require Python 3.11+ with tomllib; run dot init --check, then install Python through dot init.' >&2
+  exit 1
+fi
+if [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migrate ]; then
+  DOT_ENGINE="${DOT_ENGINE:-$TOOL_DIR}"
+  export DOT_ENGINE
+  if [ -n "$PYTHON_BIN" ]; then
+    export DOT_PYTHON="$PYTHON_BIN"
+  fi
+  if [ -n "${XDG_STATE_HOME:-}" ]; then
+    state_dir="$XDG_STATE_HOME/dot"
+  else
+    state_dir="${HOME:?HOME must be set}/.local/state/dot"
+  fi
+  if [ -n "$PYTHON_BIN" ]; then
+    if [ -n "${XDG_STATE_HOME:-}" ]; then
+      state_dir="$XDG_STATE_HOME/dot"
+    else
+      state_dir="$("$PYTHON_BIN" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve() / ".local/state/dot")' "$HOME")"
+    fi
+  fi
+  connection_record="$state_dir/connection.json"
+  if [ -f "$connection_record" ]; then
+    requested_source="${DOT_SOURCE:-}"
+    requested_config="${DOT_CONFIG:-}"
+    [ -n "$PYTHON_BIN" ] || { echo 'dot: private connection record requires Python 3.11+ validation; run dot init --check and install Python through dot init.' >&2; exit 1; }
+    exports="$("$PYTHON_BIN" - "$TOOL_DIR" "$state_dir" <<'PY'
+import shlex,sys
+sys.path.insert(0,sys.argv[1])
+import install_state
+record=install_state.read_connection(sys.argv[2])
+if record is None:
+    raise SystemExit(3)
+print('DOT_SOURCE=' + shlex.quote(record['private_source']))
+print('DOT_CONFIG=' + shlex.quote(record['config_path']))
+PY
+    )" || { echo 'dot: invalid or unreadable private connection record; run dot init --check; no fallback source selected.' >&2; exit 1; }
+    eval "$exports"
+    if { [ -n "$requested_source" ] && [ "$requested_source" != "$DOT_SOURCE" ]; } || { [ -n "$requested_config" ] && [ "$requested_config" != "$DOT_CONFIG" ]; }; then
+      echo 'dot: explicit private source conflicts with the saved connection; run dot init to review a connection update.' >&2
+      exit 1
+    fi
+    export DOT_SOURCE DOT_CONFIG
+  elif [ -z "${DOT_SOURCE:-}" ] || [ -z "${DOT_CONFIG:-}" ]; then
+    echo 'dot: private connection not initialized; run dot init. No public-checkout source fallback is used.' >&2
+    exit 1
+  fi
 fi
 # Migration validates the recorded legacy references itself: the normal split
 # tracker gate cannot be satisfied until those references are explicitly migrated.
 if [ "${1:-}" = migrate ]; then
   shift
   : "${DOT_SOURCE:?dot migrate requires the explicit recorded installed DOT_SOURCE}"
-  exec python3 -B "$TOOL_DIR/migration.py" "$@"
+  exec "$PYTHON_BIN" -B "$TOOL_DIR/migration.py" "$@"
 fi
 IS_CONTRACT=false
 [ "${1:-}" = contract ] && IS_CONTRACT=true
@@ -95,19 +190,19 @@ if [ -n "${DOT_ENGINE:-}" ]; then
       exit 1
     fi
     if [ "${1:-}" != self-update ] && [ -n "${DOT_CONFIG:-}" ]; then
-      configured_engine="$(python3 - "$DOT_CONFIG" <<'PY'
+      configured_engine="$("$PYTHON_BIN" - "$DOT_CONFIG" <<'PY'
 import sys,tomllib
 with open(sys.argv[1],'rb') as f: print(tomllib.load(f).get('data',{}).get('dotEngine',''))
 PY
       )"
       [ "$configured_engine" = "$TOOL_DIR" ] || { echo 'dot: chezmoi [data] dotEngine does not match explicit DOT_ENGINE' >&2; exit 1; }
     fi
-    python3 -B "$TOOL_DIR/contract.py" check --engine "$TOOL_DIR" --source "$DOT_SOURCE" >/dev/null || exit $?
+    "$PYTHON_BIN" -B "$TOOL_DIR/contract.py" check --engine "$TOOL_DIR" --source "$DOT_SOURCE" >/dev/null || exit $?
   fi
 fi
 if [ "${1:-}" = contract ]; then
   shift
-  exec python3 -B "$TOOL_DIR/contract.py" "$@"
+  exec "$PYTHON_BIN" -B "$TOOL_DIR/contract.py" "$@"
 fi
 if [ -z "${DOT_SOURCE:-}" ] && [ ! -f "$TOOL_DIR/../../dot-contract.json" ]; then
   echo 'dot: public engine requires explicit private DOT_SOURCE; refusing public-checkout or chezmoi source fallback' >&2
@@ -148,7 +243,7 @@ dot_status() {
     return "$failed"
   fi
   printf 'drift: %s managed entries differ; choose push (machine → repo) or pull (repo → machine)\n' "$(printf '%s\n' "$state" | awk 'NF {n++} END {print n+0}')"
-  python3 -B - "$TOOL_DIR" "$HOME" <<'PY'
+  "$PYTHON_BIN" -B - "$TOOL_DIR" "$HOME" <<'PY'
 import sys
 sys.path.insert(0,sys.argv[1])
 import scope
@@ -205,14 +300,14 @@ dot_push() {
   g push
 }
 dot_pull() {
-  DOT_ENGINE="$TOOL_DIR" DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/updates.py" pull "$@"
+  DOT_ENGINE="$TOOL_DIR" DOT_SOURCE="$DOT_SOURCE" "$PYTHON_BIN" -B "$TOOL_DIR/updates.py" pull "$@"
 }
-dot_self_update() { DOT_ENGINE="$TOOL_DIR" DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/updates.py" self-update "$@"; }
-metadata() { python3 -B "$TOOL_DIR/state.py" "$@"; }
-scope() { python3 -B "$TOOL_DIR/scope.py" "$1" "$DOT_SOURCE" "$HOME" "${@:2}"; }
+dot_self_update() { DOT_ENGINE="$TOOL_DIR" DOT_SOURCE="$DOT_SOURCE" "$PYTHON_BIN" -B "$TOOL_DIR/updates.py" self-update "$@"; }
+metadata() { "$PYTHON_BIN" -B "$TOOL_DIR/state.py" "$@"; }
+scope() { "$PYTHON_BIN" -B "$TOOL_DIR/scope.py" "$1" "$DOT_SOURCE" "$HOME" "${@:2}"; }
 dot_scope() { scope "${1:-show}" "${@:2}"; }
-dot_intent() { DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/intent.py" "$@"; }
-dot_layout() { DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/layout.py" "$@"; }
+dot_intent() { DOT_SOURCE="$DOT_SOURCE" "$PYTHON_BIN" -B "$TOOL_DIR/intent.py" "$@"; }
+dot_layout() { DOT_SOURCE="$DOT_SOURCE" "$PYTHON_BIN" -B "$TOOL_DIR/layout.py" "$@"; }
 dot_add() {
   [ ! -f "$DOT_SOURCE/dot-contract.json" ] || { fail 'tracking requires an exact dot intent Track plan/approval'; return; }
   local category os_name=- relative path
@@ -228,7 +323,7 @@ dot_add() {
   esac
   [ $# -eq 1 ] || { usage; return; }
   path="$1"
-  if scope show | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin).get("version") == 2 else 1)' 2>/dev/null; then
+  if scope show | "$PYTHON_BIN" -c 'import json,sys; exit(0 if json.load(sys.stdin).get("version") == 2 else 1)' 2>/dev/null; then
     fail 'exact-scope imports require dot intent Track plan/approval'; return
   fi
   relative="$(metadata validate "$path")"
@@ -241,7 +336,7 @@ dot_remove() {
   [ ! -f "$DOT_SOURCE/dot-contract.json" ] || { fail 'stop tracking requires an exact dot intent untrack plan/approval; live files are retained'; return; }
   [ $# -eq 1 ] || { usage; return; }
   local relative
-  if scope show | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin).get("version") == 2 else 1)' 2>/dev/null; then
+  if scope show | "$PYTHON_BIN" -c 'import json,sys; exit(0 if json.load(sys.stdin).get("version") == 2 else 1)' 2>/dev/null; then
     fail 'exact-scope changes require a reviewed dot intent plan'; return
   fi
   relative="$(metadata relative "$1")"

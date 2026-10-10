@@ -37,9 +37,13 @@ start_init() {
   local command
   printf -v command 'trap : INT; %q init %s; echo UI_EXIT=$?; sleep 30' "$HOME/.local/bin/dot" "$*"
   tmux -L "$SOCKET" new-session -d -s ui -x 180 -y 60 "$command"
+  if [ -d "$HOME/.local/share/dot-config" ] && [ ! -e "$HOME/.local/state/dot/connection.json" ]; then
+    answer 'Connect to this exact existing private checkout' y
+  fi
 }
 
 @test "guided tracker creation needs separate consent and repeat detection preserves exact bytes" {
+  cp "$HOME/.local/state/dot/install.json" "$BATS_TEST_TMPDIR/install-before"
   start_init
   answer 'Create this tracker' y
   answer 'Setup action' ''
@@ -54,6 +58,13 @@ start_init() {
   [[ "$output" == *'Compatible tracker detected'* ]]
   cmp "$BATS_TEST_TMPDIR/created" "$HOME/.config/chezmoi/chezmoi.toml"
   cmp "$BATS_TEST_TMPDIR/record" "$HOME/.local/state/dot/install.json"
+  cmp "$BATS_TEST_TMPDIR/install-before" "$HOME/.local/state/dot/install.json"
+  [ "$(stat -f %Lp "$HOME/.local/state/dot/connection.json")" = 600 ]
+  python3 - "$HOME/.local/state/dot/connection.json" "$HOME/.local/share/dot-config" "$HOME/.config/chezmoi/chezmoi.toml" <<'PY'
+import json,sys
+d=json.load(open(sys.argv[1]))
+assert d == {'connection_version':1,'private_source':sys.argv[2],'config_path':sys.argv[3]}
+PY
   [ ! -e "$HOME/.local/state/dot/adoption.json" ]
   [ ! -e "$HOME/.local/state/dot/chezmoi-state.boltdb" ]
   [ ! -e "$HOME/.config/eza/theme.yml" ]
@@ -315,7 +326,7 @@ SH
   export CHEZMOI_MISSING=yes
   start_init
   wait_for 'Install dependency chezmoi'
-  printf '{}\n' > "$HOME/.local/state/dot/install.json"
+  printf '{}\n' > "$HOME/.local/state/dot/connection.json"
   answer 'Install dependency chezmoi' y
   wait_for UI_EXIT=1
   [ ! -e "$HOME/bottle-chezmoi" ]
@@ -336,11 +347,13 @@ SH
   [ "$(cat "$HOME/.local/state/dot/chezmoi-state.boltdb")" = 'preserve database' ]
 }
 
-@test "public remote identity mismatch is not silently accepted by init" {
+@test "init leaves installer-owned artifact state independent from public checkout remotes" {
+  cp "$HOME/.local/state/dot/install.json" "$BATS_TEST_TMPDIR/install-before"
   git -C "$HOME/.local/share/dot-cli" remote set-url origin /unrelated-public
   run "$HOME/.local/bin/dot" init --check
-  [ "$status" -ne 0 ]
-  [[ "$output" == *'public remote identity'* ]]
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'Tracker pending'* ]]
+  cmp "$BATS_TEST_TMPDIR/install-before" "$HOME/.local/state/dot/install.json"
   [ ! -e "$HOME/.config/chezmoi/chezmoi.toml" ]
 }
 
@@ -535,10 +548,10 @@ SH
 }
 
 @test "malformed installation metadata fails with actionable diagnostics instead of a traceback" {
-  printf '[]\n' > "$HOME/.local/state/dot/install.json"
+  printf '[]\n' > "$HOME/.local/state/dot/connection.json"
   run "$HOME/.local/bin/dot" init --check
   [ "$status" -ne 0 ]
-  [[ "$output" == *'invalid installation record'* ]]
+  [[ "$output" == *'connection.json'* ]]
   [[ "$output" != *'Traceback'* ]]
   [ ! -e "$HOME/.config/chezmoi/chezmoi.toml" ]
 }

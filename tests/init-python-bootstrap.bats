@@ -85,6 +85,29 @@ SH
   [ ! -e "$HOME/.local/state/dot/install.json" ]
 }
 
+@test "a compatible versioned Python is preferred over an older python3 without installing" {
+  cat > "$FIXTURE_BIN/python3" <<'SH'
+#!/bin/sh
+case "$*" in *'sys.version_info'*) exit 1 ;; *) echo 'Python 3.9.6' ;; esac
+SH
+  cat > "$FIXTURE_BIN/python3.12" <<'SH'
+#!/bin/sh
+if [ "$1" = -c ]; then exit 0; fi
+echo "$*" > "$TRACE.delegated"
+exit 77
+SH
+  cat > "$FIXTURE_BIN/brew" <<'SH'
+#!/bin/sh
+echo "brew $*" >> "$TRACE"
+exit 91
+SH
+  chmod +x "$FIXTURE_BIN/python3" "$FIXTURE_BIN/python3.12" "$FIXTURE_BIN/brew"
+  start_init
+  wait_for UI_EXIT=77
+  [ "$(cat "$TRACE.delegated")" = "-B $ENGINE/init.py" ]
+  ! grep -F 'brew install' "$TRACE"
+}
+
 @test "Ubuntu bootstrap reviews a named apt transaction and never refreshes repositories" {
   export FAKE_SYSTEM=Linux FAKE_ARCH=x86_64 OS_RELEASE="$BATS_TEST_TMPDIR/os-release"
   printf 'ID=ubuntu\nVERSION_ID="24.04"\n' > "$OS_RELEASE"
