@@ -5,26 +5,47 @@ description: Public-safe setup guidance for the private dot system — download/
 
 # setup-dots
 
-Guide a user through setting up the private `dot` system from the public
+Guide a user through setting up the private `dot` system from public `ujjwal6792/dots-cli`
 bootstrap. This skill is public-safe: it contains no private configuration,
 credentials, history, or target inventory.
 
 ## 1. Obtain and review the bootstrap
 
 - Present the download/review/execute route: fetch `bootstrap.sh` over HTTPS
-  with `--proto '=https' --tlsv1.2`, verify its SHA-256, read it, then run it.
+  with `--proto '=https' --proto-redir '=https' --tlsv1.2`, verify its SHA-256,
+  read it, then run it.
 - The piped `curl | bash` route is documented, but remind the user that
   interactive prompts and browser login still use `/dev/tty`.
 - Never claim a working public URL before the release owner provides one.
+- Use independent locations: public CLI `~/.local/share/dot-cli`, private source
+  `~/.local/share/dot-config`, launcher `~/.local/bin/dot`. `DOT_SOURCE` remains
+  private; `DOT_ENGINE` names public `tools/dot`. Confirm both locations and
+  repository identities before installing. Matching installed checkouts are
+  detected read-only; updates are separate commands. Legacy checkouts require
+  separate reviewed migration, not replacement.
+- Use the reviewed platform's prebuilt browser: Go is a maintainer build
+  dependency, not a target prerequisite. Python/chezmoi remain required.
+  Compare the archive SHA-256 against an independently reviewed digest before
+  extraction/execution; a checksum from the same URL is not provenance.
 
-## 2. Dependency plan and consent
+## 2. Init owns dependency and tracker creation
 
-- Explain the platform route (macOS Homebrew bottles; Ubuntu apt + pinned
-  upstream packages; Arch official pacman with a disclosed full upgrade).
-- Show the exact package/repository plan before any consent. Confirm the user
-  understands sudo, third-party repositories, and Arch full-upgrade impact.
-- `--yes` still requires existing identity, verified access, and `sudo -n`;
-  it never selects configuration groups.
+- Bootstrap detects prerequisites read-only and installs independent CLI/source
+  checkouts and a launcher after installer consent. It does not install
+  dependencies or create/repair a chezmoi tracker.
+- `dot init` owns first-time dependency installation and tracker setup or
+  detection. Before each install/create, show the exact operation and obtain
+  informed consent; refusal leaves that operation undone. Detection does not
+  create, repair, switch or widen scope. Start with `dot init --check`; then use
+  guided `dot init`, which offers Finish by default. New tracker creation previews
+  its exact actual source/HOME/config/engine and preserved Git identity; private
+  templates/hooks are not executed. Existing machine data stays intact.
+- Explain proposed init platform effects: Homebrew bottles, Ubuntu named apt/
+  reviewed upstream packages, or Arch's disclosed full system upgrade.
+  Dotfiles browsing, self-update and migration have no package-manager effects.
+  Init's `packages` action and browser Packages Install missing each need their
+  own exact plan-ID approval; edits/navigation/deselection never install/uninstall.
+- `--yes` is installer consent only, never dependency/tracker/adoption consent.
 
 ## 3. Git identity is preserved
 
@@ -51,7 +72,22 @@ credentials, history, or target inventory.
 ## 6. Distinct Track and Adopt rounds
 
 - Track (import eligible HOME configuration) and Adopt (apply repository
-  configuration) are separate picker rounds with distinct previews.
+  configuration) are separate browser rounds with distinct previews. Finish is
+  the default; no files are preselected. Installing CLI alone leaves an empty
+  adoption scope and changes no target configuration. Zero managed drift does
+  not mean whole-machine parity, especially when selected-entry count is zero.
 - Browsing is not consent; Track does not authorize Adopt. Adopt applies only
   the explicitly approved exact scope, with Unsafe selections requiring an
   additional acknowledgment.
+
+## 7. Maintenance and compatibility
+
+- Resolve public engine and private source independently. Missing/incompatible
+  contracts stop before mutation; repair those paths/versions rather than
+  falling back to unscoped chezmoi apply or private executable tooling.
+- Keep tooling updates (`dot self-update`), approved private updates (`dot pull`),
+  and application version-manifest setup (`dot update NAME VERSION`) distinct.
+  Browsing does not provision applications or services. Consult installed help
+  for commands delivered by the reviewed version; do not promise pending commands.
+- For machine-data diagnostics use the installed private `home/` and actual
+  `DOT_CONFIG`. Preserve identity and machine data; deletion is not routine repair.

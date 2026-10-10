@@ -1,0 +1,30 @@
+name: Review release candidate
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: Review-only semantic version (does not publish)
+        required: true
+permissions:
+  contents: read
+jobs:
+  build:
+    if: github.repository == 'ujjwal6792/dots-cli'
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: tools/dot/browser/go.mod
+          cache-dependency-path: tools/dot/browser/go.sum
+      - name: Build and verify public-only candidates
+        env:
+          VERSION: ${{ inputs.version }}
+        run: |
+          python3 scripts/build-release.py --version "$VERSION" --output candidate
+          python3 scripts/check-release.py candidate
+      - uses: actions/upload-artifact@v4
+        with:
+          name: review-only-candidate
+          path: candidate
+          retention-days: 7

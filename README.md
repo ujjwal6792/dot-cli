@@ -1,132 +1,211 @@
 # dots-cli
 
-Public bootstrap for the private `dot` configuration system. This repository
-contains **only** installer logic and public setup documentation. The source of
-truth, managed configuration, and target inventories stay in the private
-dotfiles repository; nothing here includes private configuration, credentials,
-history, or machine inventories.
+Public reusable `dot` CLI, safety engine, prebuilt configuration browser and
+agent interaction skills for `ujjwal6792/dots-cli`. The private source of truth
+is `ujjwal6792/dotfiles`; no private manifests, configuration, credentials,
+history, machine inventories, approvals or recovery backups belong here.
 
-## Install
+This is a staged review candidate, not a claim that a new release is published.
+The owner replaced the former `dots-installer` with independent `dots-cli` history;
+no bootstrap or export command deletes or publishes repositories.
 
-Download, review, execute (preferred):
+## Download, review, execute
 
 ```sh
-curl --fail --location --proto '=https' --tlsv1.2 \
+curl --fail --location --proto '=https' --proto-redir '=https' --tlsv1.2 \
   "$APPROVED_BOOTSTRAP_URL" -o bootstrap.sh
 printf '%s  bootstrap.sh\n' "$APPROVED_BOOTSTRAP_SHA256" | shasum -a 256 -c -
 less bootstrap.sh
-bash bootstrap.sh
+bash bootstrap.sh --help
 ```
 
-Or pipe directly, understanding that human prompts still use `/dev/tty` and
-an unattended run needs `--yes`:
+Use immutable reviewed platform asset URLs and independently reviewed SHA-256
+values. Compare checksums before executing downloaded code. A checksum fetched
+beside an untrusted artifact is not publisher identity/provenance. Interactive
+questions use `/dev/tty`; `--yes` is explicit installer consent only. Bootstrap
+detects prerequisites, installs independent tooling/source checkouts and a
+launcher; it does not install dependencies or create a chezmoi tracker.
 
-```sh
-curl --fail --location --proto '=https' --tlsv1.2 \
-  "$APPROVED_BOOTSTRAP_URL" | bash -s -- [options]
-```
+## Defaults and identity
 
-## Defaults
+- Public checkout: `~/.local/share/dot-cli` (`--engine-directory ABSOLUTE_PATH`).
+- Private checkout: `~/.local/share/dot-config` (`--directory ABSOLUTE_PATH`).
+- Launcher: `~/.local/bin/dot`; add this directory to PATH yourself if needed.
+  Bootstrap leaves Bash/Zsh startup bytes unchanged. Custom absolute `ZDOTDIR`
+  is detected safely; startup code is not run.
+- `DOT_SOURCE` remains private; `DOT_ENGINE` resolves public `tools/dot`.
+  Private/public descriptor compatibility is checked before configuration mutation.
+- Local metadata: `~/.local/state/dot/`. Initialized chezmoi machine data and
+  exact approvals stay local-unmanaged, never in public release artifacts.
+- Private API identity/visibility and Git access are verified before retrieval.
+  Denied access never creates a repository or switches the private source.
+- Existing matching checkouts are detected read-only; neither checkout is
+  fetched or updated by bootstrap (including legacy `--existing update|keep`).
+  Dirty/unrelated checkouts and symlink/path conflicts are never reset or overwritten.
+- Legacy co-located installs require separate approved recoverable migration,
+  not silent replacement. Current development checkouts are not moved.
 
-- Permanent checkout: `~/.local/share/dot` (override with an absolute
-  `--directory '/path/with spaces'`). Real history, branch, and `origin`
-  upstream are preserved so `dot push`/`dot pull` work.
-- Launcher: `~/.local/bin/dot`, plus idempotent marked PATH blocks in Bash and
-  Zsh startup files (a nondefault absolute `ZDOTDIR` is respected).
-- Local state: `$XDG_CONFIG_HOME/chezmoi/chezmoi.toml` (or
-  `~/.config/chezmoi/chezmoi.toml`), `~/.local/state/dot/`, isolated
-  `cacheDir`/`persistentState`. These are local-unmanaged.
-- Chezmoi machine data: `name`, `email`, and `profile` (default `personal`,
-  `--profile work`). Existing Git name/email is preserved; only missing values
-  are prompted for.
-- An **explicit empty adoption scope** is written before chezmoi is configured.
-  Installation never applies configurations; adoption is a separate step.
-- Matching existing checkouts offer **Update** or **Keep existing**. Updates are
-  clean and fast-forward-only (`--existing update|keep`). Unrelated folders,
-  launchers, malformed PATH markers, and user-owned symlinks are conflicts and
-  are never overwritten.
+## Legacy installed split: dot migrate
 
-## Platforms and dependencies
+From the reviewed CLI, with explicit legacy installed `DOT_SOURCE` and tracker
+`DOT_CONFIG`, run `dot migrate plan --engine /reviewed/public-checkout --out /private/new-plan.json`.
+Review the preview and private plan, then `dot migrate apply /private/new-plan.json --approve EXACT_PLAN_ID`.
+`--engine` names an independent reviewed Git checkout, not a private-history
+extraction or fetch instruction. Only a matching version-1 installation record
+under `HOME/.local/share` and recognized legacy launcher are eligible.
 
-- **macOS:** Apple Silicon (`arm64`) macOS 15+ only. Intel Macs, Rosetta
-  (`x86_64`), and older macOS are rejected. Missing tools use the default
-  Apple Silicon Homebrew (`/opt/homebrew`) route; Homebrew setup is offered,
-  pinned (commit + SHA-256), and downloaded privately. No dependency step runs
-  as root, and normal Homebrew operations never use sudo.
-- **Ubuntu:** 24.04+ on `amd64`/`x86_64` and `arm64`/`aarch64`. 22.04 only
-  with an already compatible `python3` 3.11+ (including `tomllib`) on PATH.
-  Missing Bash/Git/curl/Python go through apt; GitHub CLI through its official
-  signed apt repository; Gum/chezmoi through reviewed pinned Debian packages
-  verified by embedded SHA-256 pins. GitHub CLI 2.45.x/2.46.x are rejected on
-  every platform. No Python PPA and no system-Python replacement on 22.04.
-- **Arch:** official Arch on native `x86_64` only. CachyOS/Manjaro/ARM are not
-  automatically supported. Missing tools map to official `pacman` targets, and
-  the required **full system upgrade** is disclosed explicitly before any sudo
-  or package transaction. No AUR and no compilation.
-- Bash, Git, curl, GitHub CLI, Python 3.11+, chezmoi, and Gum are the baseline.
-  Compatible installed tools are reused; already-installed dependencies are
-  verified, not reinstalled. A command on PATH that fails capability checks is
-  a failure, not proof of success.
-- Dependency plans are printed before consent. Unattended mode (`--yes`)
-  requires cached/passwordless sudo (`sudo -n`), existing commit identity, and
-  verified private access. The installer does not feed passwords to sudo, does
-  not use sudo for Homebrew, and cannot be used to silently approve a broader
-  transaction than was displayed.
+Snapshot verification preserves private history/index/dirty/ignored work, modes,
+symlinks, identity, exact approval bytes and unrelated local recovery/config.
+Old checkouts remain; the new public/private checkouts use the defaults above.
+Tracker source/engine references, launcher and version-2 record are journaled.
+Nothing is adopted/applied/provisioned. Concurrent editing is unsupported.
+Shared/linked Git metadata and path-conditioned identity changes fail closed.
 
-## Access and adoption
+An incomplete `~/.local/state/dot/installed-migration.json` refuses unsafe retries.
+Inspect its immutable `installed-recovery/PLAN_ID/README` and verified snapshots;
+manually restore original references with their modes, verify old work/scope,
+and retain/quarantine new destinations and recovery data before a fresh plan.
+At the snapshotting stage, originals remain authoritative: never restore an
+unverified partial backup. Do not delete/reset work or rerun bootstrap as repair.
 
-- The bootstrap is anonymous; the **private source is retrieved only after**
-  GitHub authentication and verified access (API + Git) to the private
-  repository. Existing credentials are reused only after that verification;
-  otherwise account-switch or HTTPS browser login is offered. Tokens are never
-  printed, logged, or committed.
-- You may **clone/use a verified existing private dotfiles repository**, or,
-  after separate explicit approval, **create a NEW private one**. Creation is
-  never a fallback for denied access, never renames/deletes another repo, and a
-  refused consent makes no remote change.
-- Installation does **not** adopt configurations. The subsequent optional
-  Adopt flow previews exact rendered target changes and bounded removals, and
-  applies only after explicit apply approval, with an additional acknowledgment
-  for Unsafe selections (shell, terminal, Git, desktop, services). Safe/Unsafe
-  classification and OS applicability warnings (including the Arch/CachyOS
-  desktop warning on Ubuntu) are always shown. Nothing is preselected.
-- A matching existing chezmoi/HOME-as-repo manager requires explicit
-  replacement consent (`--replace-chezmoi` in addition to `--yes`
-  unattended), a private rollback backup, and exact narrow retirement. HOME,
-  unrelated repos, credentials, and runtime data are never recursive deletion
-  targets. Linux sync-timer cleanup is the owner's responsibility; nothing
-  enables, stops, or edits timers.
-- Canonical skills live only at `~/.agents/skills`; the previous canonical
-  library is backed up exactly at `~/.agents/skills.bak` (never a timestamped
-  tree, never silently overwritten). Noncanonical harness silos are retired,
-  not merged. The Gemini mirror is generated output.
-- Unselected files are never touched: selection scope persists locally, and
-  normal `dot`/chezmoi operations enforce it. Scope expansion requires a new
-  explicit choice and preview. Missing tools are printed and saved **locally**
-  for later installation; nothing machine-specific is published.
+## Independent updates
 
-## Unattended mode and recovery
+### Command quick reference
 
-- `--yes` is noninteractive: existing identity and authentication must already
-  exist, replacement additionally requires `--replace-chezmoi`, and no
-  configuration group is ever selected implicitly. Without a controlling
-  terminal and without `--yes`, the bootstrap exits with guidance.
-- Failures report the phase. Partial installations may leave installed
-  prerequisites or a partial clone; inspect the diagnostic before retrying.
-  Recovery backups and journals live under `~/.local/state/dot/`. There is no
-  automatic rollback of packages, identity, or credential integration.
-- Unsupported-case behavior is explicit: unsupported OS/architecture,
-  incompatible Python, rejected GitHub CLI versions, missing Homebrew on a
-  Mac that needs it, download/checksum failure, and privilege denial all fail
-  closed with actionable guidance.
+| Command | Purpose |
+| --- | --- |
+| `dot init`, `dot init --check` | Consented first-run setup; read-only installed-path diagnostics |
+| `dot browse` | Dotfiles Track/Adopt plus visible Packages; no navigation side effects |
+| `dot status`, `dot diff` | Exact scope/drift and direction-labeled changes, not whole-machine parity |
+| `dot intent plan/preview/apply` | Shared exact-plan engine for human/agent review and approval |
+| `dot self-update` | Public tooling review; `--yes` approves its fast-forward only |
+| `dot pull` | Private exact-scope review; `--yes` approves that private update only |
+| `dot update NAME VERSION` | Legacy private application pin/installer contract, not self-update |
+| `dot migrate plan/apply` | Separately approved, recoverable installed-checkout split |
+| `dot doctor`, `dot contract check` | Actual tracker/private adapters and compatibility diagnostics |
 
-## Boundaries
+See [private contract and adapter diagnostics](docs/private-contract.md).
+No private package manifests are bundled; Packages is a browser view, not a
+blanket provision command. Stop tracking uses a reviewed `intent` untrack plan;
+it removes private source/scope entries while retaining live bytes and modes.
 
-- No live HOME adoption, package transaction, repository creation/deletion/
-  rename, or push is triggered by reading this documentation.
-- Publication updates keep the `--stage dependencies|migration|adoption|install`
-  stages, `--repository OWNER/REPO`, and the fixture-only `--source-url` seam
-  compatible with the private installer and scoped-management engine.
-- Linux legacy sync-timer removal remains the owner's responsibility. Reusing
-  the old remote URL can affect legacy clones; coordinate the supervised
-  transition before depending on it.
+`dot self-update` previews a clean public upstream fast-forward; `--yes`
+explicitly updates tooling only after candidate compatibility and payload checks.
+It never applies configuration, runs private hooks, changes approvals or invokes
+package managers, and does not require tracker initialization.
+
+The installed `bin/dot-browser` is exempt from the dirty-check **only** when its
+regular-file bytes/mode match the matching version-2 local installation record.
+Unrecorded/forged artifacts, symlinks, tracked edits and unrelated untracked or
+ignored files still stop the update; `bin/` is never blanket-ignored. A tooling-only
+update preserves the verified browser. If browser source changes, independently
+review the release artifact and supply `--browser-url HTTPS_OR_ABSOLUTE_PATH
+--browser-sha256 REVIEWED_SHA256` to both preview and consented self-update.
+Checksum/compatibility validation precedes mutation. Artifact promotion updates
+the local recorded hash; an ordinary promotion failure restores previous browser
+bytes/record and the transaction's tooling HEAD when no concurrent edits exist.
+An interrupted operation or concurrent editing requires inspection, not a reset.
+No approved asset URL or release provenance is supplied by this staging candidate.
+
+`dot pull` previews private upstream changes against the existing exact approved
+scope; `--yes` explicitly fast-forwards the private checkout and applies only
+unchanged approved entries/capabilities. New entries stay opt-in. Changed approved
+metadata requires fresh adoption, not a broader pull. Legacy/unscoped approvals,
+dirty (including ignored local files), ahead/diverged, inaccessible and incompatible
+updates stop without reset. Public tooling is never updated by pull. Preview uses
+bounded Git keys rather than raw credential-bearing source diffs; private hooks
+and checkout filters are not run. `dot update NAME VERSION` retains package-pin
+semantics; it is not tooling maintenance.
+
+Both update commands use the configured remote branch upstream; review/trust the
+public distribution independently. External concurrent editing is unsupported.
+Late target I/O failures can leave private source advanced: inspect the shared
+engine's local recovery instead of resetting work or retrying blindly.
+
+## First-run setup: dot init
+
+`dot init` (#30) owns dependency installation and chezmoi tracker
+setup/create-or-detect. Each install/create operation must show its operation and
+obtain informed consent. Detection is read-only: it does not create, repair,
+switch, adopt or expand scope. Use `dot init --check` for offline read-only
+record/origin/contract/tracker identity detection. Conflicts stop with actual
+source/config diagnostics; machine data is preserved. Bootstrap is not a repair
+or creation fallback.
+Dotfiles Track/Adopt, self-update and migration have no package-install or
+tracker-creation effects. Packages is the browser's separately gated install
+entrypoint below. `--replace-chezmoi` is not a bootstrap repair/retirement shortcut.
+
+After initialization, init offers **Finish** (default), `packages` (separately
+reviewed Install missing with exact plan-ID consent), and `rounds` (prebuilt
+Track/Adopt browser). `dot init --rounds` enters optional rounds after setup;
+`--profile personal|work` chooses only new tracker machine data, not adoption scope.
+Init has no blanket `--yes`. Each dependency gets its own reviewed manager
+operation and default-No consent. Tracker creation separately previews the
+complete config with actual `home/`, HOME, engine, cache/state paths and preserved
+Git identity; private templates/hooks never execute during creation.
+
+Separate optional Track and Adopt rounds start with no
+entries selected and **Finish is the default**. Bootstrap `--yes` skips rounds; installing
+tooling does not approve configuration. Empty adoption scope, including zero
+managed drift, is not whole-machine parity. Unsafe/desktop effects require
+separate acknowledgments. Package pins/application setup are separate tasks.
+Missing tools used by configs are advisory, not permission to install them while browsing.
+
+In either Track or Adopt, Space on a folder selects an exact snapshot of current
+eligible files; `h/l` independently collapse/expand it. `[x]` means all eligible
+files are selected, `[-]` means only some. Adopt stores exact current entry IDs,
+including templates/Unsafe entries with unchanged separate consent gates. Future
+entries remain opt-in. Search, resizing and preview scrolling retain the basket.
+Adopt folder selection/counts include only entries the shared engine reports as
+applicable to the current OS and explicit machine. Inapplicable entries remain
+visible for navigation and metadata editing; a folder never implicitly opts them in.
+
+## Packages beside Dotfiles
+
+`P` switches between Dotfiles and Packages in `dot browse`. Packages reads the
+private checkout's `packages/Brewfile` (macOS), `packages/pacman.txt` and
+`packages/yay.txt` (Arch), or `packages/apt.txt` (Ubuntu). It displays desired,
+installed and missing status. `m` chooses the source, `e` edits it, `L` imports
+a supplied file from inside the private checkout, and `Ctrl+S` saves with a
+private byte-preserving backup. `r` refreshes status. Lists/inventories never
+belong in the public engine or release payload.
+
+Editing, importing, saving, navigation and deselection never install or
+uninstall. `i` explicitly reviews **Install missing**; final consent defaults to
+Cancel. Approval binds an exact plan ID and fresh source/manager/state/resolution
+snapshots. Config approvals cannot install packages. AUR builds require an
+additional explicit risk acknowledgment, run unprivileged, and retain the
+helper's build-script/dependency prompts. Missing managers/sudo never trigger
+a fallback installer. Package names need not be version-pinned; legacy pin
+updates remain separate.
+
+Package installation has exactly two independently reviewed entrypoints:
+Packages **Install missing** and `dot init` (#30). Native manager confirmations
+remain interactive; resolution snapshots are not repository locks. Inspect the
+final dependency transaction and AUR scripts before confirming. No real package
+install or native Linux acceptance is claimed by the fixture tests.
+
+## Platforms and prebuilt release packages
+
+- **macOS:** native Apple Silicon arm64 macOS 15+; no Intel/Rosetta.
+- **Ubuntu:** native amd64/x86_64 or arm64/aarch64 24.04+; 22.04 needs existing
+  Python 3.11+ with tomllib.
+- **Arch:** official Arch x86_64; no ARM/derivatives. Bootstrap/prerequisite
+  provisioning does not use AUR; private Packages lists may explicitly select
+  AUR-only yay targets with the review/consent gates above. If init proposes missing
+  dependencies, its official pacman route must disclose a **full system upgrade**
+  before informed consent. Bootstrap never executes that transaction.
+
+Release assets are `darwin-arm64`, `linux-amd64` (Ubuntu/Arch), and `linux-arm64`
+(Ubuntu). Targets do not need Go. Existing Bash, Git, curl, GitHub CLI, Python
+3.11+ are bootstrap prerequisites; chezmoi and Gum provisioning belongs to init.
+Unsupported/missing prerequisites fail with guidance. GitHub CLI 2.45/2.46 is incompatible. Native platform smoke acceptance
+is distinct from fixture-only mocked package-manager tests.
+
+## Recovery and agent skills
+
+Conflicts or interrupted operations stop with recovery guidance rather than
+resetting checkouts or deleting state. Canonical skills use a bounded singleton
+`skills.bak`; other backups and private history are not public payload.
+Review `skills/setup-dots/SKILL.md` for installation/init boundaries and
+`skills/dot/SKILL.md` for read-only interaction, exact plans and explicit approval.
