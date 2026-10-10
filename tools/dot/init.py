@@ -16,6 +16,14 @@ import re
 import packages
 
 import contract
+import install_state
+
+
+def local_state_dir():
+    home = Path(os.environ['HOME'])
+    if os.environ.get('XDG_STATE_HOME'):
+        return Path(os.environ['XDG_STATE_HOME']) / 'dot'
+    return home.resolve() / '.local/state/dot'
 
 
 def safe_path(path):
@@ -28,32 +36,27 @@ def safe_path(path):
             break
 
 
-def detect(source, engine, config):
+def detect(source, engine, config, enforce_connection=True):
     home = Path(os.environ['HOME'])
     print('Private source: ' + str(source / 'home'))
     print('Actual config: ' + str(config))
-    record_path = home / '.local/state/dot/install.json'
-    for path in (home, source, engine, config, record_path):
+    state_dir = local_state_dir()
+    connection = install_state.read_connection(state_dir)
+    for path in (home, source, config, state_dir):
         safe_path(path)
+    if enforce_connection and connection and (connection['private_source'] != str(source) or connection['config_path'] != str(config)):
+        raise ValueError('private connection record conflicts with requested paths; explicit connection update consent is required')
+    if not source.exists():
+        print('Private checkout pending; no private repository read or tracker change.')
+        return connection, None
     for suffix in ('json', 'jsonc', 'yaml', 'yml'):
         alternate = config.with_suffix('.' + suffix)
         if alternate.exists() or alternate.is_symlink():
             raise ValueError('alternate tracker config exists: ' + str(alternate) + '; review explicitly; no tracker created')
-    record = contract.read_json(record_path)
-    if not isinstance(record, dict):
-        raise ValueError('invalid installation record; review recorded paths and recovery; left untouched')
-    if (record.get('version') != 2 or record.get('directory') != str(source)
-            or record.get('engine') != str(engine.parent.parent)
-            or record.get('config') != str(config)):
-        raise ValueError('installation record conflicts; review dot migrate; left untouched')
-    actual = subprocess.check_output(
-        ['git', '-C', str(source), 'remote', 'get-url', 'origin'], text=True).strip()
-    if actual != record.get('source'):
-        raise ValueError('private remote identity conflicts; no source switched or created')
-    actual_engine = subprocess.check_output(
-        ['git', '-C', str(engine.parent.parent), 'remote', 'get-url', 'origin'], text=True).strip()
-    if actual_engine != record.get('engine_source'):
-        raise ValueError('public remote identity conflicts; review installation record; left untouched')
+    root = Path(subprocess.check_output(['git', '-C', str(source), 'rev-parse', '--show-toplevel'], text=True).strip()).resolve()
+    if root != source.resolve():
+        raise ValueError('private source path is not the Git checkout root; no source was switched')
+    subprocess.check_output(['git', '-C', str(source), 'remote', 'get-url', 'origin'], text=True)
     contract.check(engine, source)
     if config.exists():
         data = tomllib.loads(config.read_text())
@@ -63,7 +66,7 @@ def detect(source, engine, config):
                 or data.get('destDir', str(home)) != str(home)):
             raise ValueError('tracker identity conflict; explicit migration needed: review dot migrate; left untouched')
         print('Compatible tracker detected; machine data preserved.')
-        return record, data
+        return connection, data
     candidates = {home / '.local/share/chezmoi',
                   Path(os.environ.get('XDG_DATA_HOME', str(home / '.local/share'))) / 'chezmoi'}
     for directory in {home / '.config/chezmoi',
@@ -73,7 +76,7 @@ def detect(source, engine, config):
         if candidate != config and (candidate.exists() or candidate.is_symlink()):
             raise ValueError('existing unrecorded tracker: ' + str(candidate) + '; explicit migration/recovery needed; data left untouched')
     print('Tracker pending; no configuration applied.')
-    return record, None
+    return connection, None
 
 
 def ask(prompt):
@@ -90,10 +93,57 @@ def consent(prompt):
     return ask(prompt + ' [y/N]') in ('y', 'yes')
 
 
-def compatible(tool):
-    if not shutil.which(tool):
+def retrieve_private_checkout(source, engine):
+    """Retrieve only the named private source, after separate terminal consent."""
+    if source.exists() or source.is_symlink():
+        return True
+    repository = 'ujjwal6792/dotfiles'
+    print('Private configuration retrieval is separate from public CLI installation and tracker creation.', flush=True)
+    print('Repository: https://github.com/' + repository + '\nDestination: ' + str(source), flush=True)
+    print('Retrieval reads this private repository after approval. It will not create a replacement repository, change authentication, or modify the installer-owned record.', flush=True)
+    if not consent('Retrieve this exact private repository?'):
+        print('Private checkout pending: retrieval declined; no repository or tracker created.')
         return False
-    result = subprocess.run([tool, '--version'], capture_output=True, text=True)
+    safe_path(source)
+    if not source.is_absolute():
+        raise ValueError('private checkout destination must be absolute')
+    parent = source.parent
+    metadata = subprocess.run(['gh', 'api', 'repos/' + repository], capture_output=True, text=True)
+    if metadata.returncode:
+        raise ValueError('private repository access denied or unavailable; no fallback repository created')
+    try:
+        identity = json.loads(metadata.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError('GitHub returned invalid repository identity; no clone attempted') from error
+    if identity.get('full_name', '').casefold() != repository.casefold() or identity.get('private') is not True:
+        raise ValueError('repository identity/visibility mismatch; no clone attempted')
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    with tempfile.TemporaryDirectory(prefix='.dot-private-', dir=parent) as temporary:
+        checkout = Path(temporary) / 'checkout'
+        result = subprocess.run(['gh', 'repo', 'clone', repository, str(checkout)], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError('private repository clone failed; existing files were not replaced')
+        remote = subprocess.run(['git', '-C', str(checkout), 'remote', 'get-url', 'origin'], capture_output=True, text=True)
+        if remote.returncode:
+            raise ValueError('cloned repository has no verifiable origin; checkout not published')
+        actual = remote.stdout.strip().removesuffix('.git').lower()
+        accepted = {'https://github.com/' + repository, 'git@github.com:' + repository}
+        if actual not in accepted:
+            raise ValueError('cloned repository origin mismatch; checkout not published')
+        contract.check(engine, checkout)
+        if source.exists() or source.is_symlink():
+            raise ValueError('private checkout destination appeared during retrieval; preserved it')
+        os.rename(checkout, source)
+    print('Private checkout retrieved and contract-checked. Tracker creation remains a separate consent.', flush=True)
+    return True
+
+
+def compatible(tool):
+    executable = os.environ.get('DOT_PYTHON') if tool == 'python3' else None
+    executable = executable or shutil.which(tool)
+    if not executable:
+        return False
+    result = subprocess.run([executable, '--version'], capture_output=True, text=True)
     if result.returncode != 0:
         return False
     if tool == 'gh':
@@ -103,7 +153,7 @@ def compatible(tool):
         return all(subprocess.run(['gh', 'auth', verb, '--help'], stdout=subprocess.DEVNULL,
                                   stderr=subprocess.DEVNULL).returncode == 0 for verb in ('setup-git', 'switch'))
     if tool == 'python3':
-        return subprocess.run(['python3', '-c', 'import sys,tomllib; sys.exit(sys.version_info < (3,11))'],
+        return subprocess.run([executable, '-c', 'import sys,tomllib; sys.exit(sys.version_info < (3,11))'],
                               stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL).returncode == 0
     return True
 
@@ -320,8 +370,9 @@ def create_tracker(source, engine, config, record, profile):
 def browser_rounds(source, engine, config):
     detect(source, engine, config)
     browser = Path(os.environ.get('DOT_BROWSER', str(engine.parent.parent / 'bin/dot-browser')))
-    safe_path(browser)
-    if not browser.is_file() or not os.access(browser, os.X_OK):
+    if (not browser.is_absolute() or browser.is_symlink() or
+            browser.resolve().parent != (engine.parent.parent / 'bin').resolve() or
+            not browser.is_file() or not os.access(browser, os.X_OK)):
         print('Browser unavailable; install a reviewed compatible prebuilt artifact. No Go build or fallback application. Finish remains available.')
         return
     print('Optional Track and Adopt rounds: nothing selected; Finish default. Each mutation needs separate exact-plan consent.', flush=True)
@@ -334,14 +385,50 @@ def main():
     parser.add_argument('--check', action='store_true', help='read-only identity detection')
     parser.add_argument('--rounds', action='store_true', help='offer prebuilt Track/Adopt rounds after setup; Finish default')
     parser.add_argument('--profile', choices=['personal', 'work'], default='personal')
+    parser.add_argument('--source', help='explicit private checkout path; never inferred from the public engine')
+    parser.add_argument('--config', help='explicit local chezmoi config path')
     args = parser.parse_args()
-    source = Path(os.environ['DOT_SOURCE'])
+    home = Path(os.environ['HOME'])
+    state_dir = local_state_dir()
+    connection = install_state.read_connection(state_dir)
+    source_value = args.source or os.environ.get('DOT_SOURCE')
+    config_value = args.config or os.environ.get('DOT_CONFIG')
+    if connection:
+        source_value = source_value or connection['private_source']
+        config_value = config_value or connection['config_path']
+    source_value = source_value or str(home / '.local/share/dot-config')
+    config_value = config_value or str(Path(os.environ.get('XDG_CONFIG_HOME', str(home / '.config'))) / 'chezmoi/chezmoi.toml')
+    source = Path(source_value)
     engine = Path(os.environ['DOT_ENGINE'])
-    config = Path(os.environ['DOT_CONFIG'])
-    record, data = detect(source, engine, config)
+    config = Path(config_value)
     if args.check:
+        detect(source, engine, config)
         return 0
     platform()
+    source_changed = bool(connection and connection['private_source'] != str(source))
+    config_changed = bool(connection and connection['config_path'] != str(config))
+    new_connection = connection is None or source_changed or config_changed
+    if source_changed or config_changed:
+        print('Requested private connection paths differ from the saved connection.')
+        print('Existing connection and all local approval/recovery state will be preserved unless this connection-only update is approved.')
+        if not consent('Update the private source/config connection to these exact paths?'):
+            print('Connection unchanged; no private source or tracker operation performed.')
+            return 0
+    if not source.exists():
+        if not retrieve_private_checkout(source, engine):
+            return 0
+    elif new_connection:
+        print('Private source: ' + str(source))
+        print('Tracker config path: ' + str(config))
+        print('Connection setup reads this checkout only after approval; tracker creation remains a separate consent.')
+        if not consent('Connect to this exact existing private checkout?'):
+            print('Private connection pending: declined; no private source or tracker read/creation performed.')
+            return 0
+    record, data = detect(source, engine, config, enforce_connection=not new_connection)
+    if new_connection:
+        install_state.write_connection(state_dir, str(source), str(config))
+        record, data = detect(source, engine, config)
+
     def validate():
         if detect(source, engine, config) != (record, data):
             raise ValueError('stale installation/tracker identity; review again')
