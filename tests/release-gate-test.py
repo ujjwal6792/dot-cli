@@ -2,6 +2,7 @@
 """Offline safety tests for the GitHub release publication gate."""
 import importlib.util
 import hashlib
+import json
 import tempfile
 from pathlib import Path
 import unittest
@@ -19,6 +20,9 @@ CHECK_SPEC.loader.exec_module(CHECKER)
 ASSET_SPEC = importlib.util.spec_from_file_location('verify_release_assets', ROOT / 'scripts/verify-release-assets.py')
 ASSET_CHECKER = importlib.util.module_from_spec(ASSET_SPEC)
 ASSET_SPEC.loader.exec_module(ASSET_CHECKER)
+DRAFT_SPEC = importlib.util.spec_from_file_location('draft_release', ROOT / 'scripts/draft-release.py')
+DRAFT = importlib.util.module_from_spec(DRAFT_SPEC)
+DRAFT_SPEC.loader.exec_module(DRAFT)
 
 
 class ReleaseGateTests(unittest.TestCase):
@@ -95,6 +99,59 @@ class ReleaseGateTests(unittest.TestCase):
                 ASSET_CHECKER.verify(first, [dict(item, digest='sha256:' + '0' * 64) for item in uploaded])
             with self.assertRaisesRegex(ValueError, 'names differ'):
                 ASSET_CHECKER.verify(first, uploaded[:-1])
+
+    def test_draft_is_found_by_tag_then_fetched_and_published_by_id(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            asset = directory / 'package.tar.gz'
+            asset.write_bytes(b'verified package')
+            digest = 'sha256:' + hashlib.sha256(asset.read_bytes()).hexdigest()
+            record = {'id': 41, 'tag_name': 'v0.1.0-rc.2', 'target_commitish': 'a' * 40,
+                      'draft': True, 'prerelease': True,
+                      'assets': [{'name': asset.name, 'digest': digest}]}
+            calls = []
+
+            def fake_gh(*args):
+                calls.append(args)
+                if args == ('--paginate', 'repos/owner/repo/releases'):
+                    return json.dumps([record])
+                if args == ('repos/owner/repo/releases/41',):
+                    return json.dumps(record)
+                return '{}'
+
+            original = DRAFT.gh
+            DRAFT.gh = fake_gh
+            try:
+                release_id = DRAFT.prepare('owner/repo', 'v0.1.0-rc.2', 'a' * 40, directory)
+                DRAFT.publish('owner/repo', release_id)
+            finally:
+                DRAFT.gh = original
+            self.assertEqual(calls[1], ('repos/owner/repo/releases/41',))
+            self.assertEqual(calls[2][:3], ('--method', 'PATCH', 'repos/owner/repo/releases/41'))
+
+    def test_draft_lookup_fails_closed_for_mismatch_duplicate_or_missing_digest(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            asset = directory / 'package.tar.gz'
+            asset.write_bytes(b'package')
+            digest = 'sha256:' + hashlib.sha256(asset.read_bytes()).hexdigest()
+            record = {'id': 41, 'tag_name': 'v0.1.0-rc.2', 'target_commitish': 'a' * 40,
+                      'draft': True, 'prerelease': True,
+                      'assets': [{'name': asset.name, 'digest': digest}]}
+            original = DRAFT.gh
+            try:
+                for bad in (dict(record, target_commitish='b' * 40),
+                            dict(record, assets=[{'name': asset.name, 'digest': None}])):
+                    def fake_gh(*args, bad=bad):
+                        return json.dumps([bad]) if args[0] == '--paginate' else json.dumps(bad)
+                    DRAFT.gh = fake_gh
+                    with self.subTest(bad=bad), self.assertRaises(ValueError):
+                        DRAFT.prepare('owner/repo', 'v0.1.0-rc.2', 'a' * 40, directory)
+                DRAFT.gh = lambda *args: json.dumps([record, record])
+                with self.assertRaisesRegex(ValueError, 'multiple'):
+                    DRAFT.prepare('owner/repo', 'v0.1.0-rc.2', 'a' * 40, directory)
+            finally:
+                DRAFT.gh = original
 
 
 if __name__ == '__main__':
