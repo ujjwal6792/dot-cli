@@ -60,6 +60,7 @@ case "$PART" in
     python3 tests/browser-api-test.py
     python3 tests/tracking-cli-test.py
     python3 tests/packages-test.py
+    python3 tests/release-gate-test.py
     ;;
   go)
     (cd tools/dot/browser && go test ./...)

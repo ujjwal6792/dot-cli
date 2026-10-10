@@ -248,6 +248,9 @@ Release assets are `darwin-arm64`, `linux-amd64` (Ubuntu/Arch), and `linux-arm64
 3.11+ are bootstrap prerequisites; chezmoi and Gum provisioning belongs to init.
 Unsupported/missing prerequisites fail with guidance. GitHub CLI 2.45/2.46 is incompatible. Native platform smoke acceptance
 is distinct from fixture-only mocked package-manager tests.
+Maintainers: follow [`docs/releasing.md`](docs/releasing.md) to dispatch and
+review a GitHub-built prerelease; checksums are integrity checks, not build
+attestations.
 
 ## Recovery and agent skills
 
