@@ -423,9 +423,78 @@ PY
   cat > "$BATS_TEST_TMPDIR/review-bin/git" <<'SH'
 #!/usr/bin/env bash
 set -euo pipefail
+# Parse Git global options in order; runner-added -c overrides may follow -C.
+args=("$@")
+i=0; checkout_seen=no; checkout_matches=yes; subcommand=''; command_index=0
+while [ "$i" -lt "${#args[@]}" ]; do
+  arg="${args[$i]}"
+  case "$arg" in
+    -c)
+      i=$((i + 2))
+      ;;
+    -c?*)
+      i=$((i + 1))
+      ;;
+    -C)
+      next=$((i + 1))
+      if [ "$next" -ge "${#args[@]}" ]; then
+        break
+      fi
+      checkout_seen=yes
+      [ "${args[$next]}" = "$REVIEW_SOURCE" ] || checkout_matches=no
+      i=$((i + 2))
+      ;;
+    -C?*)
+      checkout_seen=yes
+      [ "${arg#-C}" = "$REVIEW_SOURCE" ] || checkout_matches=no
+      i=$((i + 1))
+      ;;
+    --git-dir|--work-tree|--namespace|--exec-path|--super-prefix|--config-env)
+      i=$((i + 2))
+      ;;
+    --git-dir=*|--work-tree=*|--namespace=*|--exec-path=*|--super-prefix=*|--config-env=*)
+      i=$((i + 1))
+      ;;
+    --no-pager|--bare|--literal-pathspecs|--no-replace-objects|--no-optional-locks|--no-lazy-fetch|--paginate)
+      i=$((i + 1))
+      ;;
+    --)
+      break
+      ;;
+    -*)
+      break
+      ;;
+    *)
+      subcommand="$arg"
+      command_index=$((i + 1))
+      break
+      ;;
+  esac
+done
+has_porcelain=no; has_untracked=no; has_ignored=no
+if [ "$subcommand" = status ]; then
+  i=$command_index
+  while [ "$i" -lt "${#args[@]}" ]; do
+    arg="${args[$i]}"
+    [ "$arg" != --porcelain=v1 ] || has_porcelain=yes
+    [ "$arg" != --untracked-files=all ] || has_untracked=yes
+    [ "$arg" != --ignored ] || has_ignored=yes
+    i=$((i + 1))
+  done
+fi
+matches_review=no
+if [ "$checkout_seen" = yes ] && [ "$checkout_matches" = yes ] &&
+   [ "$subcommand" = status ] && [ "$has_porcelain" = yes ] &&
+   [ "$has_untracked" = yes ] && [ "$has_ignored" = yes ]; then
+  matches_review=yes
+fi
+if [ "${REVIEW_PROBE:-}" = 1 ]; then
+  echo "$matches_review"
+  exit 0
+fi
 "$REAL_GIT" "$@"
 # The second private status is after candidate preview and before revalidation.
-if [[ " $* " == *" -C $REVIEW_SOURCE status "* ]]; then
+if [ "$matches_review" = yes ]; then
   count=0
   [ ! -f "$REVIEW_COUNTER" ] || count=$(cat "$REVIEW_COUNTER")
   count=$((count + 1)); printf '%s\n' "$count" > "$REVIEW_COUNTER"
@@ -441,14 +510,40 @@ if [[ " $* " == *" -C $REVIEW_SOURCE status "* ]]; then
 fi
 SH
   chmod +x "$BATS_TEST_TMPDIR/review-bin/git"
+  other="$BATS_TEST_TMPDIR/other-checkout"
+  mkdir -p "$other"
+  git init -q "$other"
+  run env REVIEW_PROBE=1 "$BATS_TEST_TMPDIR/review-bin/git" \
+    -C "$other" --work-tree "$REVIEW_SOURCE" status \
+    --porcelain=v1 --untracked-files=all --ignored
+  [ "$status" -eq 0 ]
+  [ "$output" = no ]
+  run env REVIEW_PROBE=1 "$BATS_TEST_TMPDIR/review-bin/git" \
+    -C "$other" -c "fixture.path=$REVIEW_SOURCE" status \
+    --porcelain=v1 --untracked-files=all --ignored
+  [ "$status" -eq 0 ]
+  [ "$output" = no ]
+  run env REVIEW_PROBE=1 "$BATS_TEST_TMPDIR/review-bin/git" \
+    -C "$REVIEW_SOURCE" --work-tree status --git-dir --porcelain=v1 \
+    --namespace --untracked-files=all --exec-path --ignored rev-parse HEAD
+  [ "$status" -eq 0 ]
+  [ "$output" = no ]
+  [ ! -e "$REVIEW_COUNTER" ]
+  run env REVIEW_PROBE=1 "$BATS_TEST_TMPDIR/review-bin/git" \
+    -C "$REVIEW_SOURCE" -c fixture.marker=interleaved status \
+    --porcelain=v1 --untracked-files=all --ignored
+  [ "$status" -eq 0 ]
+  [ "$output" = yes ]
+  [ ! -e "$REVIEW_COUNTER" ]
   for change in bytes mode approval; do
+    rm -f "$REVIEW_COUNTER.target" "$REVIEW_COUNTER.approval"
     printf 'old\n' > "$HOME/.config/example.conf"
     chmod 644 "$HOME/.config/example.conf"
     cp "$BATS_TEST_TMPDIR/approval-before" "$HOME/.local/state/dot/adoption.json"
     printf '0\n' > "$REVIEW_COUNTER"
     run env PATH="$BATS_TEST_TMPDIR/review-bin:$PATH" REVIEW_CHANGE="$change" "$ENGINE/dot" pull --yes
-    [ "$status" -ne 0 ]
     [ -f "$REVIEW_COUNTER.target" ]
+    [ "$status" -ne 0 ]
     [ "$before" = "$(git -C "$SOURCE" rev-parse HEAD)" ]
     [ "$public" = "$(git -C "$ENGINE/../.." rev-parse HEAD)" ]
     cmp "$REVIEW_COUNTER.target" "$HOME/.config/example.conf"
