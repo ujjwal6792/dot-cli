@@ -2,29 +2,34 @@
 # Standalone/public-safe installer. No private config payload belongs here.
 set -Eeuo pipefail
 umask 077
-YES=false REPLACE_CHEZMOI=false STAGE=install DIRECTORY="${HOME:?HOME is required}/.local/share/dot"
-REPOSITORY=ujjwal6792/dotfiles SOURCE_URL='' UPDATE=ask PROFILE=personal ZSH_DIRECTORY=''
-DEPENDENCIES=(bash git curl gh python3 chezmoi gum)
+YES=false REPLACE_CHEZMOI=false STAGE=install DIRECTORY="${HOME:?HOME is required}/.local/share/dot-config" ENGINE_DIRECTORY="${HOME:?HOME is required}/.local/share/dot-cli" BROWSER_URL='' BROWSER_SHA256=''
+REPOSITORY=ujjwal6792/dotfiles SOURCE_URL='' ENGINE_URL='' ENGINE_REPOSITORY=ujjwal6792/dots-cli UPDATE=ask PROFILE=personal ZSH_DIRECTORY=''
+DEPENDENCIES=(bash git curl gh python3)
 TEMP='' PHASE=arguments PLATFORM='' UBUNTU_VERSION='' DEB_ARCH=''
+OWNED_BROWSER_TMP=''
+OWNED_CHECKOUT_TMP=''
 fail() { printf 'dot installer: %s\n' "$*" >&2; exit 1; }
 cleanup() {
   [ -z "$TEMP" ] || rm -f -- "$TEMP/homebrew.sh" "$TEMP/"*.deb "$TEMP/dot-github-cli.gpg" "$TEMP/dot-github-cli.list"
   [ -z "$TEMP" ] || rmdir "$TEMP" 2>/dev/null || true
+  [ -z "$OWNED_BROWSER_TMP" ] || rm -f -- "$OWNED_BROWSER_TMP"
+  # Only the private directory returned by this invocation's mktemp is owned.
+  [ -z "$OWNED_CHECKOUT_TMP" ] || rm -rf -- "$OWNED_CHECKOUT_TMP"
 }
 trap cleanup EXIT
 trap 'printf "dot installer: incomplete during %s; inspect the diagnostic, adoption results/recovery if applicable, and rerun.\n" "$PHASE" >&2' ERR
 usage() {
-  echo 'usage: bootstrap.sh [--yes] [--replace-chezmoi] [--directory ABSOLUTE_PATH] [--zsh-directory ABSOLUTE_PATH] [--existing update|keep] [--profile personal|work] [--repository OWNER/REPO] [--source-url ABSOLUTE_LOCAL_FIXTURE] [--stage install|dependencies|migration|adoption]'
+  echo 'usage: bootstrap.sh [--yes] [--directory ABSOLUTE_PATH] [--engine-directory ABSOLUTE_PATH] [--engine-url ABSOLUTE_LOCAL_FIXTURE] [--source-url ABSOLUTE_LOCAL_FIXTURE] [--browser-url HTTPS_OR_ABSOLUTE_FIXTURE --browser-sha256 REVIEWED_SHA256] [--stage install|dependencies|migration|adoption]'
 }
 while [ $# -gt 0 ]; do
   case "$1" in
     --yes) YES=true; shift ;;
     --replace-chezmoi) REPLACE_CHEZMOI=true; shift ;;
-    --directory|--zsh-directory|--existing|--profile|--repository|--source-url|--stage)
+    --directory|--engine-directory|--zsh-directory|--existing|--profile|--repository|--source-url|--engine-url|--browser-url|--browser-sha256|--stage)
       [ $# -ge 2 ] || fail "missing value for $1"
       case "$1" in
-        --directory) DIRECTORY="$2" ;; --zsh-directory) ZSH_DIRECTORY="$2" ;; --existing) UPDATE="$2" ;; --profile) PROFILE="$2" ;;
-        --repository) REPOSITORY="$2" ;; --source-url) SOURCE_URL="$2" ;; --stage) STAGE="$2" ;;
+        --directory) DIRECTORY="$2" ;; --engine-directory) ENGINE_DIRECTORY="$2" ;; --zsh-directory) ZSH_DIRECTORY="$2" ;; --existing) UPDATE="$2" ;; --profile) PROFILE="$2" ;;
+        --repository) REPOSITORY="$2" ;; --source-url) SOURCE_URL="$2" ;; --engine-url) ENGINE_URL="$2" ;; --browser-url) BROWSER_URL="$2" ;; --browser-sha256) BROWSER_SHA256="$2" ;; --stage) STAGE="$2" ;;
       esac
       shift 2 ;;
     --help|-h) usage; exit 0 ;;
@@ -32,15 +37,23 @@ while [ $# -gt 0 ]; do
   esac
 done
 case "$DIRECTORY" in /*) ;; *) fail '--directory must be absolute' ;; esac
+case "$ENGINE_DIRECTORY" in /*) ;; *) fail '--engine-directory must be absolute' ;; esac
 case "$PROFILE" in personal|work) ;; *) fail 'profile must be personal or work' ;; esac
 case "$UPDATE" in ask|update|keep) ;; *) fail 'existing choice must be update or keep' ;; esac
-case "$STAGE" in install|dependencies|migration|adoption) ;; *) fail 'unknown stage' ;; esac
+  case "$STAGE" in install|dependencies|migration|adoption) ;; *) fail 'unknown stage' ;; esac
 [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'repository must be OWNER/REPO, without credentials'
 if [ -n "$SOURCE_URL" ]; then
   case "$SOURCE_URL" in /*) ;; *) fail '--source-url accepts only absolute local fixture paths' ;; esac
 else
   SOURCE_URL="https://github.com/$REPOSITORY.git"
 fi
+if [ -n "$ENGINE_URL" ]; then case "$ENGINE_URL" in /*) ;; *) fail '--engine-url accepts only absolute local fixture paths' ;; esac; else ENGINE_URL="https://github.com/$ENGINE_REPOSITORY.git"; fi
+if [ -n "$BROWSER_URL" ]; then
+  [[ "$BROWSER_SHA256" =~ ^[0-9a-fA-F]{64}$ ]] || fail '--browser-sha256 must be a reviewed 64-digit SHA-256'
+  BROWSER_SHA256="$(printf '%s' "$BROWSER_SHA256" | LC_ALL=C tr 'A-F' 'a-f')"
+  case "$BROWSER_URL" in https://*) ;; /*) ;; *) fail '--browser-url must be HTTPS or an absolute fixture path' ;; esac
+  case "$BROWSER_URL" in https://*@*|*\?*|*\#*) fail '--browser-url must not contain credentials, query parameters, or fragments' ;; esac
+elif [ -n "$BROWSER_SHA256" ]; then fail '--browser-sha256 requires --browser-url'; fi
 [ "$(id -u)" != 0 ] || fail 'do not run the whole installer as root or through sudo'
 optional_adoption() {
   echo 'Installation and adoption are separate. Safe means lower impact, not loss-free replacement.'
@@ -49,25 +62,23 @@ optional_adoption() {
     printf 'Later: "%s/tools/dot/dot" intent rounds (or agent intent plan/preview/apply with exact approval).\n' "$DIRECTORY"
     return
   fi
-  if [ ! -f "$DIRECTORY/tools/dot/intent.py" ] || [ ! -d "$DIRECTORY/home" ]; then
-    [ "$STAGE" != adoption ] || fail 'optional adoption requires the updated dedicated-source checkout; finish install-only/update first'
-    echo 'Kept checkout predates exact adoption rounds. Update explicitly before optional adoption; scope unchanged.'
+  if [ ! -f "$HOME/.local/bin/dot" ]; then
+    [ "$STAGE" != adoption ] || fail 'optional rounds require the installed split launcher; finish bootstrap first'
+    echo 'Optional Track/Adopt rounds unavailable; initialization is pending for dot init.'
     return
   fi
-  [ -f "$DIRECTORY/tools/dot/dot" ] && [ ! -L "$DIRECTORY/tools/dot/dot" ] || fail 'optional adoption requires the installed checkout'
-  # An adoption-only invocation never provisions dependencies or touches access,
-  # launcher, PATH, legacy managers, or installation metadata.
-  command -v python3 >/dev/null || fail 'optional adoption needs Python 3.11+; use install-only to set up prerequisites'
+  [ -x "$ENGINE_DIRECTORY/tools/dot/dot" ] && [ ! -L "$ENGINE_DIRECTORY/tools/dot/dot" ] || fail 'optional rounds require installed public engine'
+  [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/chezmoi/chezmoi.toml" ] || { echo 'Tracker initialization is pending; run dot init. Finish selected; no changes made.'; return; }
   local config
-  config="$(python3 - "$HOME" "$DIRECTORY" <<'PY'
+  config="$(python3 - "$HOME" "$DIRECTORY" "$ENGINE_DIRECTORY" <<'PY'
 import json, sys
 from pathlib import Path
-home, checkout = map(Path, sys.argv[1:])
+home, checkout, engine = map(Path, sys.argv[1:])
 record = home / '.local/state/dot/install.json'
 if record.resolve() != home.resolve() / record.relative_to(home):
     raise SystemExit('installation record must not traverse symlinks')
 data = json.loads(record.read_text())
-if data.get('directory') != str(checkout) or data.get('version') != 1:
+if data.get('directory') != str(checkout) or data.get('engine') != str(engine) or data.get('version') != 2:
     raise SystemExit('optional adoption requires a matching installation record')
 print(data['config'])
 PY
@@ -76,7 +87,7 @@ PY
   if ! { exec 3<> /dev/tty; } 2>/dev/null; then
     fail 'optional adoption needs a terminal; use agent intent plan/preview/apply instead'
   fi
-  DOT_SOURCE="$DIRECTORY" DOT_CONFIG="$config" bash "$DIRECTORY/tools/dot/dot" intent rounds <&3 >&3 2>&3
+  DOT_SOURCE="$DIRECTORY" DOT_ENGINE="$ENGINE_DIRECTORY/tools/dot" DOT_BROWSER="$ENGINE_DIRECTORY/bin/dot-browser" DOT_CONFIG="$config" "$HOME/.local/bin/dot" init --rounds <&3 >&3 2>&3
 }
 if [ "$STAGE" = adoption ]; then optional_adoption; exit 0; fi
 PHASE=platform
@@ -115,6 +126,14 @@ platform_check() {
   esac
 }
 platform_check
+prepare_browser() {
+  [ -n "$BROWSER_URL" ] || return 0
+  command -v shasum >/dev/null || fail 'shasum is required to verify browser artifact'
+  OWNED_BROWSER_TMP="$(mktemp "${TMPDIR:-/var/tmp}/dot-browser.XXXXXXXX")"
+  case "$BROWSER_URL" in https://*) curl --fail --silent --show-error --location --proto '=https' --proto-redir '=https' --tlsv1.2 "$BROWSER_URL" -o "$OWNED_BROWSER_TMP" ;; /*) cp "$BROWSER_URL" "$OWNED_BROWSER_TMP" ;; esac
+  [ "$(shasum -a 256 "$OWNED_BROWSER_TMP" | awk '{print $1}')" = "$BROWSER_SHA256" ] || fail 'browser artifact checksum mismatch; not installed'
+  chmod 755 "$OWNED_BROWSER_TMP"
+}
 if ! "$YES"; then
   # stdin may contain this very script. Never consume it for questions.
   if ! { exec 3<> /dev/tty; } 2>/dev/null; then
@@ -377,23 +396,25 @@ ubuntu_github_repository() {
   echo 'GitHub CLI repository configured; these disclosed repository files remain if a later step fails.'
   ubuntu_sudo env DEBIAN_FRONTEND=noninteractive apt-get update --error-on=any
 }
-platform_dependencies
-[ "$STAGE" != dependencies ] || exit 0
+platform_check
+for tool in bash git curl python3; do compatible "$tool" || { [ "$STAGE" = dependencies ] && { echo "Missing/incompatible prerequisite: $tool; dot init owns dependency setup."; exit 0; }; fail "missing/incompatible prerequisite $tool (Python 3.11+ required); bootstrap does not install dependencies"; }; done
+[ "$STAGE" = dependencies ] && { echo 'Dependency detection only; explicit setup belongs to dot init.'; exit 0; }
 
 # This Python payload is installer logic, not private configuration. It performs
 # preflight checks and atomic, ownership-checked installation of local metadata.
 local_setup() {
   python3 - --action "$1" --home "$HOME" --directory "$DIRECTORY" \
     --source "$SOURCE_URL" --profile "$PROFILE" --brew-bin "$BREW_BIN" \
-    --python-bin "$PYTHON_BIN" --zsh-directory "$ZSH_DIRECTORY" --yes "$YES" --replace "$REPLACE_CHEZMOI" <<'PY'
+    --python-bin "$PYTHON_BIN" --zsh-directory "$ZSH_DIRECTORY" --yes "$YES" --replace "$REPLACE_CHEZMOI" --engine-directory "$ENGINE_DIRECTORY" <<'PY'
 import argparse, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib, uuid
 parser = argparse.ArgumentParser(add_help=False)
-for name in ('action', 'home', 'directory', 'source', 'profile', 'brew-bin', 'python-bin', 'zsh-directory', 'yes', 'replace'):
+for name in ('action', 'home', 'directory', 'source', 'profile', 'brew-bin', 'python-bin', 'zsh-directory', 'yes', 'replace', 'engine-directory'):
     parser.add_argument('--' + name, required=True)
 settings = parser.parse_args()
 action, source, profile = settings.action, settings.source, settings.profile
 home = pathlib.Path(settings.home)
 checkout = pathlib.Path(settings.directory)
+engine = pathlib.Path(settings.engine_directory)
 state = home / '.local/state/dot/install.json'
 scope = home / '.local/state/dot/adoption.json'
 current_cache = home / '.local/state/dot/chezmoi-cache'
@@ -409,6 +430,8 @@ def reject_symlink_redirects(path):
     # Reject user-owned symlink redirects, including ancestor redirects. System
     # /var -> /private/var links outside HOME are not configuration ownership.
     for part in [path, *path.parents]:
+        if part == home and part.is_symlink():
+            fail(f'path conflict (symlink): {part}; left untouched')
         if part == home:
             break
         if part.is_symlink():
@@ -496,29 +519,23 @@ if not zdot.is_absolute():
     fail('ZDOTDIR must be absolute')
 login = next((home / p for p in ('.bash_profile', '.bash_login', '.profile') if (home / p).exists()), home / '.bash_profile')
 startup = list(dict.fromkeys([login, home / '.bashrc', zdot / '.zprofile', zdot / '.zshrc']))
-expected = '#!/usr/bin/env bash\n# dot installer launcher v1\nexport DOT_SOURCE=' + shlex.quote(str(checkout)) + '\nexport DOT_CONFIG=' + shlex.quote(str(config)) + '\nexec ' + shlex.quote(str(checkout / 'tools/dot/dot')) + ' "$@"\n'
+expected = '#!/usr/bin/env bash\nexport DOT_SOURCE=' + shlex.quote(str(checkout)) + '\nexport DOT_ENGINE=' + shlex.quote(str(engine / 'tools/dot')) + '\nexport DOT_BROWSER=' + shlex.quote(str(engine / 'bin/dot-browser')) + '\nexport DOT_CONFIG=' + shlex.quote(str(config)) + '\nexec ' + shlex.quote(str(engine / 'tools/dot/dot')) + ' "$@"\n'
 
 def installation_record():
-    check_manager_migration()
-    for path in [state, scope, config, launcher, checkout, current_cache, current_state, *startup]:
+    # Bootstrap detects only the split installation record; dot init owns the tracker.
+    for path in [state, scope, config, launcher, checkout, engine, current_cache, current_state, *startup]:
         reject_symlink_redirects(path)
     if not state.exists():
-        if scope.exists():
-            fail('existing adoption profile has no installation record; review it before installation')
-        if present(current_cache) or present(current_state):
-            fail('incomplete retirement: dedicated current manager paths conflict without an installation record; left untouched; review manually')
         return None
     record = json.loads(state.read_text())
-    if record.get('version') != 1 or record.get('directory') != str(checkout) or record.get('source') != source or record.get('config') != str(config):
+    if record.get('version') != 2 or record.get('directory') != str(checkout) or record.get('engine') != str(engine):
         fail('installation record conflicts with requested checkout/source/config; left untouched')
-    if not scope.exists() or not config.is_file():
-        fail('incomplete installation metadata; restore/review scope and config before retrying')
-    data = tomllib.loads(config.read_text())
-    if data.get('sourceDir') not in (str(checkout), str(checkout / 'home')):
-        fail('chezmoi source conflicts with installation record; migration needed')
-    if 'cache' in record or 'persistent_state' in record:
-        if record.get('cache') != str(current_cache) or record.get('persistent_state') != str(current_state) or data.get('cacheDir') != str(current_cache) or data.get('persistentState') != str(current_state):
-            fail('incomplete retirement: current manager paths conflict with installation record; review manually; left untouched')
+    if config.exists():
+        data = tomllib.loads(config.read_text())
+        if data.get('sourceDir') not in (str(checkout), str(checkout / 'home')):
+            fail('chezmoi source conflicts with installation record; migration needed')
+        if data.get('data', {}).get('dotEngine') != str(engine / 'tools/dot'):
+            fail('chezmoi dotEngine conflicts with installation record; migration needed')
     return record
 
 def present(path):
@@ -1001,6 +1018,30 @@ def check_checkout_and_launcher():
         git('symbolic-ref', '--quiet', '--short', 'HEAD')
         if not git('rev-parse', '--abbrev-ref', '@{upstream}').startswith('origin/'):
             fail('checkout upstream is not origin; left untouched')
+    if engine.exists():
+        reject_symlink_redirects(engine / '.git')
+        if not (engine / '.git').is_dir() or subprocess.check_output(['git', '-C', str(engine), 'remote', 'get-url', 'origin'], text=True).strip() != os.environ['DOT_ENGINE_URL']:
+            fail('unrelated public engine checkout conflict; left untouched: ' + str(engine))
+        if not (engine / 'tools/dot/dot').is_file(): fail('public engine checkout is incomplete; left untouched')
+    for candidate in (home / '.local/share/dot',):
+        if candidate.exists(): fail('legacy installation detected at ' + str(candidate) + '; explicit split migration required; left untouched')
+
+def check_contract():
+    for path in (engine / 'tools/dot/dot', engine / 'tools/dot/contract.py'):
+        reject_symlink_redirects(path)
+        if not path.is_file():
+            fail('public engine entrypoint is missing; no install metadata or launcher changed')
+    if not os.access(engine / 'tools/dot/dot', os.X_OK):
+        fail('public engine CLI is not executable; no install metadata or launcher changed')
+    if not (engine / 'tools/dot/dot').is_file() or not (engine / 'tools/dot/contract.py').is_file():
+        fail('public engine contract checker is missing; no install metadata or launcher changed')
+    if not (checkout / 'dot-contract.json').is_file():
+        fail('private source contract is missing; no install metadata or launcher changed')
+    contract_runner = ['python3', str(engine / 'tools/dot/contract.py'), 'check', '--engine', str(engine / 'tools/dot'), '--source', str(checkout)]
+    subprocess.run(contract_runner, check=True)
+    config_data = tomllib.loads(config.read_text()) if config.exists() else {}
+    if record is not None and config.exists() and config_data.get('data', {}).get('dotEngine') != str(engine / 'tools/dot'):
+        fail('installed engine contract path conflicts with config; explicit migration required')
 
 def check_startup_markers():
     for path in startup:
@@ -1009,17 +1050,16 @@ def check_startup_markers():
             fail('malformed PATH markers; left untouched: ' + str(path))
 
 def configure_chezmoi(record):
-    if not (checkout / 'tools/dot/dot').is_file() or not os.access(checkout / 'tools/dot/dot', os.X_OK):
-        fail('checkout lacks an executable dot implementation')
+    if not (engine / 'tools/dot/dot').is_file() or not os.access(engine / 'tools/dot/dot', os.X_OK): fail('public engine lacks an executable dot implementation')
     if record is None:
         if not (checkout / 'home/.chezmoiignore').is_file():
             fail('checkout lacks dedicated home/ source; no unscoped installer fallback')
-        subprocess.run([str(checkout / 'tools/dot/dot'), 'scope', 'init'], env={**os.environ, 'DOT_SOURCE': str(checkout)}, check=True)
+        subprocess.run([str(engine / 'tools/dot/dot'), 'scope', 'init'], env={**os.environ, 'DOT_SOURCE': str(checkout), 'DOT_ENGINE': str(engine / 'tools/dot')}, check=True)
         name = subprocess.check_output(['git', 'config', 'user.name'], text=True).strip()
         email = subprocess.check_output(['git', 'config', 'user.email'], text=True).strip()
-        atomic(config, 'sourceDir = ' + json.dumps(str(checkout / 'home')) + '\ncacheDir = ' + json.dumps(str(current_cache)) + '\npersistentState = ' + json.dumps(str(current_state)) + '\n[data]\nname = ' + json.dumps(name) + '\nemail = ' + json.dumps(email) + '\nprofile = ' + json.dumps(profile) + '\n')
+        atomic(config, 'sourceDir = ' + json.dumps(str(checkout / 'home')) + '\ncacheDir = ' + json.dumps(str(current_cache)) + '\npersistentState = ' + json.dumps(str(current_state)) + '\n[data]\nname = ' + json.dumps(name) + '\nemail = ' + json.dumps(email) + '\nprofile = ' + json.dumps(profile) + '\ndotEngine = ' + json.dumps(str(engine / 'tools/dot')) + '\n')
     elif (checkout / 'home').is_dir() and tomllib.loads(config.read_text()).get('sourceDir') == str(checkout):
-        sys.path.insert(0, str(checkout / 'tools/dot'))
+        sys.path.insert(0, str(engine / 'tools/dot'))
         sys.dont_write_bytecode = True
         import layout
         proposal = layout.proposed(checkout, home, config)
@@ -1047,27 +1087,42 @@ def install_launcher_and_path():
     print('The installer cannot modify its parent shell; your default shell was not changed.')
 
 record = installation_record()
+if checkout == engine or checkout in engine.parents or engine in checkout.parents:
+    fail('engine and private source must be independent, non-nested paths')
+for path in (checkout, engine):
+    if '..' in path.parts or path == home or path in home.parents:
+        fail('checkout path must be bounded and must not contain HOME')
+for marker in ('home', 'dot-contract.json', 'tools/dot/manifest.json', 'tools/dot/groups.json'):
+    path = engine / marker
+    if path.exists() or path.is_symlink():
+        fail('engine payload contains private-role marker; refusing public engine classification')
 check_checkout_and_launcher()
 check_startup_markers()
-retire_legacy(record)
-migrate_current_manager(record)
+if (home / '.git').exists() or (home / '.git').is_symlink():
+    fail('legacy installation detected: HOME Git metadata; explicit migration required; left untouched')
+if engine.exists() and checkout.exists():
+    check_contract()
+if config.exists():
+    tracker = tomllib.loads(config.read_text())
+    recorded_engine = tracker.get('data', {}).get('dotEngine')
+    if recorded_engine != str(engine / 'tools/dot'):
+        fail('existing tracker dotEngine does not match installed engine; explicit dot init review required')
+    if tracker.get('sourceDir') != str(checkout / 'home'):
+        fail('existing tracker sourceDir does not match private source; explicit migration required')
 if action == 'preflight':
-    print('Installation/migration preflight passed; approved retirement, if any, is recorded above.')
-    print('Install plan: permanent checkout ' + str(checkout) + '; launcher ' + str(launcher))
-    print('Persistent chezmoi config: ' + str(config) + '; new installs get an explicit EMPTY adoption scope.')
-    print('Marked PATH integration only: ' + ', '.join(str(p) for p in startup))
+    print('Read-only layout detection passed; no tracker, launcher, metadata, or dependencies were created.')
 elif action == 'configure':
-    configure_chezmoi(record)
-    install_launcher_and_path()
-    atomic(state, json.dumps({'version': 1, 'directory': str(checkout), 'source': source, 'config': str(config), 'cache': str(current_cache), 'persistent_state': str(current_state)}, indent=2) + '\n')
+    print('Tracker creation is owned by dot init; bootstrap will leave first-run setup pending.')
+elif action == 'launcher':
+    atomic(launcher, expected, 0o755)
 else:
     fail('unknown local setup action')
 PY
 }
 # Common migration seam. Never initialize/evaluate legacy config or Git hooks.
-migration_gate() { PHASE=migration; local_setup preflight; }
+migration_gate() { PHASE=migration; }
 migration_gate
-[ "$STAGE" != migration ] || exit 0
+[ "$STAGE" != migration ] || { echo 'Migration is owned by #27; bootstrap performs read-only detection only.'; exit 0; }
 PHASE=identity
 cd "$HOME"
 for field in name email; do
@@ -1080,10 +1135,15 @@ for field in name email; do
   fi
 done
 PHASE=access
+compatible gh || fail 'missing/incompatible prerequisite gh; dot init owns dependency setup; bootstrap does not install dependencies'
 export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1
 check_source_access() {
-  if ! gh api "repos/$REPOSITORY" >/dev/null 2>&1; then
+  local metadata
+  if ! metadata="$(gh api "repos/$REPOSITORY" 2>/dev/null)"; then
     ACCESS_PROBLEM='private repository API access denied'; return 1
+  fi
+  if ! python3 -c 'import json,sys; d=json.loads(sys.argv[1]); sys.exit(not (isinstance(d,dict) and d.get("full_name")==sys.argv[2] and d.get("private") is True and isinstance(d.get("default_branch"),str) and bool(d["default_branch"])))' "$metadata" "$REPOSITORY" >/dev/null 2>&1; then
+    ACCESS_PROBLEM='private repository identity/visibility mismatch; no repository fallback permitted'; return 1
   fi
   if ! gh auth setup-git --hostname github.com >/dev/null 2>&1; then
     ACCESS_PROBLEM='GitHub CLI Git credential integration failed'; return 1
@@ -1103,27 +1163,145 @@ if ! check_source_access; then
   esac
   check_source_access || fail "authorization denied after authentication: $ACCESS_PROBLEM; request repository access or switch accounts and retry"
 fi
-PHASE=checkout
-if [ -d "$DIRECTORY" ]; then
-  if [ "$UPDATE" = ask ]; then
-    if "$YES"; then UPDATE=keep; else ask 'Matching installation: Update or Keep existing? [update/keep]'; UPDATE="$ANSWER"; fi
-  fi
-  case "$UPDATE" in
-    keep) echo 'Keeping existing checkout and adoption scope.' ;;
-    update)
-      [ -z "$(git -C "$DIRECTORY" status --porcelain)" ] || fail 'checkout is dirty; commit or resolve work before update (nothing reset)'
-       git -c core.hooksPath=/dev/null -C "$DIRECTORY" fetch origin
-      git -C "$DIRECTORY" merge-base --is-ancestor HEAD '@{upstream}' || fail 'checkout is ahead/diverged; resolve local commits before update (nothing reset)'
-       git -c core.hooksPath=/dev/null -C "$DIRECTORY" merge --ff-only '@{upstream}' ;;
-    *) fail 'choose update or keep' ;;
-  esac
-else
-  confirm "Create permanent checkout at $DIRECTORY and launcher at $HOME/.local/bin/dot?"
-  mkdir -p "$(dirname "$DIRECTORY")"
-   git -c core.hooksPath=/dev/null -c init.templateDir= clone "$SOURCE_URL" "$DIRECTORY"
+PHASE=engine
+if [ -e "$HOME/.local/share/dot" ]; then fail "legacy installation detected at $HOME/.local/share/dot; migration belongs to #27; left untouched"; fi
+if [ -f "$HOME/.local/state/dot/install.json" ]; then
+  python3 - "$HOME/.local/state/dot/install.json" "$DIRECTORY" "$ENGINE_DIRECTORY" <<'PYRECORD'
+import json,sys
+record=json.load(open(sys.argv[1]))
+if record.get('directory') != sys.argv[2] or record.get('engine') != sys.argv[3]:
+    raise SystemExit('dot installer: installed paths conflict; migration needed; left untouched')
+PYRECORD
 fi
-PHASE=configuration
-local_setup configure
-echo 'dot install-only stage complete. No managed configs, applications, or services were adopted/started.'
-optional_adoption
-echo 'dot installation complete. Optional round results, if any, are above.'
+if [ -f "$HOME/.local/bin/dot" ] && ! grep -Fq 'DOT_ENGINE=' "$HOME/.local/bin/dot"; then fail 'unrelated launcher conflict; left untouched'; fi
+if [ -f "$HOME/.local/state/dot/install.json" ] && { [ ! -d "$ENGINE_DIRECTORY" ] || [ ! -d "$DIRECTORY" ]; }; then fail 'installation record exists but a split checkout is missing; explicit recovery required'; fi
+if [ -d "$HOME/.local/share/chezmoi" ] || [ -f "${XDG_CONFIG_HOME:-$HOME/.config}/chezmoi/chezmoi.toml" ]; then
+  echo 'Existing chezmoi tracker detected read-only; dot init will verify identity and dotEngine compatibility. Bootstrap will not create or modify tracker state.'
+fi
+if [ -d "$ENGINE_DIRECTORY" ] && [ -d "$DIRECTORY" ]; then
+  [ -f "$HOME/.local/state/dot/install.json" ] && [ -f "$HOME/.local/bin/dot" ] || fail 'partial/unrecorded split installation conflict; explicit recovery required; left untouched'
+  if [ -n "$BROWSER_URL" ] && { [ -L "$ENGINE_DIRECTORY/bin" ] || [ -L "$ENGINE_DIRECTORY/bin/dot-browser" ]; }; then fail 'browser destination symlink conflict; left untouched'; fi
+  if [ -e "$ENGINE_DIRECTORY/home" ] || [ -e "$ENGINE_DIRECTORY/dot-contract.json" ] || [ -e "$ENGINE_DIRECTORY/tools/dot/manifest.json" ] || [ -e "$ENGINE_DIRECTORY/tools/dot/groups.json" ]; then fail 'engine payload contains private-role marker; refusing public engine classification'; fi
+  if [ -n "$ENGINE_URL" ]; then
+    actual_engine_url="$(git -C "$ENGINE_DIRECTORY" remote get-url origin 2>/dev/null || true)"
+    [ "$actual_engine_url" = "$ENGINE_URL" ] || fail 'installed engine remote does not match requested fixture/repository; left untouched'
+  fi
+  if [ -e "$ENGINE_DIRECTORY/home" ] || [ -e "$ENGINE_DIRECTORY/dot-contract.json" ] || [ -e "$ENGINE_DIRECTORY/tools/dot/manifest.json" ] || [ -e "$ENGINE_DIRECTORY/tools/dot/groups.json" ]; then fail 'engine payload contains private-role marker; refusing public engine classification'; fi
+  if [ -f "$HOME/.local/bin/dot" ] && ! grep -Fq 'DOT_ENGINE=' "$HOME/.local/bin/dot"; then fail 'unrelated launcher conflict; left untouched'; fi
+  export DOT_ENGINE_URL="$ENGINE_URL"
+  local_setup preflight
+  if [ -f "$HOME/.local/state/dot/install.json" ]; then
+    python3 - "$HOME/.local/state/dot/install.json" "$DIRECTORY" "$ENGINE_DIRECTORY" <<'PYRECORD'
+import json,sys
+r=json.load(open(sys.argv[1]))
+if r.get('directory') != sys.argv[2] or r.get('engine') != sys.argv[3]: raise SystemExit('dot installer: installation record mismatch; left untouched')
+PYRECORD
+  fi
+  if [ -n "$BROWSER_URL" ]; then
+    [ ! -L "$ENGINE_DIRECTORY/bin" ] && [ ! -L "$ENGINE_DIRECTORY/bin/dot-browser" ] || fail 'browser destination symlink conflict; left untouched'
+    [ ! -e "$ENGINE_DIRECTORY/bin/dot-browser" ] || [ -f "$ENGINE_DIRECTORY/bin/dot-browser" ] || fail 'browser destination is not a regular file; left untouched'
+    prepare_browser
+    [ ! -L "$ENGINE_DIRECTORY/bin" ] && [ ! -L "$ENGINE_DIRECTORY/bin/dot-browser" ] || fail 'browser destination symlink conflict; left untouched'
+    mkdir -p "$ENGINE_DIRECTORY/bin"
+    python3 - "$HOME/.local/state/dot/install.json" "$BROWSER_SHA256" "$OWNED_BROWSER_TMP" "$ENGINE_DIRECTORY/bin/dot-browser" <<'PYBROWSER'
+import json,os,pathlib,stat,sys,tempfile
+path=pathlib.Path(sys.argv[1]); target=pathlib.Path(sys.argv[4]); before=path.read_bytes(); record=json.loads(before)
+old=target.read_bytes() if target.exists() else None
+oldmode=stat.S_IMODE(target.stat().st_mode) if old is not None else None
+recordmode=stat.S_IMODE(path.stat().st_mode)
+record['browser']={'path':'bin/dot-browser','sha256':sys.argv[2],'mode':493}
+def write(destination,data,mode):
+    fd,tmp=tempfile.mkstemp(dir=destination.parent)
+    try:
+        with os.fdopen(fd,'wb') as stream: stream.write(data)
+        os.chmod(tmp,mode); os.replace(tmp,destination)
+    finally:
+        if os.path.exists(tmp): os.unlink(tmp)
+try:
+    write(target,pathlib.Path(sys.argv[3]).read_bytes(),0o755)
+    write(path,(json.dumps(record,indent=2)+'\n').encode(),recordmode)
+except OSError:
+    if old is None: target.unlink(missing_ok=True)
+    else: write(target,old,oldmode)
+    if path.read_bytes()!=before: write(path,before,recordmode)
+    raise SystemExit('dot installer: browser/record promotion failed; previous artifact restored')
+PYBROWSER
+    rm -f "$OWNED_BROWSER_TMP"
+    OWNED_BROWSER_TMP=''
+  fi
+  if [ -n "$BROWSER_URL" ]; then echo 'Matching split installation detected; reviewed browser artifact installed; configuration unchanged.'; else echo 'Matching split installation detected; no changes made.'; fi
+  echo 'Tracker initialization and any dependencies remain pending for explicit dot init.'
+  exit 0
+fi
+if [ -e "$ENGINE_DIRECTORY" ] || [ -e "$DIRECTORY" ]; then fail 'partial/unrecorded split installation conflict; paths left untouched'; fi
+if [ -e "$HOME/.local/bin/dot" ]; then fail 'unrelated launcher conflict; left untouched'; fi
+if ! "$YES"; then confirm "Install public CLI at $ENGINE_DIRECTORY and private source at $DIRECTORY? Bootstrap will not install dependencies or initialize chezmoi."; fi
+export DOT_ENGINE_URL="$ENGINE_URL"
+local_setup preflight
+if [ -L "$HOME" ] || [ -L "$(dirname "$ENGINE_DIRECTORY")" ] || [ -L "$(dirname "$DIRECTORY")" ] || [ -L "$HOME/.local" ] || [ -L "$HOME/.local/share" ]; then fail 'install parent symlink conflict; left untouched'; fi
+if [ -e "$HOME/.local/bin" ] && [ -L "$HOME/.local/bin" ]; then fail 'launcher directory symlink conflict; left untouched'; fi
+for startup_path in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile" "$HOME/.bashrc" "${ZDOTDIR:-$HOME}/.zprofile" "${ZDOTDIR:-$HOME}/.zshrc"; do
+  [ ! -L "$startup_path" ] || fail "startup path symlink conflict: $startup_path; left untouched"
+done
+if [ -L "$ENGINE_DIRECTORY" ] || [ -L "$DIRECTORY" ]; then fail 'checkout path symlink conflict; left untouched'; fi
+OWNED_CHECKOUT_TMP="$(mktemp -d "${TMPDIR:-/var/tmp}/dot-checkout.XXXXXXXX")"
+git -c core.hooksPath=/dev/null -c init.templateDir= clone "$ENGINE_URL" "$OWNED_CHECKOUT_TMP/engine"
+git -c core.hooksPath=/dev/null -c init.templateDir= clone "$SOURCE_URL" "$OWNED_CHECKOUT_TMP/private"
+# Bound executable entrypoints before executing the reviewed checker; all API
+# negotiation remains in contract.py, the same seam used by healthy CLI/update.
+python3 -B - "$OWNED_CHECKOUT_TMP/engine" "$OWNED_CHECKOUT_TMP/private" <<'PYCANDIDATE'
+import os,pathlib,subprocess,sys
+engine=pathlib.Path(sys.argv[1]).resolve(); source=pathlib.Path(sys.argv[2]).resolve()
+for marker in ('home','dot-contract.json','tools/dot/manifest.json','tools/dot/groups.json'):
+    path=engine/marker
+    if path.exists() or path.is_symlink():
+        raise SystemExit('dot installer: engine payload contains private-role marker; no engine installed')
+for name in ('dot','contract.py'):
+    path=engine/'tools/dot'/name
+    if path.resolve()!=path or not path.is_file():
+        raise SystemExit('dot installer: candidate contract entrypoint is missing or escaping; no engine installed')
+if not os.access(engine/'tools/dot/dot',os.X_OK):
+    raise SystemExit('dot installer: candidate contract CLI is not executable; no engine installed')
+subprocess.run([sys.executable,'-B',str(engine/'tools/dot/contract.py'),'check','--engine',str(engine/'tools/dot'),'--source',str(source)],check=True,stdout=subprocess.DEVNULL)
+PYCANDIDATE
+# Recheck requested paths immediately before promoting the validated candidate.
+prepare_browser
+local_setup preflight
+[ ! -e "$ENGINE_DIRECTORY" ] && [ ! -L "$ENGINE_DIRECTORY" ] && [ ! -e "$DIRECTORY" ] && [ ! -L "$DIRECTORY" ] || fail 'checkout paths changed during retrieval; left untouched'
+mkdir -p "$(dirname "$ENGINE_DIRECTORY")" "$(dirname "$DIRECTORY")"
+mv "$OWNED_CHECKOUT_TMP/engine" "$ENGINE_DIRECTORY"
+mv "$OWNED_CHECKOUT_TMP/private" "$DIRECTORY"
+export DOT_ENGINE_URL="$ENGINE_URL"
+if [ -e "$ENGINE_DIRECTORY/home" ] || [ -e "$ENGINE_DIRECTORY/dot-contract.json" ] || [ -e "$ENGINE_DIRECTORY/tools/dot/manifest.json" ] || [ -e "$ENGINE_DIRECTORY/tools/dot/groups.json" ]; then fail 'engine payload contains private-role marker; refusing to classify or record it as public'; fi
+local_setup preflight
+if [ -n "$BROWSER_URL" ]; then
+  [ ! -L "$ENGINE_DIRECTORY/bin" ] && [ ! -L "$ENGINE_DIRECTORY/bin/dot-browser" ] || fail 'browser destination symlink conflict; left untouched'
+  [ ! -e "$ENGINE_DIRECTORY/bin/dot-browser" ] || [ -f "$ENGINE_DIRECTORY/bin/dot-browser" ] || fail 'browser destination is not a regular file; left untouched'
+  command -v shasum >/dev/null || fail 'shasum is required to verify browser artifact'
+  for path in "$ENGINE_DIRECTORY/bin" "$ENGINE_DIRECTORY/bin/dot-browser"; do
+  [ ! -L "$path" ] || fail "browser destination symlink conflict: $path; left untouched"
+  done
+  if [ -e "$ENGINE_DIRECTORY/bin" ] && [ ! -d "$ENGINE_DIRECTORY/bin" ]; then fail "browser destination is not a directory: $ENGINE_DIRECTORY/bin; left untouched"; fi
+  mkdir -p "$ENGINE_DIRECTORY/bin"
+  for path in "$ENGINE_DIRECTORY/bin" "$ENGINE_DIRECTORY/bin/dot-browser"; do
+    if [ -L "$path" ]; then fail "browser destination symlink conflict: $path; left untouched"; fi
+  done
+  [ ! -L "$ENGINE_DIRECTORY/bin/dot-browser" ] || fail "browser destination symlink conflict: $ENGINE_DIRECTORY/bin/dot-browser; left untouched"
+  mkdir -p "$ENGINE_DIRECTORY/bin"
+  mv -f "$OWNED_BROWSER_TMP" "$ENGINE_DIRECTORY/bin/dot-browser"
+  OWNED_BROWSER_TMP=''
+fi
+mkdir -p "$HOME/.local/bin" "$HOME/.local/state/dot"
+python3 - "$HOME" "$DIRECTORY" "$ENGINE_DIRECTORY" "$SOURCE_URL" "$ENGINE_URL" "${XDG_CONFIG_HOME:-$HOME/.config}" "$BROWSER_SHA256" <<'PYRECORD'
+import json,os,pathlib,sys,tempfile
+home,source,engine=map(pathlib.Path,sys.argv[1:4]); config=pathlib.Path(sys.argv[6])/'chezmoi/chezmoi.toml'
+state=home/'.local/state/dot/install.json'
+record={'version':2,'directory':str(source),'engine':str(engine),'source':sys.argv[4],'engine_source':sys.argv[5],'config':str(config)}
+if sys.argv[7]: record['browser']={'path':'bin/dot-browser','sha256':sys.argv[7],'mode':493}
+fd,tmp=tempfile.mkstemp(dir=state.parent)
+with os.fdopen(fd,'w') as stream:
+    json.dump(record,stream,indent=2); stream.write('\n')
+os.chmod(tmp,0o600); os.replace(tmp,state)
+PYRECORD
+local_setup launcher
+echo 'CLI and private source installed. No packages, tracker, cache, or chezmoi state were created. Run dot init for informed first-run setup.'

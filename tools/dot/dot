@@ -1,0 +1,224 @@
+#!/usr/bin/env bash
+set -euo pipefail
+SOURCE="${BASH_SOURCE[0]}"
+while [ -h "$SOURCE" ]; do
+  DIR="$(cd -P "$(dirname "$SOURCE")" && pwd)"
+  SOURCE="$(readlink "$SOURCE")"
+  case "$SOURCE" in /*) ;; *) SOURCE="$DIR/$SOURCE" ;; esac
+done
+TOOL_DIR="${DOT_ENGINE:-$(cd -P "$(dirname "$SOURCE")" && pwd)}"
+if [ "${1:-}" = init ]; then
+  shift
+  exec python3 -B "$TOOL_DIR/init.py" "$@"
+fi
+# Migration validates the recorded legacy references itself: the normal split
+# tracker gate cannot be satisfied until those references are explicitly migrated.
+if [ "${1:-}" = migrate ]; then
+  shift
+  : "${DOT_SOURCE:?dot migrate requires the explicit recorded installed DOT_SOURCE}"
+  exec python3 -B "$TOOL_DIR/migration.py" "$@"
+fi
+IS_CONTRACT=false
+[ "${1:-}" = contract ] && IS_CONTRACT=true
+if [ -z "${DOT_ENGINE:-}" ] && [ ! -f "$TOOL_DIR/../../dot-contract.json" ] && [ "$IS_CONTRACT" != true ]; then
+  echo 'dot: public engine requires explicit DOT_ENGINE and private DOT_SOURCE; use the installed dot launcher' >&2
+  exit 1
+fi
+if [ -n "${DOT_ENGINE:-}" ]; then
+  [ -f "$TOOL_DIR/engine.json" ] && [ -f "$TOOL_DIR/contract.py" ] || { echo 'dot: explicit DOT_ENGINE is incomplete; refusing private-source fallback' >&2; exit 1; }
+  if [ "${1:-}" != contract ]; then
+    [ -n "${DOT_SOURCE:-}" ] || { echo 'dot: explicit DOT_SOURCE is required with DOT_ENGINE' >&2; exit 1; }
+    if [ "${1:-}" != self-update ] && { [ -z "${DOT_CONFIG:-}" ] || [ ! -f "$DOT_CONFIG" ]; }; then
+      echo 'dot: chezmoi tracker is not initialized; run dot init to review dependencies and tracker creation' >&2
+      exit 1
+    fi
+    if [ "${1:-}" != self-update ] && [ -n "${DOT_CONFIG:-}" ]; then
+      configured_engine="$(python3 - "$DOT_CONFIG" <<'PY'
+import sys,tomllib
+with open(sys.argv[1],'rb') as f: print(tomllib.load(f).get('data',{}).get('dotEngine',''))
+PY
+      )"
+      [ "$configured_engine" = "$TOOL_DIR" ] || { echo 'dot: chezmoi [data] dotEngine does not match explicit DOT_ENGINE' >&2; exit 1; }
+    fi
+    python3 -B "$TOOL_DIR/contract.py" check --engine "$TOOL_DIR" --source "$DOT_SOURCE" >/dev/null || exit $?
+  fi
+fi
+if [ "${1:-}" = contract ]; then
+  shift
+  exec python3 -B "$TOOL_DIR/contract.py" "$@"
+fi
+if [ -z "${DOT_SOURCE:-}" ] && [ ! -f "$TOOL_DIR/../../dot-contract.json" ]; then
+  echo 'dot: public engine requires explicit private DOT_SOURCE; refusing public-checkout or chezmoi source fallback' >&2
+  exit 1
+fi
+if [ "${1:-}" = browse ]; then
+  shift
+  : "${DOT_SOURCE:?dot browse requires an explicit private DOT_SOURCE}"
+  BROWSER="${DOT_BROWSER:-$TOOL_DIR/../../bin/dot-browser}"
+  [ -x "$BROWSER" ] || { echo 'dot: browser unavailable; install a compatible dot-browser artifact' >&2; exit 1; }
+  exec "$BROWSER" --engine "${DOT_ENGINE:-$TOOL_DIR}" --source "$DOT_SOURCE" --home "$HOME" "$@"
+fi
+DOT_SOURCE="${DOT_SOURCE:-$(cd "$TOOL_DIR/../.." && pwd)}"
+CM_SOURCE="$DOT_SOURCE/home"
+# Transitional legacy targets retain their existing boundary until migrated.
+[ -d "$CM_SOURCE" ] || CM_SOURCE="$DOT_SOURCE"
+cm() {
+  if [ -n "${DOT_CONFIG:-}" ]; then
+    chezmoi --no-tty --no-pager --use-builtin-diff --source "$CM_SOURCE" --destination "$HOME" --config "$DOT_CONFIG" "$@"
+  else
+    chezmoi --no-tty --no-pager --use-builtin-diff --source "$CM_SOURCE" --destination "$HOME" "$@"
+  fi
+}
+g() { git -C "$DOT_SOURCE" "$@"; }
+fail() { echo "dot: $*" >&2; return 1; }
+usage() { echo 'usage: dot status | diff [--direction repo-to-machine|machine-to-repo] | push --message TEXT | self-update [--yes] | pull [--yes] | intent rounds|pick [--mode track|adopt]|inventory PATH|plan REQUEST --out PLAN|preview PLAN|apply PLAN --approve ID [--ack-unsafe] [--ack-desktop] [--replace-skills-backup]|update [--yes] | layout plan --out PLAN|apply PLAN --approve ID | add --class shared|templated|os-only [--os darwin|linux] PATH | remove PATH | update NAME VERSION | run NAME [ARGS...] | doctor | scope init|show|catalog|expand GROUP... [--yes] [--ack-unsafe] [--ack-desktop]' >&2; return 2; }
+dot_status() {
+  [ $# -eq 0 ] || { usage; return; }
+  local state failed=0
+  state="$(cm status)" || failed=$?
+  printf '%s\n' "$state"
+  g status --short --branch
+  if [ "$failed" -ne 0 ]; then
+    echo 'drift: unavailable — chezmoi could not render the source tree' >&2
+    printf 'Inspect actual tracker: chezmoi --source "%s" --destination "%s"' "$CM_SOURCE" "$HOME" >&2
+    [ -z "${DOT_CONFIG:-}" ] || printf ' --config "%s"' "$DOT_CONFIG" >&2
+    printf ' doctor\nRun dot init --check for read-only identity diagnostics; review required machine data in the actual config; do not delete machine data or apply unscoped configuration.\n' >&2
+    return "$failed"
+  fi
+  printf 'drift: %s managed entries differ; choose push (machine → repo) or pull (repo → machine)\n' "$(printf '%s\n' "$state" | awk 'NF {n++} END {print n+0}')"
+  python3 -B - "$TOOL_DIR" "$HOME" <<'PY'
+import sys
+sys.path.insert(0,sys.argv[1])
+import scope
+approval=scope.load(sys.argv[2])
+if approval is None:
+    print('scope: no adoption approval; managed drift is not whole-machine parity')
+elif approval['version'] in (2,3):
+    count=len(approval['entries'])
+    print(f'scope: {count} selected entries; exact approval only')
+    if not count:
+        print('empty adoption scope: zero drift is not whole-machine parity')
+else:
+    print('scope: legacy group approval; review exact scope before independent pull')
+PY
+}
+dot_diff() {
+  local direction=repo-to-machine
+  if [ $# -gt 0 ]; then
+    [ $# -eq 2 ] && [ "$1" = --direction ] || { usage; return; }
+    direction="$2"
+  fi
+  case "$direction" in
+    repo-to-machine) echo 'repo → machine'; cm diff ;;
+    machine-to-repo) echo 'machine → repo (you are ahead if these are intentional local changes)'; cm diff --reverse ;;
+    *) usage ;;
+  esac
+}
+dot_push() {
+  [ $# -eq 2 ] && [ "$1" = --message ] && [ -n "$2" ] || { usage; return; }
+  [ -z "$(g diff --cached --name-only)" ] || { fail 'staged changes exist; commit them separately'; return; }
+  local paths path source state
+  local sources=()
+  paths="$(cm managed --include files --path-style absolute)"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    source="$(cm source-path "$path")"
+    [ -n "$source" ] || continue
+    [ -z "$(g status --porcelain -- "$source")" ] || { fail "source changes exist: $source"; return; }
+  done <<< "$paths"
+  state="$(cm status --include files --path-style absolute)"
+  while IFS= read -r path; do
+    [ -n "$path" ] || continue
+    path="${path:3}"
+    source="$(cm source-path "$path")"
+    case "$source" in *.tmpl) fail "edit template explicitly before push: $source"; return ;; esac
+    [ -f "$path" ] || { fail "missing managed file: $path"; return; }
+    sources+=("$source")
+  done <<< "$state"
+  if [ "${#sources[@]}" -gt 0 ]; then
+    cm re-add
+    g add -- "${sources[@]}"
+    if ! g diff --cached --quiet; then g commit -m "$2"; fi
+  fi
+  g push
+}
+dot_pull() {
+  DOT_ENGINE="$TOOL_DIR" DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/updates.py" pull "$@"
+}
+dot_self_update() { DOT_ENGINE="$TOOL_DIR" DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/updates.py" self-update "$@"; }
+metadata() { python3 -B "$TOOL_DIR/state.py" "$@"; }
+scope() { python3 -B "$TOOL_DIR/scope.py" "$1" "$DOT_SOURCE" "$HOME" "${@:2}"; }
+dot_scope() { scope "${1:-show}" "${@:2}"; }
+dot_intent() { DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/intent.py" "$@"; }
+dot_layout() { DOT_SOURCE="$DOT_SOURCE" python3 -B "$TOOL_DIR/layout.py" "$@"; }
+dot_add() {
+  [ ! -f "$DOT_SOURCE/dot-contract.json" ] || { fail 'tracking requires an exact dot intent Track plan/approval'; return; }
+  local category os_name=- relative path
+  [ $# -ge 3 ] && [ "$1" = --class ] || { usage; return; }
+  category="$2"; shift 2
+  case "$category" in
+    shared|templated) ;;
+    os-only)
+      [ $# -eq 3 ] && [ "$1" = --os ] || { usage; return; }
+      os_name="$2"; shift 2
+      case "$os_name" in darwin|linux) ;; *) usage; return ;; esac ;;
+    *) usage; return ;;
+  esac
+  [ $# -eq 1 ] || { usage; return; }
+  path="$1"
+  if scope show | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin).get("version") == 2 else 1)' 2>/dev/null; then
+    fail 'exact-scope imports require dot intent Track plan/approval'; return
+  fi
+  relative="$(metadata validate "$path")"
+  scope allowed "$relative"
+  case "$relative" in *$'\n'*|*$'\t'*|*'{{'*|*'*'*|*'?'*|*'['*) fail 'unsupported target path'; return ;; esac
+  if [ "$category" = templated ]; then cm add --force --template "$path"; else cm add --force "$path"; fi
+  metadata taxonomy "$DOT_SOURCE" "$relative" "$category" "$os_name"
+}
+dot_remove() {
+  [ ! -f "$DOT_SOURCE/dot-contract.json" ] || { fail 'stop tracking requires an exact dot intent untrack plan/approval; live files are retained'; return; }
+  [ $# -eq 1 ] || { usage; return; }
+  local relative
+  if scope show | python3 -c 'import json,sys; exit(0 if json.load(sys.stdin).get("version") == 2 else 1)' 2>/dev/null; then
+    fail 'exact-scope changes require a reviewed dot intent plan'; return
+  fi
+  relative="$(metadata relative "$1")"
+  scope allowed "$relative"
+  cm forget --force "$1"
+  metadata taxonomy "$DOT_SOURCE" "$relative"
+}
+dot_run() {
+  [ $# -ge 1 ] || { usage; return; }
+  local name="$1" script
+  shift
+  if [ "$name" = sync-skills ] && [ "$(scope skills)" != yes ]; then
+    fail 'skills router is outside adoption scope'; return
+  fi
+  case "$name" in ''|*[!a-zA-Z0-9_-]*) fail 'invalid script name'; return ;; esac
+  script="$DOT_SOURCE/scripts/$name.sh"
+  [ -f "$script" ] && [ ! -L "$script" ] || { fail "unknown script: $name"; return; }
+  bash "$script" "$@"
+}
+dot_update() {
+  [ $# -eq 2 ] || { usage; return; }
+  metadata update "$DOT_SOURCE/packages/pins.toml" "$1" "$2"
+  dot_run install-pins --apply
+}
+dot_doctor() {
+  [ $# -eq 0 ] || { usage; return; }
+  local failures=0
+  cm doctor || failures=1
+  dot_run install-pins --check || failures=1
+  metadata secrets "$DOT_SOURCE" "${DOT_SECRETS_FILE:-$HOME/.config/secrets.env}" || failures=1
+  return "$failures"
+}
+case "${1:-}" in
+  self-update) shift; dot_self_update "$@" ;;
+  '')
+    [ $# -eq 0 ] || { usage; exit 2; }
+    # shellcheck source=tools/dot/ui.sh
+    source "$TOOL_DIR/ui.sh"
+    dot_menu ;;
+  status|diff|push|pull|add|remove|run|update|doctor|scope|intent|layout) verb="$1"; shift; "dot_$verb" "$@" ;;
+  *) usage ;;
+esac
