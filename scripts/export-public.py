@@ -6,6 +6,7 @@ import shutil
 
 ROOT = Path(__file__).resolve().parents[1]
 ENGINE = ('dot', 'contract.py', 'engine.json', 'gitconfig.py', 'intent.py', 'init.py',
+          'init-python-bootstrap.sh',
           'layout.py', 'migration.py', 'picker.py', 'preview.py', 'scope.py', 'skills.py',
           'state.py', 'ui.sh', 'tracking.py', 'file_metadata.py', 'packages.py', 'updates.py')
 PUBLIC = ('README.md', 'bootstrap.sh', 'scripts/create-private-repo.sh',

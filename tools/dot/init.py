@@ -90,6 +90,51 @@ def consent(prompt):
     return ask(prompt + ' [y/N]') in ('y', 'yes')
 
 
+def retrieve_private_checkout(source, engine):
+    """Retrieve only the named private source, after separate terminal consent."""
+    if source.exists() or source.is_symlink():
+        return True
+    repository = 'ujjwal6792/dotfiles'
+    print('Private configuration retrieval is separate from public CLI installation and tracker creation.', flush=True)
+    print('Repository: https://github.com/' + repository + '\nDestination: ' + str(source), flush=True)
+    print('Retrieval reads this private repository after approval. It will not create a replacement repository, change authentication, or modify the installer-owned record.', flush=True)
+    if not consent('Retrieve this exact private repository?'):
+        print('Private checkout pending: retrieval declined; no repository or tracker created.')
+        return False
+    safe_path(source)
+    if not source.is_absolute():
+        raise ValueError('private checkout destination must be absolute')
+    parent = source.parent
+    parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    metadata = subprocess.run(['gh', 'api', 'repos/' + repository], capture_output=True, text=True)
+    if metadata.returncode:
+        raise ValueError('private repository access denied or unavailable; no fallback repository created')
+    try:
+        identity = json.loads(metadata.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError('GitHub returned invalid repository identity; no clone attempted') from error
+    if identity.get('full_name', '').casefold() != repository.casefold() or identity.get('private') is not True:
+        raise ValueError('repository identity/visibility mismatch; no clone attempted')
+    with tempfile.TemporaryDirectory(prefix='.dot-private-', dir=parent) as temporary:
+        checkout = Path(temporary) / 'checkout'
+        result = subprocess.run(['gh', 'repo', 'clone', repository, str(checkout)], capture_output=True, text=True)
+        if result.returncode:
+            raise ValueError('private repository clone failed; existing files were not replaced')
+        remote = subprocess.run(['git', '-C', str(checkout), 'remote', 'get-url', 'origin'], capture_output=True, text=True)
+        if remote.returncode:
+            raise ValueError('cloned repository has no verifiable origin; checkout not published')
+        actual = remote.stdout.strip().removesuffix('.git').lower()
+        accepted = {'https://github.com/' + repository, 'git@github.com:' + repository}
+        if actual not in accepted:
+            raise ValueError('cloned repository origin mismatch; checkout not published')
+        contract.check(engine, checkout)
+        if source.exists() or source.is_symlink():
+            raise ValueError('private checkout destination appeared during retrieval; preserved it')
+        os.rename(checkout, source)
+    print('Private checkout retrieved and contract-checked. Tracker creation remains a separate consent.', flush=True)
+    return True
+
+
 def compatible(tool):
     if not shutil.which(tool):
         return False
@@ -334,10 +379,17 @@ def main():
     parser.add_argument('--check', action='store_true', help='read-only identity detection')
     parser.add_argument('--rounds', action='store_true', help='offer prebuilt Track/Adopt rounds after setup; Finish default')
     parser.add_argument('--profile', choices=['personal', 'work'], default='personal')
+    parser.add_argument('--source', help='explicit private checkout path; never inferred from the public engine')
+    parser.add_argument('--config', help='explicit local chezmoi config path')
     args = parser.parse_args()
-    source = Path(os.environ['DOT_SOURCE'])
+    home = Path(os.environ['HOME'])
+    source_value = args.source or os.environ.get('DOT_SOURCE') or str(home / '.local/share/dot-config')
+    config_value = args.config or os.environ.get('DOT_CONFIG') or str(home / '.config/chezmoi/chezmoi.toml')
+    source = Path(source_value)
     engine = Path(os.environ['DOT_ENGINE'])
-    config = Path(os.environ['DOT_CONFIG'])
+    config = Path(config_value)
+    if not args.check and not retrieve_private_checkout(source, engine):
+        return 0
     record, data = detect(source, engine, config)
     if args.check:
         return 0

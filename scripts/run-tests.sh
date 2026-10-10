@@ -45,7 +45,8 @@ case "$PART" in
   installed)
     run_bats tests/independent-updates.bats tests/installed-migration.bats \
       tests/installed-engine.bats tests/installed-adapters.bats \
-      tests/installed-browser-update.bats tests/init.bats
+      tests/installed-browser-update.bats tests/init.bats \
+      tests/init-preflight.bats tests/init-python-bootstrap.bats
     python3 tests/tracking-cli-test.py
     ;;
   init-preflight)

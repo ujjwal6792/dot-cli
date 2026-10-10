@@ -94,6 +94,94 @@ start_init() {
   [ ! -s "$TRACE" ]
 }
 
+@test "init explicit source and config arguments override environment paths" {
+  source="$HOME/.local/share/dot-config"
+  config="$HOME/.config/chezmoi/chezmoi.toml"
+  run env DOT_SOURCE="$HOME/unrelated-source" DOT_CONFIG="$HOME/unrelated-config" \
+    "$HOME/.local/bin/dot" init --source "$source" --config "$config" --check
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Private source: $source/home"* ]]
+  [[ "$output" == *"Actual config: $config"* ]]
+  [ ! -e "$config" ]
+}
+
+@test "private retrieval is explicit and tracker creation remains a separate approval" {
+  source="$HOME/.local/share/dot-config"
+  config="$HOME/.config/chezmoi/chezmoi.toml"
+  rm -rf "$source"
+  python3 - "$HOME/.local/state/dot/install.json" <<'PY'
+import json,sys
+p=sys.argv[1]
+d=json.load(open(p))
+d['source']='https://github.com/ujjwal6792/dotfiles'
+json.dump(d,open(p,'w'))
+PY
+  cat > "$FIXTURE_BIN/gh" <<'SH'
+#!/bin/bash
+echo "gh $*" >> "$TRACE"
+case "$1" in
+  --version) echo 'gh version 2.80.0' ;;
+  auth) exit 0 ;;
+  api) printf '{"full_name":"ujjwal6792/dotfiles","private":true}\n' ;;
+  repo)
+    [ "$2" = clone ] && [ "$3" = ujjwal6792/dotfiles ] || exit 9
+    git clone -q "$FIXTURE_REMOTE" "$4" || exit
+    git -C "$4" remote set-url origin https://github.com/ujjwal6792/dotfiles
+    ;;
+  *) exit 9 ;;
+esac
+SH
+  chmod +x "$FIXTURE_BIN/gh"
+  printf -v command 'trap : INT; %q init --source %q --config %q; echo UI_EXIT=$?; sleep 30' "$HOME/.local/bin/dot" "$source" "$config"
+  tmux -L "$SOCKET" new-session -d -s ui -x 180 -y 60 "$command"
+  answer 'Retrieve this exact private repository' y
+  answer 'Create this tracker' n
+  wait_for UI_EXIT=0
+  [ -d "$source/.git" ]
+  [ "$(git -C "$source" remote get-url origin)" = 'https://github.com/ujjwal6792/dotfiles' ]
+  [[ "$(pane)" == *'Private checkout retrieved'* ]]
+  [ ! -e "$config" ]
+  [ ! -e "$HOME/.local/state/dot/adoption.json" ]
+  ! grep -E '^gh repo create|chezmoi .* (init|apply)' "$TRACE"
+}
+
+@test "noninteractive init retrieval fails closed before private API access" {
+  source="$HOME/.local/share/dot-config"
+  rm -rf "$source"
+  run "$HOME/.local/bin/dot" init --source "$source" --config "$HOME/.config/chezmoi/chezmoi.toml"
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'retrieval declined'* ]]
+  [ ! -e "$source" ]
+  ! grep -E '^gh api|^gh repo clone' "$TRACE"
+  [ ! -e "$HOME/.config/chezmoi/chezmoi.toml" ]
+}
+
+@test "approved private retrieval denied by GitHub never creates or substitutes a repository" {
+  source="$HOME/.local/share/dot-config"
+  rm -rf "$source"
+  cat > "$FIXTURE_BIN/gh" <<'SH'
+#!/bin/bash
+echo "gh $*" >> "$TRACE"
+case "$1" in
+  --version) echo 'gh version 2.80.0' ;;
+  auth) exit 0 ;;
+  api) echo 'private access denied' >&2; exit 1 ;;
+  repo) echo 'unexpected clone' >&2; exit 9 ;;
+  *) exit 9 ;;
+esac
+SH
+  chmod +x "$FIXTURE_BIN/gh"
+  printf -v command 'trap : INT; %q init --source %q --config %q; echo UI_EXIT=$?; sleep 30' "$HOME/.local/bin/dot" "$source" "$HOME/.config/chezmoi/chezmoi.toml"
+  tmux -L "$SOCKET" new-session -d -s ui -x 180 -y 60 "$command"
+  answer 'Retrieve this exact private repository' y
+  wait_for UI_EXIT=1
+  [[ "$(pane)" == *'private repository access denied'* ]]
+  [[ "$(pane)" != *'Create this tracker'* ]]
+  [ ! -e "$source" ]
+  [ ! -e "$HOME/.config/chezmoi/chezmoi.toml" ]
+  ! grep -E '^gh repo create|^gh repo clone' "$TRACE"
+}
+
 @test "missing dependency refusal leaves tracker pending and performs no install" {
   export CHEZMOI_MISSING=yes
   start_init
@@ -155,6 +243,7 @@ start_init() {
   run python3 "$REPO/scripts/export-public.py" --output "$BATS_TEST_TMPDIR/public"
   [ "$status" -eq 0 ]
   [ -f "$BATS_TEST_TMPDIR/public/tools/dot/init.py" ]
+  [ -f "$BATS_TEST_TMPDIR/public/tools/dot/init-python-bootstrap.sh" ]
   [ ! -e "$BATS_TEST_TMPDIR/public/packages" ]
   run env DOT_ENGINE="$BATS_TEST_TMPDIR/public/tools/dot" DOT_SOURCE="$HOME/.local/share/dot-config" DOT_CONFIG="$HOME/.config/chezmoi/chezmoi.toml" "$BATS_TEST_TMPDIR/public/tools/dot/dot" init --help
   [ "$status" -eq 0 ]

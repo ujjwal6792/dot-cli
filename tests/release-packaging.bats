@@ -42,7 +42,7 @@ SH
 }
 
 @test "public engine matches reviewed reusable code and excludes private catalogs" {
-  for file in dot contract.py engine.json gitconfig.py init.py packages.py intent.py layout.py migration.py picker.py preview.py scope.py skills.py state.py ui.sh; do
+  for file in dot contract.py engine.json gitconfig.py init.py init-python-bootstrap.sh packages.py intent.py layout.py migration.py picker.py preview.py scope.py skills.py state.py ui.sh; do
     [ -f "$PUB/tools/dot/$file" ]
   done
   [ ! -e "$PUB/tools/dot/manifest.json" ]

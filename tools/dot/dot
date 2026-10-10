@@ -26,8 +26,18 @@ esac
 if [ "${1:-}" = init ]; then
   shift
   if [ "${1:-}" = --check ]; then
-    if command -v python3 >/dev/null 2>&1 && [ -n "${DOT_SOURCE:-}" ] && [ -n "${DOT_CONFIG:-}" ]; then
-      exec python3 -B "$TOOL_DIR/init.py" --check
+    check_source="${DOT_SOURCE:-}"
+    check_config="${DOT_CONFIG:-}"
+    previous=''
+    for argument in "$@"; do
+      case "$previous:$argument" in
+        --source:*) check_source="$argument" ;;
+        --config:*) check_config="$argument" ;;
+      esac
+      previous="$argument"
+    done
+    if command -v python3 >/dev/null 2>&1 && python3 -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1 && [ -n "$check_source" ] && [ -n "$check_config" ]; then
+      exec python3 -B "$TOOL_DIR/init.py" --check "$@"
     fi
     echo "Public engine: $TOOL_DIR"
     if command -v python3 >/dev/null 2>&1; then
@@ -57,14 +67,10 @@ if [ "${1:-}" = init ]; then
     if [ -f "$record" ]; then echo "Install record: $record"; else echo 'Install record: not present'; fi
     exit 0
   fi
-  if ! command -v python3 >/dev/null 2>&1; then
-    echo 'dot init requires Python 3.11+ (tomllib). Install Python with your platform package manager, then rerun dot init. The public CLI bootstrap did not install dependencies.' >&2
-    exit 1
+  if ! command -v python3 >/dev/null 2>&1 || ! python3 -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1; then
+    exec bash "$TOOL_DIR/init-python-bootstrap.sh" "$TOOL_DIR" "$@"
   fi
-  if [ -z "${DOT_SOURCE:-}" ] || [ -z "${DOT_CONFIG:-}" ]; then
-    echo 'dot init needs a reviewed private checkout and tracker path. Run dot init --check for read-only detection; no repository was retrieved or created.' >&2
-    exit 1
-  fi
+  export DOT_ENGINE="${DOT_ENGINE:-$TOOL_DIR}"
   exec python3 -B "$TOOL_DIR/init.py" "$@"
 fi
 # Migration validates the recorded legacy references itself: the normal split
