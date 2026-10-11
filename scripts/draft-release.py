@@ -73,12 +73,9 @@ def tag_ref_is_absent(repository, tag):
     return all(item.get('ref') != f'refs/tags/{tag}' for item in refs)
 
 
-def verify_tag_absent_or_target(repository, tag, target):
-    if tag_ref_is_absent(repository, tag):
-        return
-    resolved = json.loads(gh(f'repos/{repository}/commits/{tag}')).get('sha')
-    if resolved != target:
-        raise ValueError('existing tag does not resolve to the verified current-main commit')
+def require_tag_absent(repository, tag):
+    if not tag_ref_is_absent(repository, tag):
+        raise ValueError('tag ref must remain absent until publication')
 
 
 def is_ancestor(source_sha, target_sha):
@@ -157,15 +154,22 @@ def prepare(repository, tag, target, directory, inspect_only=False, allow_missin
             release = get_release(repository, release_id)
             verify_identity(release, tag, target)
             verify_assets(release, directory)
-            verify_tag_absent_or_target(repository, tag, target)
+            require_tag_absent(repository, tag)
     else:
         verify_identity(release, tag, target)
         verify_assets(release, directory)
-        verify_tag_absent_or_target(repository, tag, target)
+        require_tag_absent(repository, tag)
     return release_id
 
 
 def publish(repository, release_id, tag, target, directory):
+    # Re-read both mutable release state and the tag immediately before publishing.
+    # GitHub documents no conditional-write/CAS contract, so external edits can
+    # still race after this check; post-publish validation detects, not reverses, that case.
+    require_tag_absent(repository, tag)
+    release = get_release(repository, release_id)
+    verify_identity(release, tag, target)
+    verify_assets(release, directory)
     gh('--method', 'PATCH', f'repos/{repository}/releases/{release_id}',
        '-F', 'draft=false', '-F', 'prerelease=true')
     release = get_release(repository, release_id)
