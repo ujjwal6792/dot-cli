@@ -43,6 +43,13 @@ class ReleaseGateTests(unittest.TestCase):
         self.assertEqual(GATE.validate(self.eligible()), 'v0.1.0-rc.2')
         self.assertEqual(GATE.validate(self.eligible(version='v0.1.0-rc.10', existing_tags='v0.1.0-rc.9')), 'v0.1.0-rc.10')
 
+    def test_release_workflow_serializes_same_version_without_canceling_active_run(self):
+        workflow = (ROOT / '.github/workflows/release.yml').read_text()
+        self.assertRegex(
+            workflow,
+            r'(?m)^concurrency:\n  group: release-\$\{\{ inputs\.approved_version \}\}\n  cancel-in-progress: false$',
+        )
+
     def test_feature_branch_dispatch_is_rejected(self):
         with self.assertRaisesRegex(ValueError, 'main'):
             GATE.validate(self.eligible(ref='refs/heads/implement/standalone-38'))
@@ -125,6 +132,8 @@ class ReleaseGateTests(unittest.TestCase):
                 if fail_after_retarget and any('target_commitish=' in str(arg) for call in calls for arg in call):
                     raise RuntimeError('synthetic read failure after retarget')
                 return json.dumps(record)
+            if args == ('repos/owner/repo/git/matching-refs/tags/v0.1.0-rc.2',):
+                return '[]'
             if args[:2] == ('--method', 'PATCH'):
                 if args[2] != 'repos/owner/repo/releases/41':
                     self.fail('PATCH did not use release ID')
@@ -249,6 +258,23 @@ class ReleaseGateTests(unittest.TestCase):
                     DRAFT.publish('owner/repo', 41, 'v0.1.0-rc.2', 'b' * 40, directory)
             finally:
                 DRAFT.gh = original
+
+    def test_final_recheck_refuses_draft_changed_after_initial_verification(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            directory = Path(temporary)
+            _, record = self._draft_fixture(directory, source='b' * 40)
+            calls, fake_gh = self._install_draft_api(record)
+            original = DRAFT.gh
+            DRAFT.gh = fake_gh
+            try:
+                release_id = DRAFT.prepare('owner/repo', 'v0.1.0-rc.2', 'b' * 40, directory)
+                record['assets'][0]['digest'] = 'sha256:' + '0' * 64
+                with self.assertRaisesRegex(ValueError, 'digest mismatch'):
+                    DRAFT.publish('owner/repo', release_id, 'v0.1.0-rc.2', 'b' * 40, directory)
+            finally:
+                DRAFT.gh = original
+            self.assertFalse(any(call[:2] == ('--method', 'PATCH') and 'draft=false' in call for call in calls))
+            self.assertTrue(record['draft'])
 
     def test_stale_source_requires_matching_prior_run_with_successful_build_and_smoke(self):
         release = {'created_at': '2026-10-10T23:05:34Z'}
