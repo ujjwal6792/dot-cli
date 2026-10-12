@@ -197,11 +197,21 @@ SH
   [ "$status" -ne 0 ]
   [[ "$output" == *'recorded state directory mismatch'* ]]
   printf '{"version":1,"groups":{}}\n' >"$isolated/adoption.json"
-  run env HOME="$HOME" XDG_STATE_HOME="$HOME/xdg" DOT_STATE_DIR="$legacy" PATH="/private/tmp/py312bin:$PATH" "$HOME/.local/bin/dot" init --check
+  fixture_python=
+  for candidate in /private/tmp/py312bin/python3 python3.16 python3.15 python3.14 python3.13 python3.12 python3.11 python3; do
+    if [ -x "$candidate" ]; then python_path="$candidate"; else python_path="$(command -v "$candidate" 2>/dev/null || true)"; fi
+    if [ -n "$python_path" ] && "$python_path" -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1; then
+      fixture_python="$python_path"
+      break
+    fi
+  done
+  [ -n "$fixture_python" ]
+  fixture_path="${fixture_python%/*}:$PATH"
+  run env HOME="$HOME" XDG_STATE_HOME="$HOME/xdg" DOT_STATE_DIR="$legacy" PATH="$fixture_path" "$HOME/.local/bin/dot" init --check
   [ "$status" -eq 0 ]
   [[ "$output" == *"Install record: $isolated/install.json"* ]]
   [[ "$output" != *"Install record: $legacy/install.json"* ]]
-  run env HOME="$HOME" DOT_STATE_DIR="$isolated" PYTHONPATH="$REPO/tools/dot" /private/tmp/py312bin/python3 - "$isolated" <<'PY'
+  run env HOME="$HOME" DOT_STATE_DIR="$isolated" PYTHONPATH="$REPO/tools/dot" "$fixture_python" - "$isolated" <<'PY'
 import json, sys
 from pathlib import Path
 import file_metadata, init, install_state, migration, scope, state_paths, tracking
