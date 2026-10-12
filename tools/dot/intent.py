@@ -14,6 +14,7 @@ import subprocess
 import sys
 
 import scope
+import state_paths
 
 MANIFEST = 'tools/dot/manifest.json'
 MANIFEST_PATH = None
@@ -650,8 +651,8 @@ def unsafe_review(value):
 def missing_tools(home, selected):
     import shutil
     missing = sorted({tool for e in selected.values() for tool in e['tools'] if not shutil.which(tool)})
-    report = home / '.local/state/dot/missing-tools.json'
-    if report.resolve() != home.resolve() / report.relative_to(home):
+    report = state_paths.state_dir(home) / 'missing-tools.json'
+    if report.resolve() != state_paths.state_dir(home).resolve() / 'missing-tools.json':
         raise ValueError('missing-tools report must not traverse symlinks')
     write(report, json.dumps(missing) + '\n')
     print('Missing tools (advisory): ' + ', '.join(missing))
@@ -672,9 +673,9 @@ def apply(root, home, saved, approval, ack, ack_desktop=False, replace_skills_ba
     if saved.get('skills_backup') and saved['skills_backup']['exists'] and not replace_skills_backup:
         raise ValueError('existing singleton skills backup conflict; explicit --replace-skills-backup required')
     base = root if mode == 'track' else home
-    backup = home / '.local/state/dot/recovery' / approval
+    backup = state_paths.state_dir(home) / 'recovery' / approval
     # Local state ancestors must not redirect recovery outside HOME.
-    if backup.resolve() != home.resolve() / backup.relative_to(home):
+    if backup.resolve() != state_paths.state_dir(home).resolve() / 'recovery' / approval:
         raise ValueError('local recovery state must not traverse symlinks')
     backup.mkdir(parents=True, mode=0o700, exist_ok=False)
     os.chmod(backup, 0o700)

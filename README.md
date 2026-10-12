@@ -35,15 +35,18 @@ bash install.sh --version VERSION --platform PLATFORM \
 Default locations are `~/.local/share/dot-cli` (versioned payload and atomic
 `current` pointer), `~/.local/bin/dot`, and
 `${XDG_STATE_HOME:-~/.local/state}/dot/install.json`. The mode-0600 local record
-uses schema `record_version: 1`: `owner` (`artifact/curl` or
+uses schema `record_version: 2`: `owner` (`artifact/curl` or
 `package-manager/brew|pacman`), release repository/tag/platform/archive SHA-256,
-canonical `install_root` and `engine_path`, plus `browser_sha256`. Optional
+canonical `install_root`, `engine_path`, and the exact `state_dir`, plus
+`browser_sha256`. Existing v1 records remain readable. Optional
 private/config connection lives separately in `connection.json` (see the
 [shared state contract](docs/install-record-contract.md)); neither checkout is
 needed to install or identify the public artifact. These are local mutable
 ownership/recovery records, not trust roots.
 The installer does not edit shell startup files; add `~/.local/bin` to PATH
 manually. `--root` and `--state-dir` accept absolute paths, including spaces.
+`--state-dir` controls every runtime state lookup through the generated launcher;
+it does not move or consult any previous state directory.
 Package-manager-owned installs are never overwritten; use `brew upgrade` or
 `pacman -Syu` instead. No formula/AUR package is published by this project yet.
 

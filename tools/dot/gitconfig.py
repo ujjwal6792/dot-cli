@@ -2,11 +2,13 @@
 """Bounded Git key edits. Never resolve includes or execute configured commands."""
 import base64
 import json
+import os
 from pathlib import Path
 import re
 import subprocess
 import sys
 import tempfile
+import state_paths
 
 import scope
 
@@ -149,13 +151,15 @@ def merge(text, patch):
 
 
 SPLIT_WRAPPER = '''#!/bin/sh
+{{ $state := env "DOT_STATE_DIR" -}}
+{{ if not $state -}}{{ $xdg := env "XDG_STATE_HOME" -}}{{ if $xdg -}}{{ $state = joinPath $xdg "dot" -}}{{ else -}}{{ $state = joinPath .chezmoi.homeDir ".local/state/dot" -}}{{ end -}}{{ end -}}
 {{ $engine := env "DOT_ENGINE" -}}
 {{ if hasKey . "dotEngine" -}}
 {{ $engine = .dotEngine -}}
 {{ if not $engine -}}{{ fail "explicit public dotEngine is required; run compatible dot init before applying" }}{{ end -}}
 {{ end -}}
-{{ if and (not $engine) (lstat (joinPath .chezmoi.homeDir ".local/state/dot/install.json")) -}}
-{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath .chezmoi.homeDir ".local/state/dot/install.json") | trim) "True" -}}
+{{ if and (not $engine) (lstat (joinPath $state "install.json")) -}}
+{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath $state "install.json") | trim) "True" -}}
 {{ fail "split installation requires explicit public dotEngine; run compatible dot init before applying" }}
 {{ end -}}
 {{ end -}}
@@ -168,11 +172,23 @@ exec python3 -B {{ joinPath .chezmoi.sourceDir ".." "tools/dot/gitconfig.py" | s
 '''
 
 
+def supported_wrapper(text):
+    if text in (WRAPPER, SPLIT_WRAPPER):
+        return True
+    if os.environ.get('DOT_STATE_DIR') is not None or os.environ.get('XDG_STATE_HOME') is not None:
+        return False
+    state_template = '{{ $state := env "DOT_STATE_DIR" -}}\n{{ if not $state -}}{{ $xdg := env "XDG_STATE_HOME" -}}{{ if $xdg -}}{{ $state = joinPath $xdg "dot" -}}{{ else -}}{{ $state = joinPath .chezmoi.homeDir ".local/state/dot" -}}{{ end -}}{{ end -}}\n'
+    legacy = SPLIT_WRAPPER.replace(state_template, '')
+    legacy = legacy.replace('(joinPath $state "install.json")',
+                            '(joinPath .chezmoi.homeDir ".local/state/dot/install.json")')
+    return text == legacy
+
+
 def preferences(root, home, entry, config=None, os_name=None):
     from intent import bounded, read_text, template_text, scan
     validate(entry)
     wrapper = bounded(root, entry['source'])
-    if wrapper.read_text() not in (WRAPPER, SPLIT_WRAPPER):
+    if not supported_wrapper(wrapper.read_text()):
         raise ValueError('unsupported native Git adapter; only the bounded wrapper is authorized')
     source = bounded(root, entry['git_source'])
     text = read_text(source)
@@ -206,7 +222,7 @@ def track(root, home, entry, selection):
         if key not in ('path', 'destination', 'git_keys') and value != entry.get(key):
             raise ValueError('Track cannot change or remove bounded Git metadata: ' + key)
     wrapper = bounded(root, entry['source'])
-    if wrapper.read_text() not in (WRAPPER, SPLIT_WRAPPER):
+    if not supported_wrapper(wrapper.read_text()):
         raise ValueError('unsupported native Git adapter; only the bounded wrapper is authorized')
     live = bounded(home, selection['path'])
     text, _ = merge(raw(live), {})  # Validate without following includes.
@@ -330,8 +346,8 @@ def native_backup(root, home, config, os_name, args):
     merged, _ = merge(text, patch)
     if merged == text or not operation['mutating']:
         return
-    recovery = home / '.local/state/dot/native-git-recovery'
-    if recovery.resolve() != home.resolve() / recovery.relative_to(home):
+    recovery = state_paths.state_dir(home) / 'native-git-recovery'
+    if recovery.resolve() != state_paths.state_dir(home).resolve() / 'native-git-recovery':
         raise ValueError('native Git recovery must not traverse symlinks')
     recovery.mkdir(parents=True, exist_ok=True, mode=0o700)
     recovery.chmod(0o700)
@@ -364,8 +380,8 @@ def main():
     merged, _ = merge(text, patch)
     args = json.loads(base64.b64decode(args_encoded, validate=True))
     if merged != text and native_operation(args)['mutating']:
-        recovery = home / '.local/state/dot/native-git-recovery'
-        if recovery.resolve() != home.resolve() / recovery.relative_to(home):
+        recovery = state_paths.state_dir(home) / 'native-git-recovery'
+        if recovery.resolve() != state_paths.state_dir(home).resolve() / 'native-git-recovery':
             raise ValueError('native Git recovery must not traverse symlinks')
         records = list(recovery.glob('*/plan.json'))
         if not any(record.parent.resolve() == recovery.resolve() / record.parent.name and

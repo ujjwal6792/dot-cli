@@ -17,13 +17,11 @@ import packages
 
 import contract
 import install_state
+import state_paths
 
 
 def local_state_dir():
-    home = Path(os.environ['HOME'])
-    if os.environ.get('XDG_STATE_HOME'):
-        return Path(os.environ['XDG_STATE_HOME']) / 'dot'
-    return home.resolve() / '.local/state/dot'
+    return state_paths.state_dir()
 
 
 def safe_path(path):
@@ -327,7 +325,7 @@ def apply_dependency(plan, validate):
 
 def create_tracker(source, engine, config, record, profile):
     home = Path(os.environ['HOME'])
-    state = home / '.local/state/dot'
+    state = state_paths.state_dir(home)
     identity = {}
     for field, prompt in (('name', 'Tracker full name (local machine data only):'),
                           ('email', 'Tracker email (local machine data only):')):

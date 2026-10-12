@@ -39,6 +39,17 @@ EOF
     fi
     exit 0 ;;
 esac
+if [ "${DOT_STATE_DIR+x}" = x ]; then
+  case "$DOT_STATE_DIR" in /*) ;; *) echo 'dot: DOT_STATE_DIR must be absolute' >&2; exit 2 ;; esac
+  case "$DOT_STATE_DIR" in *'/../'*|*/..|*'/./'*|*/.|*'//'|*$'\n'*|*$'\r'*) echo 'dot: DOT_STATE_DIR must be normalized and contain no control characters' >&2; exit 2 ;; esac
+  current=
+  IFS=/ read -r -a state_parts <<< "$DOT_STATE_DIR"
+  for part in "${state_parts[@]}"; do
+    [ -n "$part" ] || continue
+    current="$current/$part"
+    [ ! -L "$current" ] || { echo "dot: DOT_STATE_DIR traverses a symlink: $current" >&2; exit 2; }
+  done
+fi
 if [ "${1:-}" = init ]; then
   shift
   if [ "${1:-}" = --check ]; then
@@ -53,7 +64,7 @@ if [ "${1:-}" = init ]; then
       previous="$argument"
     done
     PYTHON_BIN="$(find_compatible_python || true)"
-    state_dir="${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot"
+    state_dir="${DOT_STATE_DIR:-${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot}"
     connection_record="$state_dir/connection.json"
     if [ -n "$PYTHON_BIN" ] && { { [ -n "$check_source" ] && [ -n "$check_config" ]; } || [ -f "$connection_record" ]; }; then
       DOT_ENGINE="${DOT_ENGINE:-$TOOL_DIR}" DOT_PYTHON="$PYTHON_BIN" exec "$PYTHON_BIN" -B "$TOOL_DIR/init.py" --check "$@"
@@ -97,7 +108,7 @@ if [ "${1:-}" = init ]; then
   exec "$PYTHON_BIN" -B "$TOOL_DIR/init.py" "$@"
 fi
 if [ "${1:-}" = self-update ]; then
-  INSTALL_RECORD="${XDG_STATE_HOME:-$HOME/.local/state}/dot/install.json"
+  INSTALL_RECORD="${DOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dot}/install.json"
   if [ -f "$INSTALL_RECORD" ] && grep -q '"kind"[[:space:]]*:[[:space:]]*"package-manager"' "$INSTALL_RECORD"; then
     if grep -q '"manager"[[:space:]]*:[[:space:]]*"brew"' "$INSTALL_RECORD"; then echo 'dot self-update: package-manager-owned; run brew upgrade dots-cli' >&2; exit 1; fi
     if grep -q '"manager"[[:space:]]*:[[:space:]]*"pacman"' "$INSTALL_RECORD"; then echo 'dot self-update: package-manager-owned; run pacman -Syu' >&2; exit 1; fi
@@ -107,14 +118,16 @@ if [ "${1:-}" = self-update ]; then
     INSTALL_ROOT="$(sed -n 's/.*"engine_path":"\(.*\)\/current\/tools\/dot".*/\1/p' "$INSTALL_RECORD")"
     [ -n "$INSTALL_ROOT" ] || { echo 'dot self-update: invalid artifact install record; refusing to write' >&2; exit 1; }
     shift
-    exec sh "$TOOL_DIR/../../install.sh" --self-update "$@" --root "$INSTALL_ROOT"
+    state_args=()
+    [ -z "${DOT_STATE_DIR:-}" ] || state_args=(--state-dir "$DOT_STATE_DIR")
+    exec sh "$TOOL_DIR/../../install.sh" --self-update "$@" --root "$INSTALL_ROOT" "${state_args[@]}"
   fi
 fi
 if [ -z "${DOT_ENGINE:-}" ] && [ ! -f "$TOOL_DIR/../../dot-contract.json" ] && [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migrate ]; then
   echo 'dot: public engine requires explicit DOT_ENGINE and private DOT_SOURCE; use the installed dot launcher' >&2
   exit 1
 fi
-if [ -n "${DOT_ENGINE:-}" ] && [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migrate ] && [ -z "${DOT_SOURCE:-}" ] && [ ! -f "${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot/connection.json" ]; then
+if [ -n "${DOT_ENGINE:-}" ] && [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migrate ] && [ -z "${DOT_SOURCE:-}" ] && [ ! -f "${DOT_STATE_DIR:-${XDG_STATE_HOME:-${HOME:?HOME must be set}/.local/state}/dot}/connection.json" ]; then
   echo 'dot: explicit DOT_SOURCE is required with DOT_ENGINE; run dot init to establish a private connection' >&2
   exit 1
 fi
@@ -129,13 +142,17 @@ if [ "${1:-}" != contract ] && [ "${1:-}" != self-update ] && [ "${1:-}" != migr
   if [ -n "$PYTHON_BIN" ]; then
     export DOT_PYTHON="$PYTHON_BIN"
   fi
-  if [ -n "${XDG_STATE_HOME:-}" ]; then
+  if [ -n "${DOT_STATE_DIR:-}" ]; then
+    state_dir="$DOT_STATE_DIR"
+  elif [ -n "${XDG_STATE_HOME:-}" ]; then
     state_dir="$XDG_STATE_HOME/dot"
   else
     state_dir="${HOME:?HOME must be set}/.local/state/dot"
   fi
   if [ -n "$PYTHON_BIN" ]; then
-    if [ -n "${XDG_STATE_HOME:-}" ]; then
+    if [ -n "${DOT_STATE_DIR:-}" ]; then
+      state_dir="$DOT_STATE_DIR"
+    elif [ -n "${XDG_STATE_HOME:-}" ]; then
       state_dir="$XDG_STATE_HOME/dot"
     else
       state_dir="$("$PYTHON_BIN" -c 'from pathlib import Path; import sys; print(Path(sys.argv[1]).resolve() / ".local/state/dot")' "$HOME")"

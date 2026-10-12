@@ -1,8 +1,10 @@
 """Versioned private logical-file metadata; resolved at every authorization seam."""
 import json
-from pathlib import Path
 import re
 import sys
+from pathlib import Path
+
+import state_paths
 
 SYSTEMS = {'darwin', 'linux'}
 FIELDS = {'portability', 'impact', 'tools', 'removals', 'hooks', 'warnings',
@@ -24,8 +26,8 @@ def identifier(value):
 
 def identity(home, data):
     from intent import file_state
-    path = Path(home) / '.local/state/dot/machine.json'
-    if path.resolve() != Path(home).resolve() / '.local/state/dot/machine.json' or not path.is_file() or path.is_symlink():
+    path = state_paths.state_dir(home) / 'machine.json'
+    if path.resolve() != state_paths.state_dir(home).resolve() / 'machine.json' or not path.is_file() or path.is_symlink():
         raise ValueError('stable explicit machine identity required')
     from contract import read_json
     record = read_json(path)

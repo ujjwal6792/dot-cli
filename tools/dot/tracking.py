@@ -3,6 +3,7 @@ import json
 import hashlib
 import sys
 from pathlib import Path
+import state_paths
 
 
 def source_collisions(root, actions):
@@ -41,8 +42,8 @@ def after_state(action):
 
 def pending(home):
     from contract import read_json
-    recovery = Path(home) / '.local/state/dot/recovery'
-    if recovery.resolve() != Path(home).resolve() / '.local/state/dot/recovery':
+    recovery = state_paths.state_dir(home) / 'recovery'
+    if recovery.resolve() != state_paths.state_dir(home).resolve() / 'recovery':
         raise ValueError('recovery must not traverse symlinks')
     if recovery.exists():
         for directory in recovery.iterdir():
@@ -64,8 +65,8 @@ def recover(root, home, saved, approval):
             saved['request']['mode'] not in ('untrack', 'metadata') or
             saved['root'] != str(root.resolve()) or saved['home'] != str(home.resolve())):
         raise ValueError('explicit approval of the exact tracking recovery plan required')
-    backup = home / '.local/state/dot/recovery' / approval
-    if backup.resolve() != home.resolve() / backup.relative_to(home):
+    backup = state_paths.state_dir(home) / 'recovery' / approval
+    if backup.resolve() != state_paths.state_dir(home).resolve() / 'recovery' / approval:
         raise ValueError('recovery must not traverse symlinks')
     if read_json(backup / 'plan.json') != saved or read_json(backup / 'transaction.json')['status'] != 'pending':
         raise ValueError('pending exact tracking recovery required')

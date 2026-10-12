@@ -1,18 +1,30 @@
 # Local install and connection state contract
 
-This is the shared #34/#35 interface. State is local-unmanaged under
+This is the shared #34/#35 interface. By default, state is local-unmanaged under
 `${XDG_STATE_HOME:-$HOME/.local/state}/dot/`; it is never stored in either Git
 checkout, a release archive, chezmoi data, approvals, or recovery journals.
 
+An installer `--state-dir ABSOLUTE_PATH` selects the exact runtime state
+directory, not merely the install record location. Its generated launcher pins
+that path as `DOT_STATE_DIR` on every invocation, overriding inherited XDG or
+DOT_STATE_DIR values. The path is shell-quoted, must be normalized and absolute,
+and may not traverse symlinks. The CLI, Python engine, read-only `dot init
+--check`, self-update ownership checks, approvals, intent journals, migration,
+and recovery all resolve through this same value. A bad explicit value fails
+closed; it never falls back to the legacy default. Direct CLI users without an
+installer-pinned launcher may set `DOT_STATE_DIR` explicitly; absent that, the
+historic XDG/default behavior is unchanged. No state is moved, copied, or
+deleted when selecting a different directory.
+
 ## Public artifact record (installer-owned)
 
-`install.json` is schema `record_version: 1`. It describes the installed public
+`install.json` is schema `record_version: 2` for current artifact installs. It describes the installed public
 tool artifact only; a private checkout or tracker is never required to install
 or identify it:
 
 ```json
 {
-  "record_version": 1,
+  "record_version": 2,
   "owner": {"kind": "artifact", "manager": "curl"},
   "artifact": {
     "repository": "ujjwal6792/dots-cli",
@@ -22,13 +34,16 @@ or identify it:
   },
   "install_root": "/home/example/.local/share/dot-cli",
   "engine_path": "/home/example/.local/share/dot-cli/current/tools/dot",
+  "state_dir": "/home/example/.local/state/dot-cli",
   "browser_sha256": "<64 lowercase hex>"
 }
 ```
 
 The owner enum is `artifact/curl` or `package-manager/brew|pacman`. Artifact
 install/update may replace this record only when it is a valid schema-v1
-artifact/curl record. Package-manager ownership is read-only to the installer and
+artifact/curl record or a valid schema-v2 record whose `state_dir` equals the
+directory containing it. Version 1 remains supported for existing installs;
+new artifact installs write version 2. Package-manager ownership is read-only to the installer and
 `dot self-update`; direct users to the manager. Unknown, malformed, legacy, or
 symlink-redirected records fail closed and are never silently upgraded or
 reinterpreted. The archive checksum is the reviewed release integrity input;
