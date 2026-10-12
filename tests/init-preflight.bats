@@ -73,7 +73,7 @@ SH
   run env -u DOT_SOURCE -u DOT_CONFIG PATH="$BATS_TEST_TMPDIR/bin" HOME="$HOME" DOT_ENGINE="$ENGINE" "$ENGINE/dot" init --check
   [ "$status" -eq 0 ]
   [[ "$output" == *'unavailable or too old (detected 3.9.6)'* ]]
-  [[ "$output" == *'Private connection: not recorded'* ]]
+  [[ "$output" == *'Runtime state: not inspected (Python 3.11+ required for safe path validation)'* ]]
   [ ! -e "$HOME/.local/state/dot/install.json" ]
   [ ! -e "$HOME/.local/state/dot/connection.json" ]
 }
