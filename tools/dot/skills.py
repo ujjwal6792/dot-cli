@@ -15,6 +15,53 @@ HOOK = '''#!/bin/sh
 {{ if lstat (joinPath $repo ".." "tools/dot/scope.py") -}}
 {{ $repo = joinPath $repo ".." -}}
 {{ end -}}
+{{ $scope_version := output "python3" "-B" (joinPath $repo "tools/dot/state_paths.py") "approval-version" | trim -}}
+{{ $exact := or (eq $scope_version "2") (eq $scope_version "3") -}}
+{{ if $exact -}}
+python3 -B "{{ $repo }}/tools/dot/skills.py" "{{ $repo }}" "{{ .chezmoi.homeDir }}"
+{{ else -}}
+"{{ $repo }}/scripts/sync-skills.sh"
+{{ end -}}
+'''
+
+
+SPLIT_HOOK = '''#!/bin/sh
+# Bounded native adapter; legacy scopes retain their transitional router.
+{{ $repo := .chezmoi.sourceDir -}}
+{{ if lstat (joinPath $repo ".." "tools/dot/state_paths.py") -}}{{ $repo = joinPath $repo ".." -}}{{ end -}}
+{{ $state_tool := joinPath $repo "tools/dot/state_paths.py" -}}
+{{ $engine := env "DOT_ENGINE" -}}
+{{ if hasKey . "dotEngine" -}}
+{{ $engine = .dotEngine -}}
+{{ if not $engine -}}{{ fail "explicit public dotEngine is required; run compatible dot init before applying" }}{{ end -}}
+{{ end -}}
+{{ if and (not $engine) (eq (output "python3" "-B" $state_tool "split-install" | trim) "yes") -}}
+{{ fail "split installation requires explicit public dotEngine; run compatible dot init before applying" }}
+{{ end -}}
+{{ if $engine -}}
+{{ $repo = joinPath .chezmoi.sourceDir ".." -}}
+{{ $contract := output "python3" "-B" (joinPath $engine "contract.py") "check" "--engine" $engine "--source" $repo -}}
+python3 -B {{ joinPath $engine "contract.py" | shellQuote }} check --engine {{ $engine | shellQuote }} --source {{ $repo | shellQuote }} >/dev/null || exit 1
+{{ if eq (output "python3" "-B" (joinPath $engine "scope.py") "skills" $repo .chezmoi.homeDir | trim) "yes" -}}
+python3 -B {{ joinPath $engine "skills.py" | shellQuote }} {{ $repo | shellQuote }} {{ .chezmoi.homeDir | shellQuote }}
+{{ end -}}
+{{ else -}}
+{{ $scope_version := output "python3" "-B" (joinPath $repo "tools/dot/state_paths.py") "approval-version" | trim -}}
+{{ $exact := or (eq $scope_version "2") (eq $scope_version "3") -}}
+{{ if $exact -}}
+python3 -B "{{ $repo }}/tools/dot/skills.py" "{{ $repo }}" "{{ .chezmoi.homeDir }}"
+{{ else -}}
+"{{ $repo }}/scripts/sync-skills.sh"
+{{ end -}}
+{{ end -}}
+'''
+
+LEGACY_HOOK = '''#!/bin/sh
+# Bounded native adapter; legacy scopes retain their transitional router.
+{{ $repo := .chezmoi.sourceDir -}}
+{{ if lstat (joinPath $repo ".." "tools/dot/scope.py") -}}
+{{ $repo = joinPath $repo ".." -}}
+{{ end -}}
 {{ $exact := false -}}
 {{ if lstat (joinPath .chezmoi.homeDir ".local/state/dot/adoption.json") -}}
 {{ $exact = eq (output "python3" "-B" (joinPath $repo "tools/dot/scope.py") "version" $repo .chezmoi.homeDir | trim) "2" -}}
@@ -26,8 +73,7 @@ python3 -B "{{ $repo }}/tools/dot/skills.py" "{{ $repo }}" "{{ .chezmoi.homeDir 
 {{ end -}}
 '''
 
-
-SPLIT_HOOK = '''#!/bin/sh
+LEGACY_SPLIT_HOOK = '''#!/bin/sh
 # Bounded native adapter; legacy scopes retain their transitional router.
 {{ $repo := .chezmoi.sourceDir -}}
 {{ $engine := env "DOT_ENGINE" -}}
@@ -62,6 +108,16 @@ python3 -B "{{ $repo }}/tools/dot/skills.py" "{{ $repo }}" "{{ .chezmoi.homeDir 
 {{ end -}}
 {{ end -}}
 '''
+
+
+def supported_hook(text):
+    if text in (HOOK, SPLIT_HOOK):
+        return True
+    # Previously rendered exact adapters used the fixed legacy state path.
+    # Accept those only when no explicit isolated runtime directory is active.
+    if os.environ.get('DOT_STATE_DIR') is not None or os.environ.get('XDG_STATE_HOME') is not None:
+        return False
+    return text in (LEGACY_HOOK, LEGACY_SPLIT_HOOK)
 
 
 def output(entry):

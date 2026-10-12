@@ -28,7 +28,7 @@ class BrowserApiTest(unittest.TestCase):
         subprocess.run(['git', '-C', str(self.source), 'config', 'user.name', 'Fixture'], check=True)
         subprocess.run(['git', '-C', str(self.source), 'config', 'user.email', 'fixture@example.invalid'], check=True)
         shutil.copy(REPO / 'tools' / 'dot' / 'scope.py', self.source / 'tools' / 'dot' / 'scope.py')
-        for name in ('contract.py', 'intent.py', 'scope.py', 'gitconfig.py', 'skills.py', 'layout.py', 'browser_api.py', 'tracking.py', 'file_metadata.py', 'packages.py'):
+        for name in ('contract.py', 'intent.py', 'scope.py', 'gitconfig.py', 'skills.py', 'layout.py', 'browser_api.py', 'tracking.py', 'file_metadata.py', 'packages.py', 'state_paths.py'):
             shutil.copy(REPO / 'tools' / 'dot' / name, self.engine / name)
         shutil.copy(REPO / 'tools' / 'dot' / 'engine.json', self.engine / 'engine.json')
         shutil.copy(REPO / 'tools' / 'dot' / 'dot', self.engine / 'dot')

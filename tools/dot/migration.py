@@ -18,6 +18,7 @@ import contract
 import intent
 import layout
 import scope
+import state_paths
 
 
 def write(path, text, mode=0o600):
@@ -90,12 +91,15 @@ def git(path):
 
 
 def paths(home):
-    state = home / '.local/state/dot'
-    return {name: layout.private_path(home, path) for name, path in {
+    state = state_paths.state_dir(home)
+    values = {
         'record': state / 'install.json', 'launcher': home / '.local/bin/dot',
         'journal': state / 'installed-migration.json', 'recovery': state / 'installed-recovery',
         'private': home / '.local/share/dot-config', 'public': home / '.local/share/dot-cli',
-        'state': state}.items()}
+        'state': state}
+    return {name: layout.state_path(home, path) if name in ('record', 'journal', 'recovery')
+            else path if name == 'state' else layout.private_path(home, path)
+            for name, path in values.items()}
 
 
 def launcher(source, config, public=None):
@@ -294,7 +298,7 @@ def main():
             print('Installed layout already split; no changes or new approval.')
             return
         output = Path(os.path.abspath(args.out))
-        if output.resolve() != output or output.exists() or output.is_symlink() or any(output.is_relative_to(Path(value[k])) for k in ('source', 'candidate')) or output.is_relative_to(home / '.local/state/dot'):
+        if output.resolve() != output or output.exists() or output.is_symlink() or any(output.is_relative_to(Path(value[k])) for k in ('source', 'candidate')) or output.is_relative_to(state_paths.state_dir(home)):
             raise ValueError('plan output must be new, outside checkouts and local state')
         intent.write(output, json.dumps(value, indent=2) + '\n')
         print('Installed split preview (no adoption/packages/services):\n' + str(source) + ' → ' + str(paths(home)['private']) + '\nPublic candidate: ' + args.engine + ' → ' + str(paths(home)['public']) + '\nReferences: sourceDir, dotEngine, launcher, install.json\nOriginals, exact scope, identity and recovery retained. Plan: ' + value['id'])

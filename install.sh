@@ -50,6 +50,7 @@ if [ -z "$state_dir" ]; then state_dir="${XDG_STATE_HOME:-${HOME:?HOME is requir
 case "$state_dir" in /*) ;; *) fail '--state-dir must be absolute' ;; esac
 case "$root" in *'/../'*|*/..|*'/./'*|*'//'*) fail '--root must be normalized' ;; esac
 case "$state_dir" in *'/../'*|*/..|*'/./'*|*'//'*) fail '--state-dir must be normalized' ;; esac
+case "$root" in *[![:print:]]*) fail '--root must not contain control characters' ;; esac
 case "$root" in
   /|"$HOME"|/usr|/usr/*|/usr/local|/usr/local/*|/opt/homebrew|/opt/homebrew/*|/var/lib/pacman|/var/lib/pacman/*)
     fail 'system/package-manager prefix is protected; use brew upgrade or pacman -Syu for managed installs' ;;
@@ -73,6 +74,11 @@ check_path() {
   done
 }
 check_path "$root"; check_path "$state_dir"; check_path "${HOME:?HOME is required}/.local/bin"
+case "$state_dir" in *[![:print:]]*) fail '--state-dir must not contain control characters' ;; esac
+json_escape() { printf %s "$1" | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+root_json=$(json_escape "$root")
+engine_path_json=$(json_escape "$root/current/tools/dot")
+state_dir_json=$(json_escape "$state_dir")
 record="$state_dir/install.json"
 launcher="${HOME}/.local/bin/dot"
 connection="$state_dir/connection.json"
@@ -95,18 +101,23 @@ if [ -f "$record" ]; then
   grep -q '"kind"[[:space:]]*:[[:space:]]*"artifact"' "$record" || fail 'unknown install owner; refusing to modify it'
   grep -q '"manager"[[:space:]]*:[[:space:]]*"curl"' "$record" || fail 'unknown artifact manager; refusing to modify it'
   record_keys=$(grep -Eo '"[A-Za-z0-9_]+"[[:space:]]*:' "$record" | wc -l | tr -d ' ')
-  [ "$record_keys" -eq 12 ] || fail 'malformed or unsupported artifact record; refusing to modify it'
+  [ "$record_keys" -eq 12 ] || [ "$record_keys" -eq 13 ] || fail 'malformed or unsupported artifact record; refusing to modify it'
   for field in record_version owner kind manager artifact repository release_tag platform sha256 install_root engine_path browser_sha256; do
     grep -Eq '"'"$field"'"[[:space:]]*:' "$record" || fail 'incomplete artifact record; refusing to modify it'
   done
-  grep -Eq '"record_version"[[:space:]]*:[[:space:]]*1([,}])' "$record" || fail 'unsupported artifact record version'
+  if grep -Eq '"record_version"[[:space:]]*:[[:space:]]*2([,}])' "$record"; then
+    [ "$record_keys" -eq 13 ] || fail 'malformed v2 artifact record; refusing to modify it'
+    grep -Fq '"state_dir":"'"$state_dir_json"'"' "$record" || fail 'recorded state directory mismatch; refusing to modify it'
+  else
+    grep -Eq '"record_version"[[:space:]]*:[[:space:]]*1([,}])' "$record" && [ "$record_keys" -eq 12 ] || fail 'unsupported artifact record version'
+  fi
   grep -Fq '"repository":"ujjwal6792/dots-cli"' "$record" || fail 'unknown recorded repository'
   grep -Eq '"platform"[[:space:]]*:[[:space:]]*"(darwin-arm64|linux-amd64|linux-arm64)"' "$record" || fail 'unsupported recorded platform'
   grep -Eq '"release_tag"[[:space:]]*:[[:space:]]*"v[0-9]+\.[0-9]+\.[0-9]+(-[A-Za-z0-9.-]+)?"' "$record" || fail 'invalid recorded release tag'
   grep -Eq '"sha256"[[:space:]]*:[[:space:]]*"[a-f0-9]{64}"' "$record" || fail 'invalid recorded archive checksum'
   grep -Eq '"browser_sha256"[[:space:]]*:[[:space:]]*"[a-f0-9]{64}"' "$record" || fail 'invalid recorded browser checksum'
-  grep -Fq '"install_root":"'"$root"'"' "$record" || fail 'recorded install root mismatch; refusing to modify it'
-  grep -Fq '"engine_path":"'"$root/current/tools/dot"'"' "$record" || fail 'recorded engine path mismatch; refusing to modify it'
+  grep -Fq '"install_root":"'"$root_json"'"' "$record" || fail 'recorded install root mismatch; refusing to modify it'
+  grep -Fq '"engine_path":"'"$engine_path_json"'"' "$record" || fail 'recorded engine path mismatch; refusing to modify it'
 fi
 [ -z "$old_target" ] || [ -f "$record" ] || fail 'unrecorded current install; refusing to claim or replace it'
 if [ -L "$launcher" ]; then fail 'launcher symlink is refused'; fi
@@ -185,12 +196,14 @@ version_dir="$root/versions/$version-$platform"
 mv "$payload" "$version_dir"
 record_tmp="$state_dir/.install.$$.json"
 cat >"$record_tmp" <<EOF
-{"record_version":1,"owner":{"kind":"artifact","manager":"curl"},"artifact":{"repository":"ujjwal6792/dots-cli","release_tag":"v$version","platform":"$platform","sha256":"$digest"},"install_root":"$root","engine_path":"$root/current/tools/dot","browser_sha256":"$browser_digest"}
+{"record_version":2,"owner":{"kind":"artifact","manager":"curl"},"artifact":{"repository":"ujjwal6792/dots-cli","release_tag":"v$version","platform":"$platform","sha256":"$digest"},"install_root":"$root_json","engine_path":"$engine_path_json","state_dir":"$state_dir_json","browser_sha256":"$browser_digest"}
 EOF
 launcher_tmp="${launcher}.$$"
+shell_quote() { printf "'%s'" "$(printf %s "$1" | sed "s/'/'\\\\''/g")"; }
 cat >"$launcher_tmp" <<EOF
 #!/bin/sh
-exec "$root/current/tools/dot/dot" "\$@"
+export DOT_STATE_DIR=$(shell_quote "$state_dir")
+exec $(shell_quote "$root/current/tools/dot/dot") "\$@"
 EOF
 chmod 755 "$launcher_tmp"
 old_record="$tmp/old-install.json"

@@ -9,7 +9,7 @@ ENGINE = ('dot', 'contract.py', 'engine.json', 'gitconfig.py', 'intent.py', 'ini
           'init-python-bootstrap.sh',
           'layout.py', 'migration.py', 'picker.py', 'preview.py', 'scope.py', 'skills.py',
            'state.py', 'ui.sh', 'tracking.py', 'file_metadata.py', 'packages.py', 'updates.py',
-           'install_state.py')
+           'install_state.py', 'state_paths.py')
 PUBLIC = ('README.md', 'bootstrap.sh', 'install.sh', 'scripts/create-private-repo.sh',
            'skills/setup-dots/SKILL.md', 'skills/dot/SKILL.md', 'docs/private-contract.md',
            'docs/install-record-contract.md')
