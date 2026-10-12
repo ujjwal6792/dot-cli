@@ -87,6 +87,12 @@ def read_install_record(state_dir):
     return value
 
 
+def is_split_install(state_dir):
+    """Safely detect artifact records that require the independent engine."""
+    value = _read(_record_path(state_dir, 'install.json'))
+    return bool(value and (value.get('version') == 2 or value.get('record_version') == 2))
+
+
 def read_connection(state_dir):
     """Read optional private source/tracker connection; never creates state."""
     value = _read(_record_path(state_dir, 'connection.json'))

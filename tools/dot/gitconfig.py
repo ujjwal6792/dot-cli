@@ -151,15 +151,33 @@ def merge(text, patch):
 
 
 SPLIT_WRAPPER = '''#!/bin/sh
-{{ $state := env "DOT_STATE_DIR" -}}
-{{ if not $state -}}{{ $xdg := env "XDG_STATE_HOME" -}}{{ if $xdg -}}{{ $state = joinPath $xdg "dot" -}}{{ else -}}{{ $state = joinPath .chezmoi.homeDir ".local/state/dot" -}}{{ end -}}{{ end -}}
+{{ $repo := .chezmoi.sourceDir -}}
+{{ if lstat (joinPath $repo ".." "tools/dot/state_paths.py") -}}{{ $repo = joinPath $repo ".." -}}{{ end -}}
+{{ $state_tool := joinPath $repo "tools/dot/state_paths.py" -}}
 {{ $engine := env "DOT_ENGINE" -}}
 {{ if hasKey . "dotEngine" -}}
 {{ $engine = .dotEngine -}}
 {{ if not $engine -}}{{ fail "explicit public dotEngine is required; run compatible dot init before applying" }}{{ end -}}
 {{ end -}}
-{{ if and (not $engine) (lstat (joinPath $state "install.json")) -}}
-{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath $state "install.json") | trim) "True" -}}
+{{ if and (not $engine) (eq (output "python3" "-B" $state_tool "split-install" | trim) "yes") -}}
+{{ fail "split installation requires explicit public dotEngine; run compatible dot init before applying" }}
+{{ end -}}
+{{ if $engine -}}
+python3 -B {{ joinPath $engine "contract.py" | shellQuote }} check --engine {{ $engine | shellQuote }} --source {{ joinPath .chezmoi.sourceDir ".." | shellQuote }} >/dev/null || exit 1
+exec python3 -B {{ joinPath $engine "gitconfig.py" | shellQuote }} modify {{ .chezmoi.sourceDir | shellQuote }} {{ .chezmoi.homeDir | shellQuote }} {{ .chezmoi.configFile | shellQuote }} {{ .chezmoi.os | shellQuote }} {{ .chezmoi.args | toJson | b64enc }}
+{{ else -}}
+exec python3 -B {{ joinPath .chezmoi.sourceDir ".." "tools/dot/gitconfig.py" | shellQuote }} modify {{ .chezmoi.sourceDir | shellQuote }} {{ .chezmoi.homeDir | shellQuote }} {{ .chezmoi.configFile | shellQuote }} {{ .chezmoi.os | shellQuote }} {{ .chezmoi.args | toJson | b64enc }}
+{{ end -}}
+'''
+
+LEGACY_SPLIT_WRAPPER = '''#!/bin/sh
+{{ $engine := env "DOT_ENGINE" -}}
+{{ if hasKey . "dotEngine" -}}
+{{ $engine = .dotEngine -}}
+{{ if not $engine -}}{{ fail "explicit public dotEngine is required; run compatible dot init before applying" }}{{ end -}}
+{{ end -}}
+{{ if and (not $engine) (lstat (joinPath .chezmoi.homeDir ".local/state/dot/install.json")) -}}
+{{ if eq (output "python3" "-B" "-c" "import json,sys; print(json.load(open(sys.argv[1])).get('version') == 2)" (joinPath .chezmoi.homeDir ".local/state/dot/install.json") | trim) "True" -}}
 {{ fail "split installation requires explicit public dotEngine; run compatible dot init before applying" }}
 {{ end -}}
 {{ end -}}
@@ -177,11 +195,7 @@ def supported_wrapper(text):
         return True
     if os.environ.get('DOT_STATE_DIR') is not None or os.environ.get('XDG_STATE_HOME') is not None:
         return False
-    state_template = '{{ $state := env "DOT_STATE_DIR" -}}\n{{ if not $state -}}{{ $xdg := env "XDG_STATE_HOME" -}}{{ if $xdg -}}{{ $state = joinPath $xdg "dot" -}}{{ else -}}{{ $state = joinPath .chezmoi.homeDir ".local/state/dot" -}}{{ end -}}{{ end -}}\n'
-    legacy = SPLIT_WRAPPER.replace(state_template, '')
-    legacy = legacy.replace('(joinPath $state "install.json")',
-                            '(joinPath .chezmoi.homeDir ".local/state/dot/install.json")')
-    return text == legacy
+    return text == LEGACY_SPLIT_WRAPPER
 
 
 def preferences(root, home, entry, config=None, os_name=None):

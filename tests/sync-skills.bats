@@ -4,6 +4,7 @@
 # and resulting filesystem state only.
 
 setup() {
+  FIXTURE_TMP="$(cd -P "$BATS_TEST_TMPDIR" && pwd)"
   FIXTURE_HOME="$BATS_TEST_TMPDIR/home"
   CANONICAL="$FIXTURE_HOME/.agents/skills"
   DEST="$FIXTURE_HOME/.gemini/skills"
@@ -84,4 +85,40 @@ run_router() {
   [ "$status" -ne 0 ]
   [[ "$output" == *"not found"* ]]
   [ ! -e "$DEST" ]
+}
+
+@test "rejects symlinked DOT_STATE_DIR without reading its approval or mirroring" {
+  outside="$FIXTURE_TMP/outside-state"
+  mkdir -p "$outside"
+  printf '{"version":1,"groups":{"skills":[".agents/skills","sync-skills.sh",".gemini/skills"]}}\n' >"$outside/adoption.json"
+  ln -s "$outside" "$FIXTURE_TMP/state-link"
+  export DOT_STATE_DIR="$FIXTURE_TMP/state-link"
+  run run_router
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'state directory must not traverse symlinks'* ]]
+  [ ! -e "$DEST" ]
+  grep -Fq '"skills"' "$outside/adoption.json"
+  [ ! -e "$FIXTURE_HOME/.agents/skills.bak" ]
+}
+
+@test "rejects malformed explicit DOT_STATE_DIR instead of falling back to default approval" {
+  for invalid in relative ""; do
+    export DOT_STATE_DIR="$invalid"
+    run run_router
+    [ "$status" -ne 0 ]
+    [ ! -e "$DEST" ]
+  done
+}
+
+@test "valid isolated DOT_STATE_DIR selects isolated approval, not legacy approval" {
+  isolated="$FIXTURE_TMP/isolated state"
+  mkdir -p "$isolated"
+  printf '{"version":1,"groups":{"skills":[".agents/skills","sync-skills.sh",".gemini/skills"]}}\n' >"$isolated/adoption.json"
+  printf '{"version":1,"groups":{}}\n' >"$FIXTURE_HOME/.local/state/dot/adoption.json"
+  export DOT_STATE_DIR="$isolated"
+  run run_router
+  [ "$status" -eq 0 ]
+  [[ "$output" == *'sync-skills: mirrored'* ]]
+  diff -r "$CANONICAL" "$DEST"
+  [ ! -e "$FIXTURE_HOME/.agents/skills.bak" ]
 }

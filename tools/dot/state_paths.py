@@ -1,6 +1,7 @@
 """Resolve the one runtime state directory without falling back on errors."""
 import os
 from pathlib import Path
+import sys
 
 
 def validate_directory(directory):
@@ -27,3 +28,26 @@ def state_dir(home=None):
     else:
         directory = home.resolve() / '.local/state/dot'
     return validate_directory(directory)
+
+
+def main():
+    command = sys.argv[1:] or ['resolve']
+    if command == ['resolve']:
+        print(state_dir())
+    elif command == ['approval-version']:
+        import scope
+        approval = scope.load(os.environ['HOME'])
+        print(approval['version'] if approval is not None else 0)
+    elif command == ['split-install']:
+        import install_state
+        print('yes' if install_state.is_split_install(state_dir()) else 'no')
+    else:
+        raise ValueError('unknown state-path operation')
+
+
+if __name__ == '__main__':
+    try:
+        main()
+    except (KeyError, OSError, ValueError) as error:
+        print('dot state: ' + str(error), file=sys.stderr)
+        raise SystemExit(1)
