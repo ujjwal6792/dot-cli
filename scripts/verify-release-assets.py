@@ -18,18 +18,22 @@ def verify(directory, uploaded):
 
     actual = {}
     for item in uploaded:
-        if not isinstance(item, dict) or set(item) != {'name', 'digest'}:
+        if not isinstance(item, dict) or set(item) != {'name', 'size', 'digest'}:
             raise ValueError('unexpected GitHub asset metadata')
-        name, digest = item['name'], item['digest']
-        if not isinstance(name, str) or name in actual or not isinstance(digest, str):
+        name, size, digest = item['name'], item['size'], item['digest']
+        if (not isinstance(name, str) or name in actual or not isinstance(size, int)
+                or isinstance(size, bool) or size < 0 or not isinstance(digest, str)):
             raise ValueError('invalid or duplicate GitHub asset')
         if not re.fullmatch(r'sha256:[0-9a-f]{64}', digest):
             raise ValueError('GitHub did not report a SHA-256 asset digest: ' + name)
-        actual[name] = digest.removeprefix('sha256:')
+        actual[name] = (size, digest.removeprefix('sha256:'))
     if set(actual) != set(expected):
         raise ValueError('uploaded asset names differ from the complete verified package set')
     for name, path in expected.items():
-        if hashlib.sha256(path.read_bytes()).hexdigest() != actual[name]:
+        size, digest = actual[name]
+        if path.stat().st_size != size:
+            raise ValueError('uploaded asset size mismatch: ' + name)
+        if hashlib.sha256(path.read_bytes()).hexdigest() != digest:
             raise ValueError('uploaded asset digest mismatch: ' + name)
 
 

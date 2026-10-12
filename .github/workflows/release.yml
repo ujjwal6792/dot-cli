@@ -8,6 +8,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: release-${{ inputs.approved_version }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -39,7 +43,7 @@ jobs:
         run: |
           git fetch --force origin main --tags
           CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list; gh api --paginate "repos/$GH_REPOSITORY/releases" --jq '.[].tag_name')"
+          EXISTING_VERSIONS="$(git tag --list)"
           python3 scripts/release-gate.py \
             --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
             --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
@@ -79,7 +83,7 @@ jobs:
         run: |
           git fetch --force origin main --tags
           CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list; gh api --paginate "repos/$GH_REPOSITORY/releases" --jq '.[].tag_name')"
+          EXISTING_VERSIONS="$(git tag --list)"
           python3 scripts/release-gate.py \
             --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
             --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
@@ -131,7 +135,7 @@ jobs:
         run: |
           git fetch --force origin main --tags
           CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list; gh api --paginate "repos/$GH_REPOSITORY/releases" --jq '.[].tag_name')"
+          EXISTING_VERSIONS="$(git tag --list)"
           python3 scripts/release-gate.py \
             --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
             --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
@@ -168,6 +172,7 @@ jobs:
     runs-on: ubuntu-24.04
     permissions:
       contents: write
+      actions: read
     steps:
       - uses: actions/checkout@v4
         with:
@@ -187,15 +192,11 @@ jobs:
         run: |
           git fetch --force origin main --tags
           CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list; gh api --paginate "repos/$GH_REPOSITORY/releases" --jq '.[].tag_name')"
+          EXISTING_VERSIONS="$(git tag --list)"
           python3 scripts/release-gate.py \
             --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
             --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
             --version "$APPROVED_VERSION" --existing-tags "$EXISTING_VERSIONS"
-          if gh release view "$APPROVED_VERSION" >/dev/null 2>&1; then
-            echo "release already exists: $APPROVED_VERSION" >&2
-            exit 1
-          fi
       - uses: actions/download-artifact@v4
         with:
           name: verified-release-assets
@@ -208,6 +209,7 @@ jobs:
           python3 scripts/restore-release-executables.py candidate "$VERSION"
       - name: Stage verified assets as a draft, then publish atomically
         env:
+          GH_REPOSITORY: ${{ github.repository }}
           APPROVED_VERSION: ${{ inputs.approved_version }}
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -223,13 +225,21 @@ jobs:
 
           `SHA256SUMS` and `BROWSER_SHA256SUMS` detect accidental corruption and bind the browser to each archive. Checksums are not a cryptographic attestation or independent proof of provenance. Review the workflow run and source commit before installation. The macOS GitHub-hosted installed-package smoke is not native Linux acceptance evidence.
           NOTES
-          gh release create "$APPROVED_VERSION" \
-            --target "$GITHUB_SHA" --title "$APPROVED_VERSION" \
-            --notes-file release-notes.md --prerelease --draft
-          gh release upload "$APPROVED_VERSION" candidate/*
-          gh api "repos/$GH_REPOSITORY/releases/tags/$APPROVED_VERSION" \
-            --jq '[.assets[] | {name, digest}]' > uploaded-assets.json
-          python3 scripts/verify-release-assets.py candidate uploaded-assets.json
-          RELEASE_ID="$(gh api "repos/$GH_REPOSITORY/releases/tags/$APPROVED_VERSION" --jq .id)"
-          gh api --method PATCH "repos/$GH_REPOSITORY/releases/$RELEASE_ID" \
-            -F draft=false -F prerelease=true
+          RELEASE_ID="$(python3 scripts/draft-release.py \
+            --repository "$GH_REPOSITORY" --tag "$APPROVED_VERSION" \
+            --target "$GITHUB_SHA" --directory candidate --inspect-only --allow-missing)"
+          if [[ -z "$RELEASE_ID" ]]; then
+            shopt -s nullglob
+            ASSETS=(candidate/*)
+            if ((${#ASSETS[@]} == 0)); then
+              echo 'no release assets found' >&2
+              exit 1
+            fi
+            gh release create "$APPROVED_VERSION" "${ASSETS[@]}" \
+              --target "$GITHUB_SHA" --title "$APPROVED_VERSION" \
+              --notes-file release-notes.md --prerelease --draft
+          fi
+          python3 scripts/check-release.py candidate
+          python3 scripts/draft-release.py \
+            --repository "$GH_REPOSITORY" --tag "$APPROVED_VERSION" \
+            --target "$GITHUB_SHA" --directory candidate
