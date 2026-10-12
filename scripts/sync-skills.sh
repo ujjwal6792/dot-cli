@@ -11,18 +11,17 @@
 # drifting.
 set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-state_dir="${DOT_STATE_DIR:-${XDG_STATE_HOME:-$HOME/.local/state}/dot}"
 if [ -n "${DOT_ENGINE:-}" ]; then
   [ -n "${DOT_SOURCE:-}" ] || { echo 'sync-skills: explicit DOT_SOURCE required with public engine' >&2; exit 1; }
   python3 -B "$DOT_ENGINE/contract.py" check --engine "$DOT_ENGINE" --source "$DOT_SOURCE" >/dev/null || exit 1
   exec python3 -B "$DOT_ENGINE/skills.py" "$DOT_SOURCE" "$HOME"
 fi
-if [ -e "$state_dir/adoption.json" ]; then
-  if python3 -c 'import json,sys; exit(0 if json.load(open(sys.argv[1])).get("version") == 2 else 1)' "$state_dir/adoption.json"; then
-    exec python3 -B "$SCRIPT_DIR/../tools/dot/skills.py" "$SCRIPT_DIR/.." "$HOME"
-  fi
+STATE_PATHS="$SCRIPT_DIR/../tools/dot/state_paths.py"
+scope_version="$(python3 -B "$STATE_PATHS" approval-version)"
+if [ "$scope_version" = 2 ] || [ "$scope_version" = 3 ]; then
+  exec python3 -B "$SCRIPT_DIR/../tools/dot/skills.py" "$SCRIPT_DIR/.." "$HOME"
 fi
-if [ -d "$SCRIPT_DIR/../home" ] || [ -e "$state_dir/adoption.json" ] || [ -L "$state_dir/adoption.json" ]; then
+if [ -d "$SCRIPT_DIR/../home" ] || [ "$scope_version" != 0 ]; then
   selected="$(python3 "$SCRIPT_DIR/../tools/dot/scope.py" skills "$SCRIPT_DIR/.." "$HOME")"
   [ "$selected" = yes ] || { echo 'sync-skills: outside adoption scope' >&2; exit 1; }
 fi

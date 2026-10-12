@@ -65,6 +65,7 @@ setup() {
   mkdir -p "$TMP/tree/dot-cli/tools/dot" "$TMP/tree/dot-cli/bin"
   cp "$REPO/tools/dot/dot" "$TMP/tree/dot-cli/tools/dot/dot"
   chmod +x "$TMP/tree/dot-cli/tools/dot/dot"
+  cp "$REPO"/tools/dot/*.py "$TMP/tree/dot-cli/tools/dot/"
   for file in contract.py init.py engine.json; do : >"$TMP/tree/dot-cli/tools/dot/$file"; done
   printf '#!/bin/sh\nexit 0\n' >"$TMP/tree/dot-cli/bin/dot-browser"
   chmod +x "$TMP/tree/dot-cli/bin/dot-browser"
@@ -86,6 +87,7 @@ setup() {
   mkdir -p "$TMP/tree/dot-cli/tools/dot" "$TMP/tree/dot-cli/bin"
   cp "$REPO/tools/dot/dot" "$TMP/tree/dot-cli/tools/dot/dot"
   chmod +x "$TMP/tree/dot-cli/tools/dot/dot"
+  cp "$REPO"/tools/dot/*.py "$TMP/tree/dot-cli/tools/dot/"
   for file in contract.py init.py engine.json; do : >"$TMP/tree/dot-cli/tools/dot/$file"; done
   printf '#!/bin/sh\nexit 0\n' >"$TMP/tree/dot-cli/bin/dot-browser"
   chmod +x "$TMP/tree/dot-cli/bin/dot-browser"
@@ -211,7 +213,7 @@ SH
   [ "$status" -eq 0 ]
   [[ "$output" == *"Install record: $isolated/install.json"* ]]
   [[ "$output" != *"Install record: $legacy/install.json"* ]]
-  run env HOME="$HOME" DOT_STATE_DIR="$isolated" PYTHONPATH="$REPO/tools/dot" "$fixture_python" - "$isolated" <<'PY'
+  run env HOME="$HOME" DOT_STATE_DIR="$isolated" PYTHONPATH="$TMP/install root/current/tools/dot" "$fixture_python" - "$isolated" <<'PY'
 import json, sys
 from pathlib import Path
 import file_metadata, init, install_state, migration, scope, state_paths, tracking
