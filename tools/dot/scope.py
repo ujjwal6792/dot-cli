@@ -8,6 +8,7 @@ import re
 import sys
 import subprocess
 import tempfile
+import state_paths
 sys.dont_write_bytecode = True
 
 
@@ -17,12 +18,12 @@ def source_root(root):
 
 
 def profile_path(home):
-    return Path(home) / '.local/state/dot/adoption.json'
+    return state_paths.state_dir(home) / 'adoption.json'
 
 
 def load(home):
     path = profile_path(home)
-    if path.resolve() != Path(home).resolve() / path.relative_to(home):
+    if path.resolve() != state_paths.state_dir(home).resolve() / 'adoption.json':
         raise ValueError('adoption profile must not traverse symlinks')
     if path.is_symlink():
         raise ValueError('adoption profile must not be a symlink')
@@ -60,7 +61,7 @@ def load(home):
 
 def save(home, data):
     path = profile_path(home)
-    if path.resolve() != Path(home).resolve() / path.relative_to(home):
+    if path.resolve() != state_paths.state_dir(home).resolve() / 'adoption.json':
         raise ValueError('local profile must not traverse symlinks')
     path.parent.mkdir(parents=True, exist_ok=True)
     fd, tmp = tempfile.mkstemp(dir=path.parent)
@@ -278,8 +279,8 @@ def ignore(root, home, config=None, os_name=None, umask_value=None, permissions=
             permitted = permitted or any(p.startswith(name + '/') for p in roots)
         if permitted:
             if data['version'] in (2, 3) and is_hook(rel):
-                from skills import HOOK, SPLIT_HOOK
-                if source.is_symlink() or source.read_text() not in (HOOK, SPLIT_HOOK):
+                from skills import supported_hook
+                if source.is_symlink() or not supported_hook(source.read_text()):
                     raise ValueError('unsupported native skills hook; only the bounded adapter is authorized')
             check_destructive_attributes(source)
             if permissions != 'preview' and source.is_dir() and not source.is_symlink():
@@ -394,8 +395,8 @@ def main():
         native_args = json.loads(args[0]) if args else []
         from gitconfig import native_operation
         if targets and native_operation(native_args)['mutating']:
-            recovery = Path(home) / '.local/state/dot/native-removal-recovery'
-            if recovery.resolve() != Path(home).resolve() / recovery.relative_to(home):
+            recovery = state_paths.state_dir(home) / 'native-removal-recovery'
+            if recovery.resolve() != state_paths.state_dir(home).resolve() / 'native-removal-recovery':
                 raise ValueError('native removal recovery must not traverse symlinks')
             recovery.mkdir(parents=True, exist_ok=True, mode=0o700)
             recovery.chmod(0o700)

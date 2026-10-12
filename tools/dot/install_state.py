@@ -5,9 +5,11 @@ from pathlib import Path
 import re
 import stat
 import tempfile
+import state_paths
 
 
-INSTALL_KEYS = {'record_version', 'owner', 'artifact', 'install_root', 'engine_path', 'browser_sha256'}
+INSTALL_KEYS_V1 = {'record_version', 'owner', 'artifact', 'install_root', 'engine_path', 'browser_sha256'}
+INSTALL_KEYS_V2 = INSTALL_KEYS_V1 | {'state_dir'}
 ARTIFACT_KEYS = {'repository', 'release_tag', 'platform', 'sha256'}
 CONNECTION_KEYS = {'connection_version', 'private_source', 'config_path'}
 OWNERS = {'artifact': {'curl'}, 'package-manager': {'brew', 'pacman'}}
@@ -16,12 +18,8 @@ SHA256 = re.compile(r'[a-f0-9]{64}\Z')
 
 
 def _record_path(state_dir, name):
-    directory = Path(state_dir)
-    if not directory.is_absolute():
-        raise ValueError('state directory must be absolute')
-    for component in (directory, *directory.parents):
-        if component.is_symlink():
-            raise ValueError('state path must not traverse symlinks')
+    directory = state_paths.state_dir() if state_dir is None else Path(state_dir)
+    directory = state_paths.validate_directory(directory)
     if directory.exists() and (not directory.is_dir() or stat.S_IMODE(directory.stat().st_mode) != 0o700):
         raise ValueError('state directory must be a mode-0700 directory')
     path = directory / name
@@ -55,11 +53,19 @@ def _absolute(value, field):
 
 def read_install_record(state_dir):
     """Read and validate installer-owned artifact identity; never creates files."""
-    value = _read(_record_path(state_dir, 'install.json'))
+    directory = state_paths.state_dir() if state_dir is None else state_paths.validate_directory(state_dir)
+    value = _read(_record_path(directory, 'install.json'))
     if value is None:
         return None
-    if set(value) != INSTALL_KEYS or type(value['record_version']) is not int or value['record_version'] != 1:
+    if (type(value.get('record_version')) is not int or
+            (value['record_version'] == 1 and set(value) != INSTALL_KEYS_V1) or
+            (value['record_version'] == 2 and set(value) != INSTALL_KEYS_V2) or
+            value['record_version'] not in (1, 2)):
         raise ValueError('unsupported or malformed install record schema')
+    if value['record_version'] == 2:
+        _absolute(value['state_dir'], 'state_dir')
+        if Path(value['state_dir']) != directory:
+            raise ValueError('install record state_dir does not match its containing directory')
     owner, artifact = value['owner'], value['artifact']
     if (not isinstance(owner, dict) or set(owner) != {'kind', 'manager'} or
             not isinstance(owner['kind'], str) or owner['kind'] not in OWNERS):
@@ -81,6 +87,12 @@ def read_install_record(state_dir):
     return value
 
 
+def is_split_install(state_dir):
+    """Safely detect artifact records that require the independent engine."""
+    value = _read(_record_path(state_dir, 'install.json'))
+    return bool(value and (value.get('version') == 2 or value.get('record_version') == 2))
+
+
 def read_connection(state_dir):
     """Read optional private source/tracker connection; never creates state."""
     value = _read(_record_path(state_dir, 'connection.json'))
@@ -99,13 +111,7 @@ def write_connection(state_dir, private_source, config_path):
     _absolute(private_source, 'private_source')
     _absolute(config_path, 'config_path')
     directory = Path(state_dir)
-    if not directory.is_absolute():
-        raise ValueError('state directory must be absolute')
-    if directory.is_symlink():
-        raise ValueError('state directory must not be a symlink')
-    for component in directory.parents:
-        if component.is_symlink():
-            raise ValueError('state path must not traverse symlinks')
+    directory = state_paths.validate_directory(directory)
     directory.mkdir(mode=0o700, parents=True, exist_ok=True)
     if not directory.is_dir():
         raise ValueError('state path must be a directory')

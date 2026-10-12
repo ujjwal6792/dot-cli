@@ -14,6 +14,7 @@ import urllib.parse
 import urllib.request
 
 from contract import check
+import state_paths
 
 
 def git(root, *args):
@@ -65,7 +66,7 @@ def managed_browser(root, source):
     path = root / 'bin/dot-browser'
     if not path.exists() and not path.is_symlink():
         return None
-    record_path = Path(os.environ['HOME']).resolve() / '.local/state/dot/install.json'
+    record_path = state_paths.state_dir() / 'install.json'
     if record_path.resolve() != record_path or path.resolve() != path:
         raise ValueError('managed browser/installation record must not traverse symlinks')
     record = json.loads(record_path.read_text())
@@ -226,7 +227,7 @@ def update(command, yes, browser_url=None, browser_sha256=None):
             raise ValueError('target/approval changed before fast-forward; retry')
         git(root, 'merge', '--ff-only', candidate)
         if command == 'self-update' and artifact.exists():
-            record_path = Path(os.environ['HOME']).resolve() / '.local/state/dot/install.json'
+            record_path = state_paths.state_dir() / 'install.json'
             record = json.loads(browser[0])
             record['browser']['sha256'] = hashlib.sha256(artifact.read_bytes()).hexdigest()
             try:

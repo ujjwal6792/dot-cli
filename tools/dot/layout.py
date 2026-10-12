@@ -11,6 +11,7 @@ import tomllib
 sys.dont_write_bytecode = True
 import intent
 import scope
+import state_paths
 
 
 def private_path(home, path):
@@ -20,12 +21,20 @@ def private_path(home, path):
     return path
 
 
+def state_path(home, path):
+    path = Path(os.path.abspath(path))
+    state = state_paths.state_dir(home)
+    if not path.is_relative_to(state) or path.resolve() != state.resolve() / path.relative_to(state):
+        raise ValueError('migration state must remain in the selected state directory without symlink traversal')
+    return path
+
+
 def proposed(root, home, config):
     config = private_path(home, config)
     selection = scope.load(str(home))
     if selection is None:
         raise ValueError('source migration requires an explicit existing adoption boundary')
-    journal = private_path(home, home / '.local/state/dot/layout-migration.json')
+    journal = state_path(home, state_paths.state_dir(home) / 'layout-migration.json')
     if journal.exists() and json.loads(journal.read_text()).get('stage') != 'complete':
         raise ValueError('incomplete source migration; inspect journal/backups; no unsafe retry')
     new_source = root / 'home'
@@ -67,7 +76,7 @@ def approved(root, home, config, value, token):
         return
     if token != value.get('id') or proposed(root, home, config) != value:
         raise ValueError('stale/unapproved source migration; review a fresh plan')
-    directory = private_path(home, home / '.local/state/dot/layout-recovery' / token)
+    directory = state_path(home, state_paths.state_dir(home) / 'layout-recovery' / token)
     directory.mkdir(parents=True, mode=0o700, exist_ok=False)
     directory.chmod(0o700)
     for name, path in (('config', config), ('selection', scope.profile_path(str(home)))):
@@ -76,7 +85,7 @@ def approved(root, home, config, value, token):
         backup.chmod(0o600)
         if backup.read_bytes() != path.read_bytes():
             raise ValueError('metadata changed during backup; no migration applied')
-    journal = private_path(home, home / '.local/state/dot/layout-migration.json')
+    journal = state_path(home, state_paths.state_dir(home) / 'layout-migration.json')
     progress = {'version': 1, 'stage': 'backed-up', 'backup': str(directory), 'plan': value}
     intent.write(journal, json.dumps(progress, indent=2) + '\n')
     try:

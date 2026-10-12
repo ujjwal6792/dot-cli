@@ -65,6 +65,7 @@ setup() {
   mkdir -p "$TMP/tree/dot-cli/tools/dot" "$TMP/tree/dot-cli/bin"
   cp "$REPO/tools/dot/dot" "$TMP/tree/dot-cli/tools/dot/dot"
   chmod +x "$TMP/tree/dot-cli/tools/dot/dot"
+  cp "$REPO"/tools/dot/*.py "$TMP/tree/dot-cli/tools/dot/"
   for file in contract.py init.py engine.json; do : >"$TMP/tree/dot-cli/tools/dot/$file"; done
   printf '#!/bin/sh\nexit 0\n' >"$TMP/tree/dot-cli/bin/dot-browser"
   chmod +x "$TMP/tree/dot-cli/bin/dot-browser"
@@ -86,6 +87,7 @@ setup() {
   mkdir -p "$TMP/tree/dot-cli/tools/dot" "$TMP/tree/dot-cli/bin"
   cp "$REPO/tools/dot/dot" "$TMP/tree/dot-cli/tools/dot/dot"
   chmod +x "$TMP/tree/dot-cli/tools/dot/dot"
+  cp "$REPO"/tools/dot/*.py "$TMP/tree/dot-cli/tools/dot/"
   for file in contract.py init.py engine.json; do : >"$TMP/tree/dot-cli/tools/dot/$file"; done
   printf '#!/bin/sh\nexit 0\n' >"$TMP/tree/dot-cli/bin/dot-browser"
   chmod +x "$TMP/tree/dot-cli/bin/dot-browser"
@@ -161,6 +163,73 @@ SH
     --version 1.2.4 --platform linux-amd64 --url "file://$RELEASE_DIR/next.tar.gz" --sha256 "$next_digest" --yes
   [ "$status" -eq 0 ]
   [ "$(readlink "$TMP/install root/current")" = 'versions/1.2.4-linux-amd64' ]
+}
+
+@test "installed launcher pins runtime state to the approved exact directory" {
+  mkdir -p "$TMP/tree/dot-cli/tools" "$TMP/tree/dot-cli/bin" "$TMP/tree/dot-cli"
+  cp -R "$REPO/tools/dot" "$TMP/tree/dot-cli/tools/dot"
+  printf '#!/bin/sh\nexit 0\n' >"$TMP/tree/dot-cli/bin/dot-browser"
+  chmod +x "$TMP/tree/dot-cli/bin/dot-browser"
+  cp "$REPO/install.sh" "$TMP/tree/dot-cli/install.sh"
+  chmod +x "$TMP/tree/dot-cli/install.sh"
+  printf '{"format": 2, "version": "1.2.3", "platform": "linux-amd64", "engine_api": 1}\n' >"$TMP/tree/dot-cli/release.json"
+  tar -czf "$RELEASE_DIR/state.tar.gz" -C "$TMP/tree" dot-cli
+  digest=$(shasum -a 256 "$RELEASE_DIR/state.tar.gz" | awk '{print $1}')
+  legacy="$HOME/.local/state/dot"
+  isolated="$HOME/.local/state/dot cli's"
+  mkdir -p "$legacy"
+  printf 'legacy install bytes\n' >"$legacy/install.json"
+  printf 'legacy approval bytes\n' >"$legacy/adoption.json"
+  printf 'legacy recovery bytes\n' >"$legacy/recovery"
+  cp -R "$legacy" "$TMP/legacy-before"
+  run bash "$REPO/install.sh" --version 1.2.3 --platform linux-amd64 \
+    --url "file://$RELEASE_DIR/state.tar.gz" --sha256 "$digest" \
+    --root "$TMP/install root" --state-dir "$isolated"
+  [ "$status" -eq 0 ]
+  [ -f "$isolated/install.json" ]
+  grep -Fq '"record_version":2' "$isolated/install.json"
+  grep -Fq '"state_dir":"'"$isolated"'"' "$isolated/install.json"
+  grep -Fq 'DOT_STATE_DIR=' "$HOME/.local/bin/dot"
+  mkdir -m 700 "$TMP/relocated-state"
+  cp "$isolated/install.json" "$TMP/relocated-state/install.json"
+  chmod 600 "$TMP/relocated-state/install.json"
+  run bash "$REPO/install.sh" --version 1.2.3 --platform linux-amd64 \
+    --url "file://$RELEASE_DIR/state.tar.gz" --sha256 "$digest" \
+    --root "$TMP/install root" --state-dir "$TMP/relocated-state"
+  [ "$status" -ne 0 ]
+  [[ "$output" == *'recorded state directory mismatch'* ]]
+  printf '{"version":1,"groups":{}}\n' >"$isolated/adoption.json"
+  fixture_python=
+  for candidate in /private/tmp/py312bin/python3 python3.16 python3.15 python3.14 python3.13 python3.12 python3.11 python3; do
+    if [ -x "$candidate" ]; then python_path="$candidate"; else python_path="$(command -v "$candidate" 2>/dev/null || true)"; fi
+    if [ -n "$python_path" ] && "$python_path" -c 'import sys,tomllib; sys.exit(sys.version_info < (3,11))' >/dev/null 2>&1; then
+      fixture_python="$python_path"
+      break
+    fi
+  done
+  [ -n "$fixture_python" ]
+  fixture_path="${fixture_python%/*}:$PATH"
+  run env HOME="$HOME" XDG_STATE_HOME="$HOME/xdg" DOT_STATE_DIR="$legacy" PATH="$fixture_path" "$HOME/.local/bin/dot" init --check
+  [ "$status" -eq 0 ]
+  [[ "$output" == *"Install record: $isolated/install.json"* ]]
+  [[ "$output" != *"Install record: $legacy/install.json"* ]]
+  run env HOME="$HOME" DOT_STATE_DIR="$isolated" PYTHONPATH="$TMP/install root/current/tools/dot" "$fixture_python" - "$isolated" <<'PY'
+import json, sys
+from pathlib import Path
+import file_metadata, init, install_state, migration, scope, state_paths, tracking
+home = Path.home()
+selected = Path(sys.argv[1])
+assert state_paths.state_dir() == selected
+assert init.local_state_dir() == selected
+assert scope.profile_path(home) == selected / 'adoption.json'
+assert migration.paths(home)['state'] == selected
+assert scope.load(str(home)) == {'version': 1, 'groups': {}}
+assert install_state.read_install_record(selected)['owner'] == {'kind': 'artifact', 'manager': 'curl'}
+tracking.pending(home)
+assert not (home / '.local/state/dot/adoption.json').read_bytes().startswith(b'{"version":1')
+PY
+  [ "$status" -eq 0 ]
+  diff -r "$TMP/legacy-before" "$legacy"
 }
 
 @test "installer refuses package-manager ownership without touching its prefix" {
