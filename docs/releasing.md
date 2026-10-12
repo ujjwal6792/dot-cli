@@ -36,21 +36,42 @@ command above does not select a version by itself.
 
 The dispatch commit must still equal remote `main` at the beginning of every
 stage and immediately before publication. The gate rejects a branch, fork,
-non-dispatch event, stale main commit, malformed version, existing tag/release,
-or non-monotonic RC number. A workflow failure at any stage prevents release
-creation; assets are published together only after all checks pass. Do not
-manually create the version tag or release to bypass the gate.
+non-dispatch event, stale main commit, malformed version, existing tag, or
+non-monotonic RC number. A workflow failure at any stage prevents publication.
+Do not manually create the version tag or release to bypass the gate.
 
-The publish job stages assets on an unpublished draft, compares GitHub's
-reported SHA-256 digest and exact asset-name set with the complete local
-package, and only then makes the prerelease public. If that final job fails,
-inspect the workflow and any unpublished draft/tag before taking action; the
-same version is intentionally blocked from automated reuse to prevent
-clobbering an existing tag or release.
+The publish job serializes this workflow by approved version and stages assets
+on an unpublished draft. A same-version retry can reuse a draft only if its
+identity and complete asset names, sizes, and SHA-256 digests match the fresh,
+reproducibly built candidate. If the draft targets an older commit, its source
+must additionally be proven by a prior successful
+verify/build/installed-smoke run, be an ancestor of current main, and have no
+existing version tag. A stale draft is retargeted by release ID while
+remaining a draft, fetched again, and fully rechecked before publication. After
+publishing, the workflow verifies the release by ID and checks that the Git
+tag resolves to the approved main commit. Any mismatch fails closed without
+deleting or recreating a draft or tag.
 
-Before directing users to an asset, review the completed workflow and GitHub
-Release page: source commit, all three archives, `SHA256SUMS`,
-`BROWSER_SHA256SUMS`, and the prerelease notes. The assets are for macOS Apple
+Concurrency caveat: the workflow concurrency group prevents two runs of this
+workflow for the same version from publishing simultaneously. It does not lock
+the release against repository owners or collaborators editing it through the
+GitHub UI or another API client. GitHub's documented Update Release API does
+not specify a conditional-write/compare-and-swap mechanism, so an external
+authorized edit can still race between the final read/asset verification and
+the publish PATCH. The post-publish readback detects a mismatch but cannot
+undo publication. Before dispatch, the maintainer responsible for the release
+must ensure no authorized person or other automation will edit that draft
+during publication and explicitly decide whether this residual risk is
+acceptable. If it is not accepted, do not dispatch; preserve the draft and
+choose a separately reviewed recovery plan.
+
+If post-publish verification fails, do not direct users to the release; inspect
+the workflow and published state and escalate rather than automatically
+deleting or replacing assets/tags. Before installer handoff, require a
+successful final workflow readback for the exact source commit and tag, review
+all three archives, all eight expected asset names/sizes/digests, release
+notes, and the included `SHA256SUMS` and `BROWSER_SHA256SUMS`. Verify checksums
+on downloaded files before installation. The assets are for macOS Apple
 Silicon, Linux x86_64, and Linux ARM64. There is no native Linux install test
 or package-manager installation behavior in this workflow. Checksums detect
 corruption and cross-check the browser in each archive; they are **not** a
