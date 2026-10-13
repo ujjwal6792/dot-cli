@@ -42,6 +42,17 @@ func TestMachineSuggestionFailureStillAllowsEditing(t *testing.T) {
 	}
 }
 
+func TestMachineFormValidatesBeforeSubmitting(t *testing.T) {
+	e := &machineFailureFixture{sourceFixture: sourceFixture{exists: true}}
+	m := sendAndRun(NewInitModel(e), "enter")
+	m = sendAndRun(m, "enter")
+	m, _ = m.Update(tea.PasteMsg{Content: "not-valid!"})
+	m = sendAndRun(m, "enter")
+	if e.saved != "" || !strings.Contains(m.View().Content, "lowercase") {
+		t.Fatal("invalid machine form submitted: " + m.View().Content)
+	}
+}
+
 func TestSourcePendingOperationCannotBeSubmittedTwice(t *testing.T) {
 	e := &sourceFixture{}
 	m, cmd := NewInitModel(e).Update(key("enter"))

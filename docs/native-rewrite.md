@@ -1,8 +1,10 @@
 # Native rewrite acceptance
 
 The owner approved deleting the interpreter-based implementation before its
-replacement works. The application is intentionally incomplete. Implement the
-remaining tickets in Go; do not restore the old runtime or its packaging.
+replacement worked. The shared engine, setup, distribution and integrated
+acceptance are now native Go. [Final local evidence](native-acceptance.md)
+records actual artifact execution and platform limits; do not restore the old
+runtime or infer release readiness from retained UI tests alone.
 
 ## Architecture and sequence
 

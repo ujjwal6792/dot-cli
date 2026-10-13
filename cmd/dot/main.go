@@ -47,7 +47,7 @@ func run(ctx context.Context, args []string, in io.Reader, out, errOut io.Writer
 		return 0
 	}
 	fmt.Fprintln(errOut, "dot:", err)
-	if ctx.Err() != nil || errors.Is(err, context.Canceled) {
+	if ctx.Err() != nil || errors.Is(err, context.Canceled) || errors.Is(err, tea.ErrInterrupted) {
 		return 130
 	}
 	var usage usageError
@@ -418,6 +418,7 @@ Commands:
   intent plan            Strict request JSON → exact plan JSON
   intent preview         Review fresh plan JSON without writes
   intent apply           Apply exact plan with explicit separate consents
+  intent rounds, intent pick  Aliases of the same app (no second picker)
   pull, push             Explicit private Git operation (--yes)
   recovery               Inspect pending configuration recovery
   recover                Roll back exact configuration plan (--approve ID)
@@ -431,11 +432,15 @@ Commands:
 Common: --home PATH --source PATH --config PATH --state-dir PATH
         --git PATH --chezmoi PATH --name NAME --email EMAIL
 Paths must be clean absolute paths. Defaults are inside HOME; no checkout fallback.
+Packaged --chezmoi overrides are refused: keep the verified release bundle intact.
+Retired: add/remove, run, update NAME VERSION, layout/migrate, group scope runners,
+personal/work --profile, --rounds and interpreter/browser/engine overrides.
+Use reviewed Track/Adopt/untrack/update requests, not direct mutations or scripts.
 Exit codes: 0 success, 1 operation/dependency failure, 2 invalid usage, 130 cancelled.`)
 	joined := strings.Join(args, " ")
 	switch {
 	case strings.Contains(joined, "intent"):
-		fmt.Fprintln(out, "intent plan --request FILE|- [--format json]\nintent preview --plan FILE|- [--format json]\nintent apply --plan FILE|- --approve EXACT_ID [--ack-unsafe] [--ack-desktop] [--ack-backup]\nRequest modes: track, adopt, untrack, update, metadata. Named profiles are JSON profile unions, not personal/work. Preview does not authorize apply.")
+		fmt.Fprintln(out, "intent inventory --mode track|adopt|untrack --format json\nintent plan --request FILE|- [--format json]\nintent preview --plan FILE|- [--format json]\nintent apply --plan FILE|- --approve EXACT_ID [--ack-unsafe] [--ack-desktop] [--ack-backup]\nRequest modes: track, adopt, untrack, update, metadata. Named profiles are JSON profile unions, not personal/work. Preview does not authorize apply; each required gate is independent.\nOptions follow the verb/subcommand; stdin JSON uses -. Update preserves exact prior enrollment.")
 	case strings.Contains(joined, "init"):
 		fmt.Fprintln(out, "init --check [common paths]: old-user/new-user contract verdict, no writes.\nScripted setup: init --action new|clone --url URL; init --machine ID; init --tracker-plan; init --tracker-apply FILE --approve ID --yes. Each is a separate explicit operation; no implicit adoption. init --complete verifies readiness.")
 	case strings.Contains(joined, "install") || strings.Contains(joined, "self-update"):

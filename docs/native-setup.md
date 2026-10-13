@@ -1,4 +1,4 @@
-# Native setup handoff (#17 → #18)
+# Native setup
 
 `internal/setup` owns first-run effects and embeds `*tui.NativeEngine`. It reuses
 `internal/native` contracts, manifests, machine identities, adoption v3, strict
@@ -20,6 +20,12 @@ model also has `tui.NewInitModelContext(ctx, engine)` for deliberately entering
 setup; `tui.NewInitModel(engine)` remains available. Context cancellation/quit
 cancels pending setup subprocesses. Earlier explicitly completed steps are
 retained, never deleted to conceal interruption.
+
+Machine editing is a genuine embedded Huh v2.0.3 form: its Init/Update/View are
+part of this same app, never a standalone Run/prompt. Returning inspection,
+intent, packages and remote commands share the application context. Ctrl+C
+returns cancellation (130); normal q/Finish and cancel-default reviews remain
+non-mutating normal exits.
 
 The journey is Welcome → Source → Machine → Dependencies → Tracker → Done.
 If Git is missing, a prerequisite Dependencies review is offered before source
@@ -172,7 +178,7 @@ Current official documentation was consulted for Bubble Tea v2 `Exec`, go-toml
 v2, Homebrew and pacman; Context7 discovery exposed no Context7 tool. Linux
 runtime execution is explicitly owner-waived; no Docker daemon was started.
 Cross-builds do not establish Linux runtime acceptance. Real network hosting/auth
-and real privileged manager installation were not exercised. #18 still owns
-`cmd/dot` routing, complete help, dependency resolution/pinning and packaged
-Darwin acceptance; #19 owns whole-spec/release acceptance. No release-tag
-automation was changed or augmented with branch/PR CI.
+and real privileged manager installation were not exercised. The integrated
+`cmd/dot` router, dependency pinning and real packaged keyboard/manager/source
+interruption gates are recorded in [native acceptance](native-acceptance.md).
+No release-tag automation was augmented with branch/PR CI.

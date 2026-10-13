@@ -22,7 +22,7 @@ func NewApp(ctx context.Context, o Options) (tea.Model, *Engine, error) {
 		return nil, nil, err
 	}
 	if e.Complete(ctx) == nil {
-		return tui.NewReturningModel(e), e, nil
+		return tui.NewReturningModelContext(ctx, e), e, nil
 	}
 	return tui.NewInitModelContext(ctx, e), e, nil
 }

@@ -21,7 +21,12 @@ type returningMsg struct {
 var returningActions = []string{"Finish without changes", "Browse / Track: HOME → repository", "Browse / Adopt: repository → target", "Status (machine-scoped)", "Diff / importable changes", "Approved scope", "Pull repository (explicit)", "Push existing commits (explicit)"}
 
 func NewReturningModel(e Engine) tea.Model {
+	return NewReturningModelContext(context.Background(), e)
+}
+
+func NewReturningModelContext(ctx context.Context, e Engine) tea.Model {
 	m := NewModel(e, false, "track").(model)
+	m.setupContext, m.setupCancel = context.WithCancel(ctx)
 	m.returning = true
 	m.stage = "returning-home"
 	return m
@@ -49,6 +54,12 @@ func (m *model) resetReturning() {
 }
 func (m model) updateReturning(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.String() == "ctrl+c" || key.String() == "q" {
+		if m.setupCancel != nil {
+			m.setupCancel()
+		}
+		if key.String() == "ctrl+c" {
+			return m, tea.Interrupt
+		}
 		return m, tea.Quit
 	}
 	if m.loading {
@@ -96,11 +107,14 @@ func (m model) updateReturning(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			operation := m.returningOperation
 			return m, func() tea.Msg {
-				return returningMsg{err: e.Remote(context.Background(), operation, true), remote: true}
+				return returningMsg{err: e.Remote(m.setupCtx(), operation, true), remote: true}
 			}
 		}
 		switch m.returningChoice {
 		case 0:
+			if m.setupCancel != nil {
+				m.setupCancel()
+			}
 			return m, tea.Quit
 		case 1, 2:
 			m.mode = "track"
@@ -123,7 +137,7 @@ func (m model) updateReturning(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.returningOperation = operation
 			m.loading = true
 			return m, func() tea.Msg {
-				text, err := e.Inspect(context.Background(), operation)
+				text, err := e.Inspect(m.setupCtx(), operation)
 				return returningMsg{text: text, err: err}
 			}
 		case 6, 7:
@@ -187,6 +201,6 @@ func (m model) renderReturning() string {
 	return b.String()
 }
 func RunReturning(ctx context.Context, e Engine) error {
-	_, err := tea.NewProgram(NewReturningModel(e)).Run()
+	_, err := tea.NewProgram(NewReturningModelContext(ctx, e), tea.WithContext(ctx)).Run()
 	return err
 }

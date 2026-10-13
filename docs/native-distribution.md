@@ -1,5 +1,9 @@
 # Native CLI and distribution handoff (#18 → #19)
 
+The final integrated #19 gate and fresh artifact hashes are recorded in
+[native acceptance](native-acceptance.md). The #18 evidence below remains
+provenance, not the final archive/run after #19's fixes.
+
 ## Delivered boundaries
 
 `cmd/dot` is the only application executable. Bare `dot`, `dot init`, `browse`,
@@ -192,8 +196,13 @@ normal quit. Real scripted setup, tracker, Track, machine-2 clone/local Git remo
 explicit pull/push, JSON, exact adoption, target bytes/executable mode, stale plans,
 checksum-before-install, public/private update separation, recovery and uninstall
 are exercised. Fixtures and transcripts/files are retained, never confused with
-mocked engine success. The existing #17 child-manager fixtures exercise terminal
-streams and recheck failure without privileged host installation.
+mocked engine success. #19 extends this to full keyboard setup/Continue/Replace,
+logical Track, machine-2 Adopt, independently omitted gates, local profile/custom
+policy, malformed data, concurrent approvals, and actual manager/source interrupts.
+Acceptance compiles a non-installing native manager/SSH child fixture with Go on
+the maintainer side; only that fixture enters PATH in the explicitly isolated
+manager cases. Ordinary app journeys still have Git-only PATH. A manager's zero
+exit must fail readiness, not masquerade as successful tool installation.
 
 Linux **runtime execution is explicitly owner-waived**. Do not start Docker.
 Both Linux artifacts are cross-built and inspected; these are not Linux runtime
