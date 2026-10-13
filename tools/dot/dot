@@ -28,8 +28,10 @@ case "${1:-}" in
   --help|-h|help)
     cat <<'EOF'
 dot — independent configuration CLI
-usage: dot init [--check] [--source ABS] [--config ABS] [--rounds] [--url URL] [--name NAME] [--email EMAIL]
-       dot --version | dot --help
+usage: dot (opens the interactive TUI app: Welcome to Done menu)
+       dot init [--check] [--source ABS] [--config ABS] [--rounds] [--url URL] [--name NAME] [--email EMAIL]
+       dot --version | dot -v | dot --help | dot -h
+       dot -u | dot --uninstall | dot --health
        dot status | diff [--direction repo-to-machine|machine-to-repo] | push --message TEXT
        dot pull [--yes] | self-update [--yes] | browse
        dot add --class shared|templated|os-only [--os darwin|linux] PATH | remove PATH
@@ -39,13 +41,14 @@ usage: dot init [--check] [--source ABS] [--config ABS] [--rounds] [--url URL] [
        dot layout plan --out PLAN|apply PLAN --approve ID
        dot contract check | migrate
 
-Help and version are independent of Python and private configuration. `dot init
---check` performs read-only prerequisite, connection, and tracker detection.
-With no arguments, use `dot browse` for the interactive browser or one of the
-verbs above; only plumbing stays outside the app.
+Help, version, uninstall, and health are independent of Python and private
+configuration. `dot init --check` performs read-only prerequisite,
+connection, and tracker detection and reports an old-user/new-user verdict.
+With no arguments, `dot` opens the interactive TUI app (Welcome to Done
+menu); only plumbing stays outside the app.
 EOF
     exit 0 ;;
-  --version|version)
+  --version|version|-v)
     VERSION_FILE="$(dirname "$(dirname "$TOOL_DIR")")/release.json"
     if [ -r "$VERSION_FILE" ]; then
       sed -n 's/.*"version"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/dot \1/p' "$VERSION_FILE"
@@ -53,6 +56,37 @@ EOF
       echo 'dot development build'
     fi
     exit 0 ;;
+  -u|--uninstall)
+    cat <<'EOF'
+dot uninstall (read-only guidance; nothing was removed):
+  1. Remove the launcher: ~/.local/bin/dot
+  2. Remove the public engine: ~/.local/share/dot-cli
+  3. Optionally remove private state after review: ~/.local/state/dot
+Private checkouts and live files are never touched by this command.
+EOF
+    exit 0 ;;
+  --health)
+    echo "Public engine: $TOOL_DIR"
+    for requirement in bash git curl python3 chezmoi; do
+      if command -v "$requirement" >/dev/null 2>&1; then
+        printf 'Requirement %s: available\n' "$requirement"
+      else
+        printf 'Requirement %s: missing (review/install through dot init only)\n' "$requirement"
+      fi
+    done
+    BROWSER="${DOT_BROWSER:-$TOOL_DIR/../../bin/dot-browser}"
+    if [ -x "$BROWSER" ]; then
+      echo 'Browser: available'
+    else
+      echo 'Browser: missing (install a compatible dot-browser artifact)'
+    fi
+    exit 0 ;;
+  '')
+    : "${HOME:?dot: HOME must be set}"
+    BROWSER="${DOT_BROWSER:-$TOOL_DIR/../../bin/dot-browser}"
+    [ -x "$BROWSER" ] || { echo 'dot: browser unavailable; install a compatible dot-browser artifact' >&2; exit 1; }
+    # shellcheck disable=SC2269 # DOT_SOURCE default is intentional for new users.
+    exec "$BROWSER" --engine "$TOOL_DIR" --home "$HOME" --source "${DOT_SOURCE:-$HOME/.local/share/dot-config}" --init ;;
 esac
 if [ "${DOT_STATE_DIR+x}" = x ]; then
   case "$DOT_STATE_DIR" in /*) ;; *) echo 'dot: DOT_STATE_DIR must be absolute' >&2; exit 2 ;; esac
@@ -413,11 +447,6 @@ dot_doctor() {
 }
 case "${1:-}" in
   self-update) shift; dot_self_update "$@" ;;
-  '')
-    [ $# -eq 0 ] || { usage; exit 2; }
-    # shellcheck source=tools/dot/ui.sh
-    source "$TOOL_DIR/ui.sh"
-    dot_menu ;;
   status|diff|push|pull|add|remove|run|update|doctor|scope|intent|layout) verb="$1"; shift; "dot_$verb" "$@" ;;
   *) usage ;;
 esac
