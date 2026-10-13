@@ -44,6 +44,49 @@ start_browser() {
   printf -v command 'bash %q browse; code=$?; echo UI_EXIT=$code; echo UI_DONE; sleep 30' "$DOT_ENGINE/dot"
   tmux -L "$SOCKET" new-session -d -s ui -x 140 -y 45 "$command"
 }
+@test "real Tab retargets across available machines and Track needs exact approval" {
+  python3 - "$DOT_SOURCE" "$HOME" <<'PY'
+import json, pathlib, sys
+source, home = map(pathlib.Path, sys.argv[1:])
+system = 'darwin' if sys.platform == 'darwin' else 'linux'
+path = source / 'tools/dot/manifest.json'
+data = json.loads(path.read_text())
+data.update(version=2, tracking={}, machines={key: dict(label=key, os=system) for key in ['local_machine', 'other_machine']})
+data['entries']['prefs']['machines'] = dict(include=['all'], exclude=[])
+path.write_text(json.dumps(data))
+path = source / 'dot-contract.json'
+descriptor = json.loads(path.read_text()); descriptor.update(manifest_version=2, approval_version=3)
+path.write_text(json.dumps(descriptor))
+(home / '.local/state/dot/adoption.json').write_text(json.dumps(dict(version=3, profile='default', entries=data['entries'], machine=dict(id='local_machine', os=system))))
+PY
+  git -C "$DOT_SOURCE" add .
+  git -C "$DOT_SOURCE" commit -qm 'assignment fixture'
+  cp "$DOT_SOURCE/tools/dot/manifest.json" "$BATS_TEST_TMPDIR/manifest-before"
+  cp "$HOME/.local/state/dot/adoption.json" "$BATS_TEST_TMPDIR/state-before"
+  start_browser
+  wait_for 'prefs.conf'
+  tmux -L "$SOCKET" send-keys -t ui Tab
+  wait_for 'Machines: local_machine'
+  tmux -L "$SOCKET" send-keys -t ui Tab
+  wait_for 'Machines: other_machine'
+  cmp "$DOT_SOURCE/tools/dot/manifest.json" "$BATS_TEST_TMPDIR/manifest-before"
+  cmp "$HOME/.local/state/dot/adoption.json" "$BATS_TEST_TMPDIR/state-before"
+  tmux -L "$SOCKET" send-keys -t ui p
+  wait_for 'REVIEW EXACT PLAN'
+  wait_for 'other_machine'
+  tmux -L "$SOCKET" send-keys -t ui a
+  wait_for 'FINAL CONFIRMATION'
+  [[ "$(pane)" == *'> Cancel'* ]]
+  tmux -L "$SOCKET" send-keys -t ui j Enter
+  wait_for 'Applied reviewed plan'
+  python3 - "$DOT_SOURCE/tools/dot/manifest.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['entries']['prefs']['machines'] == dict(include=['other_machine'], exclude=[])
+PY
+  [ "$(cat "$HOME/prefs.conf")" = 'live preference' ]
+  cmp "$HOME/.local/state/dot/adoption.json" "$BATS_TEST_TMPDIR/state-before"
+  [ -z "$(git -C "$DOT_SOURCE" status --porcelain)" ]
+}
 @test "Dotfiles stop-tracking final confirmation defaults Cancel then exact apply retains live bytes/mode" {
   start_browser
   wait_for 'Dotfiles'
@@ -72,6 +115,59 @@ start_browser() {
   python3 -c 'import json,sys; assert json.load(open(sys.argv[1]))["entries"] == {}' "$HOME/.local/state/dot/adoption.json"
   [ -z "$(git -C "$DOT_SOURCE" status --porcelain)" ]
   pane >&3
+}
+@test "real Adopt composes profiles and approves all deselections locally without editing shared lists" {
+  python3 - "$DOT_SOURCE" "$HOME" <<'PY'
+import json, pathlib, sys
+source, home = map(pathlib.Path, sys.argv[1:])
+system = 'darwin' if sys.platform == 'darwin' else 'linux'
+path = source / 'tools/dot/manifest.json'
+data = json.loads(path.read_text())
+data['entries']['prefs']['machines'] = dict(include=['all'], exclude=[])
+data['entries']['extra'] = dict(data['entries']['prefs'], destination='extra.conf', source='home/extra.conf')
+data['profiles']['extra'] = ['prefs', 'extra']
+path.write_text(json.dumps(data))
+(source / 'home/extra.conf').write_text('shared extra preference\n')
+(home / 'extra.conf').write_text('local extra preference\n')
+(home / '.local/state/dot/adoption.json').write_text(json.dumps(dict(version=3, profile='default', entries=data['entries'], machine=dict(id='local_machine', os=system))))
+PY
+  git -C "$DOT_SOURCE" add .
+  git -C "$DOT_SOURCE" commit -qm 'composable profiles fixture'
+  cp "$DOT_SOURCE/tools/dot/manifest.json" "$BATS_TEST_TMPDIR/manifest-before"
+  start_browser
+  wait_for prefs.conf
+  tmux -L "$SOCKET" send-keys -t ui BTab
+  wait_for ADOPT
+  wait_for extra.conf
+  tmux -L "$SOCKET" send-keys -t ui s
+  wait_for 'OPT-IN EXACT REPOSITORY PRESET'
+  tmux -L "$SOCKET" send-keys -t ui Enter
+  wait_for '1 selected'
+  tmux -L "$SOCKET" send-keys -t ui s
+  wait_for 'OPT-IN EXACT REPOSITORY PRESET'
+  tmux -L "$SOCKET" send-keys -t ui j Enter
+  wait_for '2 selected'
+  wait_for 'default + extra'
+  tmux -L "$SOCKET" send-keys -t ui Space j Space
+  wait_for '0 selected'
+  tmux -L "$SOCKET" send-keys -t ui p
+  wait_for 'REVIEW EXACT PLAN'
+  tmux -L "$SOCKET" send-keys -t ui a
+  wait_for 'FINAL CONFIRMATION'
+  [[ "$(pane)" == *'> Cancel'* ]]
+  tmux -L "$SOCKET" send-keys -t ui j Enter
+  wait_for 'Applied reviewed plan'
+  cmp "$DOT_SOURCE/tools/dot/manifest.json" "$BATS_TEST_TMPDIR/manifest-before"
+  python3 - "$HOME/.local/state/dot/adoption.json" <<'PY'
+import json, sys
+state = json.load(open(sys.argv[1]))
+assert state['entries'] == {}
+assert state['profiles'] == ['default', 'extra']
+assert state['deselected'] == ['extra', 'prefs']
+PY
+  [ "$(cat "$HOME/prefs.conf")" = 'live preference' ]
+  [ "$(cat "$HOME/extra.conf")" = 'local extra preference' ]
+  [ -z "$(git -C "$DOT_SOURCE" status --porcelain)" ]
 }
 @test "Dotfiles logical metadata editor reviews a source-only metadata change before applying" {
   os_name=darwin

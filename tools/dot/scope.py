@@ -36,13 +36,41 @@ def load(home):
     if data.get('version') in (2, 3):
         from intent import metadata, profile_name
         fields = {'version', 'profile', 'entries'} | ({'machine'} if data['version'] == 3 else set())
-        if set(data) != fields or not isinstance(data['entries'], dict):
+        optional = {'profiles', 'deselected', 'customs'} if data['version'] == 3 else set()
+        if not fields <= set(data) or set(data) - fields - optional or not isinstance(data['entries'], dict):
             raise ValueError('invalid exact adoption profile')
         if data['version'] == 3:
             from file_metadata import machine_identifier, SYSTEMS
             if not isinstance(data['machine'], dict) or set(data['machine']) != {'id', 'os'} or data['machine']['os'] not in SYSTEMS:
                 raise ValueError('invalid approved machine identity')
             machine_identifier(data['machine']['id'])
+            if 'profiles' in data:
+                names = data['profiles']
+                if not isinstance(names, list) or not names or any(not isinstance(p, str) for p in names) or len(set(names)) != len(names):
+                    raise ValueError('invalid composed adoption profiles')
+                for name in names:
+                    profile_name(name)
+            deselected = data.get('deselected', [])
+            if (not isinstance(deselected, list) or any(not isinstance(k, str) for k in deselected)
+                    or len(set(deselected)) != len(deselected) or set(deselected) & set(data['entries'])):
+                raise ValueError('invalid local deselections')
+            customs = data.get('customs', {})
+            from file_metadata import CUSTOM_FIELDS
+            if not isinstance(customs, dict):
+                raise ValueError('invalid machine-local customs')
+            for key, changes in customs.items():
+                if (not isinstance(key, str) or not key or any(ord(c) < 32 for c in key) or not isinstance(changes, dict)
+                        or set(changes) - CUSTOM_FIELDS):
+                    raise ValueError('invalid machine-local customs')
+                for field, value in changes.items():
+                    if field == 'impact':
+                        if value not in ('Safe', 'Unsafe'):
+                            raise ValueError('invalid machine-local impact')
+                    elif (not isinstance(value, list) or any(not isinstance(v, str) for v in value)
+                          or len(set(value)) != len(value)):
+                        raise ValueError('invalid machine-local capability list')
+                if key in data['entries']:
+                    metadata(dict(data['entries'][key], **changes))
         profile_name(data['profile'])
         for key, entry in data['entries'].items():
             if not isinstance(key, str):

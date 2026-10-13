@@ -73,6 +73,8 @@ def safe_error(error):
             return clean(message)
         if message.startswith('machine:'):
             return clean(message)
+        if message.startswith('assignment:'):
+            return clean(message)
         if message.startswith('packages:'):
             # Package errors are fixed policy messages, never source bytes or
             # arbitrary manager stderr. The manager identifier is allowlisted.
@@ -160,6 +162,13 @@ def inventory(intent, home, mode='track'):
     catalog = dict(catalog, entries=resolved)
     state = intent.scope.load(str(home))
     check_scope(catalog, home, state)
+    machines = set(catalog.get('machines', {}))
+    if state and state['version'] == 3:
+        machines.add(state['machine']['id'])
+    for entry in catalog['entries'].values():
+        assigned = entry.get('machines', {'include': [], 'exclude': []})
+        machines.update(assigned['include'] + assigned['exclude'])
+    machines.discard('all')
     rows = []
     if mode in ('adopt', 'untrack'):
         os_name = 'linux' if sys.platform.startswith('linux') else sys.platform
@@ -192,10 +201,9 @@ def inventory(intent, home, mode='track'):
                     rows[-1].update(logical_id=logical, tracking=definition)
         profiles = [{'name': name, 'entries': identifiers}
                     for name, identifiers in sorted(catalog['profiles'].items())]
-        if catalog['version'] == 2:
-            for profile in profiles:
-                profile['entries'] = [key for key in profile['entries'] if os_name in resolved[key]['os'] and applicable(catalog, home, key)]
-        return {'mode': mode, 'os': os_name, 'entries': rows, 'profiles': profiles}
+        for profile in profiles:
+            profile['entries'] = [key for key in profile['entries'] if os_name in resolved[key]['os'] and applicable(catalog, home, key)]
+        return {'mode': mode, 'os': os_name, 'entries': rows, 'profiles': profiles, 'machines': sorted(machines)}
 
     # Safe hierarchical inventory. Never enter excluded names, symlinks, or
     # repository internals; the frontend controls which folders are visible.
@@ -245,7 +253,7 @@ def inventory(intent, home, mode='track'):
 
     walk(home)
     from file_metadata import current_os
-    return {'mode': mode, 'os': current_os(), 'entries': rows}
+    return {'mode': mode, 'os': current_os(), 'entries': rows, 'machines': sorted(machines)}
 
 
 def snapshot(intent, home, rel):
