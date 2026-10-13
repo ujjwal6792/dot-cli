@@ -22,6 +22,10 @@ adapter paths; private scripts are never policy adapters.
   `SourceEngine`, `MachineEngine` and setup/dependency interfaces. Native policy
   does not import TUI or setup packages, avoiding a dependency cycle.
 
+Implemented setup and constructor/CLI handoff: [native-setup.md](native-setup.md).
+Source is allowed inside HOME (including the required default checkout), while
+source/state/tracker targets remain excluded from enrollment.
+
 ## Router/distribution owner (#18)
 
 - `Plan(ctx, Request)` → typed `Plan`; `Preview(ctx, Plan)` freshness checks;
