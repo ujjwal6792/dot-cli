@@ -94,6 +94,7 @@ type model struct {
 	highlightPath                    string
 	currentOS                        string
 	logicalRequest                   map[string]any
+	initMode                         bool
 }
 
 type inventoryMsg struct {
@@ -144,8 +145,18 @@ func NewModel(engine Engine, rounds bool, mode string) tea.Model {
 	return model{engine: engine, basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: mode, profile: "default", search: input, templateInput: templateEditor, rounds: rounds, stage: stage, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 
+func NewInitModel(engine Engine) tea.Model {
+	input := textinput.New()
+	input.Placeholder = "filter paths"
+	input.Prompt = "/ "
+	templateEditor := textarea.New()
+	templateEditor.Placeholder = "Secret-free template"
+	templateEditor.SetWidth(72)
+	templateEditor.SetHeight(12)
+	return model{engine: engine, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
+}
 func (m model) Init() tea.Cmd {
-	if m.stage == "setup" {
+	if m.stage == "setup" || m.initMode {
 		return nil
 	}
 	return m.loadInventory
@@ -353,6 +364,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case tea.KeyPressMsg:
 		if m.packageView {
 			return m.updatePackages(value)
+		}
+		if m.initMode && (m.stage == "welcome" || m.stage == "done") {
+			switch value.String() {
+			case "q", "esc", "ctrl+c":
+				return m, tea.Quit
+			case "enter":
+				if m.stage == "welcome" {
+					m.stage = "done"
+					return m, nil
+				}
+				return m, tea.Quit
+			}
+			return m, nil
 		}
 		if value.String() == "P" && m.stage == "" && !m.searching {
 			m.packageView = true
@@ -1249,7 +1273,13 @@ func (m model) render() string {
 		b.WriteString("\nj/k move · Enter select · Esc cancel")
 		return b.String()
 	}
+	if m.stage == "welcome" && m.initMode {
+		return "Welcome to dot\nSingle TUI app for first run and day-2 verbs · no prompts outside the app\n\ndot init --check is read-only and reports an old-user/new-user verdict\n\nEnter continue · q quit"
+	}
 	if m.stage == "done" {
+		if m.initMode {
+			return "Done\nSetup complete · adoption scope unchanged · empty scope is not whole-machine parity\n\nEnter quit · q quit"
+		}
 		if m.rounds {
 			return "Applied reviewed plan.\nEnter next optional round · q quit"
 		}
@@ -1515,6 +1545,12 @@ func (m model) renderReview() string {
 
 func Run(ctx context.Context, engine Engine, rounds bool, mode string) error {
 	program := tea.NewProgram(NewModel(engine, rounds, mode))
+	_, err := program.Run()
+	return err
+}
+
+func RunInit(ctx context.Context, engine Engine) error {
+	program := tea.NewProgram(NewInitModel(engine))
 	_, err := program.Run()
 	return err
 }
