@@ -34,9 +34,9 @@ load bootstrap-helper
   [ ! -e "$HOME/.config/chezmoi/chezmoi.toml" ]
   [ ! -e "$HOME/.config/eza/theme.yml" ]
   [ "$(head -n 1 "$HOME/.zshrc")" = 'keep shell' ]
-  [[ "$(cat "$TRACE")" == *'gh auth setup-git --hostname github.com'* ]]
-  [[ "$(cat "$TRACE")" == *'gh api repos/ujjwal6792/dotfiles'* ]]
   [[ "$(cat "$TRACE")" != *'brew install'* ]]
+  [[ "$(cat "$TRACE")" != *'gh api repos/'* ]]
+  [[ "$(cat "$TRACE")" != *'gh auth setup-git --hostname'* ]]
 }
 
 @test "Intel and older macOS are rejected even with every dependency present" {
@@ -91,6 +91,7 @@ load bootstrap-helper
   [[ "$output" == *'--yes requires existing Git user.email'* ]]
   git config --global user.email fixture@example.org
   export ACCESS_DENIED=yes
+  deny_git_access
   run install_dot --yes
   [ "$status" -ne 0 ]
   [[ "$output" == *'--yes requires existing access'* ]]
@@ -100,7 +101,7 @@ load bootstrap-helper
   export ACCESS_DENIED=no
   run bash "$BOOT" --yes --source-url "$BATS_TEST_TMPDIR/not-a-repository"
   [ "$status" -ne 0 ]
-  [[ "$output" == *'private Git access denied despite API access'* ]]
+  [[ "$output" == *'private Git access denied'* ]]
 }
 
 @test "existing tracker and HOME git are detected or preserved without retirement" {

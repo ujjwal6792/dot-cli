@@ -14,8 +14,9 @@ credentials, history, or target inventory.
 - Present the download/review/execute route: fetch `bootstrap.sh` over HTTPS
   with `--proto '=https' --proto-redir '=https' --tlsv1.2`, verify its SHA-256,
   read it, then run it.
-- The piped `curl | bash` route is documented, but remind the user that
-  interactive prompts and browser login still use `/dev/tty`.
+- The piped `curl | bash` route is documented, but remind the user that `dot
+  init` itself is non-interactive (it stops with guidance unless given an
+  explicit `--url`); only the prebuilt browser owns a terminal.
 - Never claim a working public URL before the release owner provides one.
 - Use independent locations: public CLI `~/.local/share/dot-cli`, private source
   `~/.local/share/dot-config`, launcher `~/.local/bin/dot`. `DOT_SOURCE` remains
