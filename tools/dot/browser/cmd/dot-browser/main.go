@@ -16,6 +16,7 @@ func main() {
 	home := flag.String("home", os.Getenv("HOME"), "target HOME directory")
 	mode := flag.String("mode", "track", "initial mode: track or adopt")
 	rounds := flag.Bool("rounds", false, "offer optional Track/Adopt rounds; defaults to Finish")
+	init := flag.Bool("init", false, "open the first-run Welcome to Done flow")
 	flag.Parse()
 	if *engine == "" || *source == "" || *home == "" {
 		fmt.Fprintln(os.Stderr, "dot-browser: --engine, --source, and --home (or DOT_ENGINE, DOT_SOURCE, and HOME) are required")
@@ -37,6 +38,12 @@ func main() {
 		fatal(err)
 	}
 	client := browser.Client{Executable: filepath.Join(enginePath, "browser_api.py"), Engine: enginePath, Source: sourcePath, Home: homePath}
+	if *init {
+		if err := browser.RunInit(context.Background(), client); err != nil {
+			fatal(err)
+		}
+		return
+	}
 	if err := browser.Run(context.Background(), client, *rounds, *mode); err != nil {
 		fatal(err)
 	}

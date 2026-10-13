@@ -246,6 +246,10 @@ def main():
     config = Path(config_value)
     if args.check:
         detect(source, engine, config)
+        if not source.exists() and not source.is_symlink():
+            print('init verdict: new-user; no private checkout; nothing was created or modified.')
+        else:
+            print('init verdict: old-user; valid Git checkout with a passing contract check; nothing was created or modified.')
         return 0
     platform()
     new_connection = connection is None or connection['private_source'] != str(source) or connection['config_path'] != str(config)
