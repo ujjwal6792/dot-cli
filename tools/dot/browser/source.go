@@ -89,8 +89,11 @@ func (m model) sourceResult(msg sourceMsg) (tea.Model, tea.Cmd) {
 		m.sourceChoice = 0
 		m.message = "Original checkout preserved at " + msg.result.Backup
 	case "continue", "clone", "new":
-		m.stage = "done"
-		m.message = "Source connected and contract-checked. No tracker, adoption, commit or push performed."
+		m.stage = "machine"
+		m.machineInput = textinput.New()
+		m.machineInput.CharLimit = 128
+		cmd := m.machineCommand("suggest")
+		return m, cmd
 	}
 	return m, nil
 }
@@ -101,6 +104,9 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.loading {
 		return m, nil
+	}
+	if m.stage == "machine" {
+		return m.updateMachine(key)
 	}
 	if m.stage == "source-url" {
 		switch key.String() {

@@ -33,6 +33,11 @@ an exclusively created sibling `dot-config.backup-<UTC timestamp>/checkout`.
 Nothing is deleted or overwritten. Failed clone/contract checks retain their
 checkout for inspection; retry through Continue or backup-first Replace.
 
+Source success opens the editable [local machine identity](machine-identity.md)
+page. Confirmation saves `adoption.json` v3 with `machine: {id, os}` and no new
+file selections. Detection and identity setup are offline; v3 owns the local
+identity without rewriting shared machine declarations or another target's state.
+
 Required public adapters are `intent`, `scope`, `gitconfig`, `skills`, and
 `layout`, mapped to Python modules by `engine.json`. Private native ignore,
 removal, bounded Git and skills controls must resolve this same explicit engine

@@ -2,6 +2,8 @@ package browser
 
 import (
 	"context"
+	"encoding/json"
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -15,6 +17,33 @@ type sourceFixture struct {
 	fixtureEngine
 	exists bool
 	calls  []string
+}
+
+type machineFailureFixture struct {
+	sourceFixture
+	saved string
+}
+
+func (f *machineFailureFixture) InitMachine(_ context.Context, request map[string]any) (MachineResult, error) {
+	if request["action"] == "suggest" {
+		return MachineResult{}, errors.New("machine: collision suffixes exhausted; choose a unique id")
+	}
+	f.saved = request["id"].(string)
+	return MachineResult{Machine: Machine{ID: f.saved, OS: "darwin"}}, nil
+}
+
+func TestMachineSuggestionFailureStillAllowsEditing(t *testing.T) {
+	e := &machineFailureFixture{sourceFixture: sourceFixture{exists: true}}
+	m := sendAndRun(NewInitModel(e), "enter")
+	m = sendAndRun(m, "enter")
+	if !strings.Contains(m.View().Content, "choose a unique id") {
+		t.Fatal(m.View().Content)
+	}
+	m, _ = m.Update(tea.PasteMsg{Content: "unique_machine"})
+	m = sendAndRun(m, "enter")
+	if e.saved != "unique_machine" || !strings.Contains(m.View().Content, "Done") {
+		t.Fatal("suggestion failure prevented editing: " + m.View().Content)
+	}
 }
 
 func TestSourcePendingOperationCannotBeSubmittedTwice(t *testing.T) {
@@ -53,6 +82,34 @@ func TestInitNewUserThroughRealEngineAndURLInput(t *testing.T) {
 	m = sendAndRun(m, "enter")
 	if !strings.Contains(m.View().Content, "Source connected and contract-checked") {
 		t.Fatal(m.View().Content)
+	}
+	if !strings.Contains(m.View().Content, "Machine identity") || strings.Contains(m.View().Content, "Enter quit") {
+		t.Fatal("source flow skipped machine identity: " + m.View().Content)
+	}
+	m, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: 'u', Mod: tea.ModCtrl}))
+	m, _ = m.Update(tea.PasteMsg{Content: "Edited-ID"})
+	m = sendAndRun(m, "enter")
+	if !strings.Contains(m.View().Content, "lowercase") {
+		t.Fatal("invalid identity accepted: " + m.View().Content)
+	}
+	m, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: 'u', Mod: tea.ModCtrl}))
+	m, _ = m.Update(tea.PasteMsg{Content: "edited_machine"})
+	m = sendAndRun(m, "enter")
+	if !strings.Contains(m.View().Content, "Done") {
+		t.Fatal(m.View().Content)
+	}
+	body, err := os.ReadFile(filepath.Join(home, ".local/state/dot/adoption.json"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var adoption struct {
+		Version int `json:"version"`
+		Machine struct {
+			ID string `json:"id"`
+		} `json:"machine"`
+	}
+	if err := json.Unmarshal(body, &adoption); err != nil || adoption.Version != 3 || adoption.Machine.ID != "edited_machine" {
+		t.Fatalf("adoption %s: %v", body, err)
 	}
 	got, err := exec.Command("git", "-C", source, "config", "--get", "remote.origin.url").Output()
 	if err != nil || strings.TrimSpace(string(got)) != url {
