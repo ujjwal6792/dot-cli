@@ -101,8 +101,11 @@ def read_text(path, secrets=True):
 
 def metadata(entry):
     required = {'destination', 'source', 'os', 'portability', 'impact', 'removals', 'hooks', 'tools'}
-    if not isinstance(entry, dict) or not required <= set(entry) or set(entry) - required - {'warnings', 'integrations', 'requires', 'notices', 'git_keys', 'git_source'}:
+    if not isinstance(entry, dict) or not required <= set(entry) or set(entry) - required - {'warnings', 'integrations', 'requires', 'notices', 'git_keys', 'git_source', 'machines'}:
         raise ValueError('unsupported entry metadata')
+    if 'machines' in entry:
+        from file_metadata import assignment
+        assignment(entry['machines'])
     warnings = entry.get('warnings', [])
     if not isinstance(warnings, list) or len(set(warnings)) != len(warnings) or any(w != 'desktop-arch-compatibility' for w in warnings):
         raise ValueError('unsupported compatibility warning')
@@ -281,18 +284,27 @@ def plan(root, home, request):
     mode = request.get('mode')
     if mode not in ('track', 'adopt', 'migrate', 'update', 'untrack', 'metadata'):
         raise ValueError('invalid intent mode')
-    allowed = {'version', 'mode', 'profile'} | ({'selections'} if mode == 'track' else {'entries', 'metadata'} if mode == 'adopt' else {'entries'} if mode == 'untrack' else {'metadata'} if mode == 'metadata' else set())
+    allowed = {'version', 'mode', 'profile'} | ({'selections'} if mode == 'track' else {'entries', 'metadata', 'profiles'} if mode == 'adopt' else {'entries'} if mode == 'untrack' else {'metadata'} if mode == 'metadata' else set())
     if set(request) - allowed:
         raise ValueError('unsupported request fields')
     name = profile_name(request.get('profile'))
     original = manifest(root)
+    state = scope.load(str(home))
+    prior_profiles = state.get('profiles', [name]) if state and mode == 'adopt' and state.get('profile') == name else [name]
+    profiles = request.get('profiles', prior_profiles)
+    if (not isinstance(profiles, list) or not profiles or any(not isinstance(p, str) for p in profiles)
+            or len(set(profiles)) != len(profiles)):
+        raise ValueError('assignment: profiles must be a nonempty list of unique named profiles')
+    for profile in profiles:
+        profile_name(profile)
+    if 'profiles' in request and any(p not in original['profiles'] for p in profiles):
+        raise ValueError('assignment: unknown named profile')
     if original['version'] == 2:
         from file_metadata import identity
         identity(home, original)
     data = json.loads(json.dumps(original))
     actions, selected, inputs = [], {}, {}
     os_name = 'linux' if sys.platform.startswith('linux') else sys.platform
-    state = scope.load(str(home))
     from file_metadata import check_scope
     # A fresh Adopt may explicitly re-identify; updates/source-only changes may not.
     if mode != 'adopt':
@@ -303,7 +315,7 @@ def plan(root, home, request):
     for key, changes in (edits.items() if mode != 'metadata' else []):
         if not isinstance(changes, dict) or set(changes) - {'os', 'impact', 'removals', 'tools', 'warnings', 'integrations', 'requires', 'notices', 'git_keys'}:
             raise ValueError('unsupported Adopt metadata edits')
-        data['entries'][key] = metadata(dict(data['entries'][key], **changes))
+        metadata(dict(data['entries'][key], **changes))
     # Capabilities can create outputs/relationships involving unselected entries.
     # Validate the complete proposed intent, not merely each edited entry.
     validate_manifest_data(data)
@@ -324,11 +336,13 @@ def plan(root, home, request):
                 from file_metadata import track as track_logical
                 track_logical(root, home, data, selection, selected, inputs, actions)
                 continue
-            if not isinstance(selection, dict) or set(selection) - {'path', 'destination', 'os', 'portability', 'impact', 'template', 'tools', 'removals', 'warnings', 'integrations', 'requires', 'notices', 'git_keys'}:
+            if not isinstance(selection, dict) or set(selection) - {'path', 'destination', 'os', 'portability', 'impact', 'template', 'tools', 'removals', 'warnings', 'integrations', 'requires', 'notices', 'git_keys', 'machines'}:
                 raise ValueError('unsupported selection fields')
             dest = selection.get('destination', selection.get('path'))
             previous_id, previous = track_entry(data, dest)
             if previous and 'git-config' in previous.get('integrations', []):
+                previous = metadata(dict(previous, machines=selection.get('machines', previous.get('machines', {'include': ['all'], 'exclude': []}))))
+                data['entries'][previous_id] = previous
                 live = bounded(home, selection['path'])
                 text = track(root, home, previous, selection)
                 if previous_id in selected:
@@ -364,20 +378,22 @@ def plan(root, home, request):
                 entry = metadata({'destination': dest, 'source': source_name(dest, templated, bool(mode_bits & 0o111), templated or not bool(mode_bits & 0o044)),
                                   'os': selection.get('os'), 'portability': selection.get('portability'),
                                   'impact': selection.get('impact'), 'tools': selection.get('tools', []),
-                                   'removals': selection.get('removals', []), 'hooks': []})
+                                    'removals': selection.get('removals', []), 'hooks': [],
+                                    'machines': selection.get('machines', {'include': ['all'], 'exclude': []})})
                 for field in ('warnings', 'integrations', 'requires', 'notices'):
                     if field in selection:
                         entry[field] = selection[field]
                 metadata(entry)
-                if dest in selected:
+                entry_id = next((key for key, old in data['entries'].items() if old['destination'] == dest), dest)
+                if entry_id in selected:
                     raise ValueError('duplicate selection')
-                selected[dest] = entry
-                previous = data['entries'].get(dest)
+                selected[entry_id] = entry
+                previous = data['entries'].get(entry_id)
                 if previous is not None and previous['source'] != entry['source']:
                     old_source = bounded(root, previous['source'])
                     actions.append({'path': previous['source'], 'before': file_state(old_source),
                                     'text': None, 'remove': True})
-                data['entries'][dest] = entry
+                data['entries'][entry_id] = entry
                 source = bounded(root, entry['source'])
                 actions.append({'path': entry['source'], 'before': file_state(source), 'text': text, 'remove': False})
         data['profiles'][name] = sorted(selected)
@@ -390,6 +406,9 @@ def plan(root, home, request):
     else:
         from file_metadata import entries as resolve_entries, applicable
         resolved = resolve_entries(data, home)
+        for key, changes in edits.items():
+            resolved[key] = metadata(dict(resolved[key], **changes))
+        validate_manifest_data({'version': 1, 'entries': resolved, 'profiles': data['profiles']})
         if mode == 'update':
             if state is None or state['version'] not in (2, 3):
                 raise ValueError('updates require an approved exact scope')
@@ -404,11 +423,13 @@ def plan(root, home, request):
                 raise ValueError('migration requires an explicitly recorded repository profile')
             ids = [key for key in data['profiles'][name] if scope.allows(state, data['entries'][key]['destination'])]
         else:
-            ids = request.get('entries', data['profiles'].get(name))
+            ids = request.get('entries', sorted({key for p in profiles for key in data['profiles'].get(p, [])})
+                              if all(p in data['profiles'] for p in profiles) else None)
         if not isinstance(ids, list) or len(set(ids)) != len(ids) or any(key not in data['entries'] for key in ids):
             raise ValueError('unknown entries/profile')
-        if mode == 'adopt' and 'entries' not in request and data['version'] == 2:
+        if mode == 'adopt' and 'entries' not in request:
             ids = [key for key in ids if os_name in resolved[key]['os'] and applicable(data, home, key)]
+            ids = [key for key in ids if key not in (state or {}).get('deselected', [])]
         if set(edits) - set(ids):
             raise ValueError('Adopt metadata edits must be restricted to selected entries')
         for key in ids:
@@ -469,14 +490,6 @@ def plan(root, home, request):
                 if target.exists():
                     read_text(target)
                 actions.append({'path': removal, 'before': file_state(target), 'text': None, 'remove': True})
-        if mode == 'adopt':
-            if data['version'] == 1 or 'entries' in request:
-                data['profiles'][name] = sorted(selected)
-            if data != original:
-                if git(root, 'status', '--porcelain'):
-                    raise ValueError('metadata/profile edits require a clean source checkout')
-                actions.append({'path': MANIFEST_RELATIVE, 'repository': True, 'before': file_state(bounded(root, MANIFEST_RELATIVE)),
-                                'text': json.dumps(data, indent=2, sort_keys=True) + '\n', 'remove': False})
     if len({a['path'] for a in actions}) != len(actions):
         raise ValueError('conflicting actions')
     if mode in ('track', 'metadata'):
@@ -485,6 +498,19 @@ def plan(root, home, request):
     result = {'version': 1, 'request': request, 'root': str(root.resolve()), 'home': str(home.resolve()),
               'actions': actions, 'selected': selected, 'inputs': inputs,
               'manifest': original, 'state': state, 'head': git(root, 'rev-parse', 'HEAD').strip()}
+    if mode == 'adopt' and ((state and state['version'] == 3) or edits or 'profiles' in request):
+        from file_metadata import approved
+        result['adoption'] = approved(original, home, name, selected)
+        if result['adoption']['version'] != 3:
+            raise ValueError('assignment: local customizations and profiles require a local machine identity')
+        if 'profiles' in request or (state and state.get('profiles') and state.get('profile') == name):
+            result['adoption']['profiles'] = profiles
+        candidates = {key for p in profiles for key in original['profiles'].get(p, [])}
+        result['adoption']['deselected'] = sorted((set((state or {}).get('deselected', [])) | candidates) - set(selected))
+        customs = dict((state or {}).get('customs', {}))
+        for key, changes in edits.items():
+            customs[key] = dict(customs.get(key, {}), **changes)
+        result['adoption']['customs'] = {k: v for k, v in customs.items() if k in original['entries'] and v}
     if data['version'] == 2:
         from file_metadata import identity, entries as resolve_entries
         result['machine'] = identity(home, data)
@@ -727,7 +753,7 @@ def apply(root, home, saved, approval, ack, ack_desktop=False, replace_skills_ba
             # Update plans already require identical approved capabilities.
             # Preserve the owner's exact approval bytes/mode, not a reserialization.
             if mode != 'update':
-                scope.save(str(home), approved(saved['manifest'], home, saved['request']['profile'], saved['selected']))
+                scope.save(str(home), saved.get('adoption') or approved(saved['manifest'], home, saved['request']['profile'], saved['selected']))
             missing_tools(home, saved['selected'])
     except (OSError, ValueError) as error:
         raise ValueError(f'partial completion; recovery plan/backups: {backup}; {error}') from error

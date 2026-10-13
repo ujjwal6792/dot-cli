@@ -117,6 +117,9 @@ func TestPublicTerminalSearchAndHiddenToggleDoNotDropBasket(t *testing.T) {
 	for _, r := range "plain" {
 		m, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: r}))
 	}
+	if !strings.Contains(m.View().Content, "1 selected") {
+		t.Fatalf("search editor hid the exact basket count: %s", m.View().Content)
+	}
 	m = send(m, "enter")
 	if !strings.Contains(m.View().Content, "1 selected") {
 		t.Fatalf("search lost exact basket selection: %s", m.View().Content)

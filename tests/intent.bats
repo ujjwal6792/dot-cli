@@ -23,6 +23,14 @@ setup() {
   printf '{"version":1,"mode":"track","profile":"work","selections":[{"path":".config/arbitrary/preferences.conf","os":["darwin","linux"],"portability":"managed-shared","impact":"Safe"}]}\n' > "$REQUEST"
 }
 
+local_machine() {
+  python3 - <<'PY' | python3 "$DOT_ENGINE/browser_api.py"
+import json, os
+print(json.dumps(dict(version=1, command='init-machine', engine=os.environ['DOT_ENGINE'],
+    source=os.environ['DOT_SOURCE'], home=os.environ['HOME'], request=dict(action='save', id='fixture_machine'))))
+PY
+}
+
 @test "Adopt rejects empty and unrelated metadata edits without modifying manifest or HOME" {
   printf 'other\n' > "$HOME/.config/arbitrary/other.conf"
   python3 - "$REQUEST" <<'PY'
@@ -48,6 +56,7 @@ PY
 }
 
 @test "selected metadata downgrade requires original Unsafe and desktop acknowledgments" {
+  local_machine
   python3 - "$REQUEST" <<'PY'
 import json, sys
 p = sys.argv[1]; d = json.load(open(p))
@@ -66,7 +75,10 @@ PY
   run "$DOT" intent apply "$PLAN" --approve "$TOKEN" --ack-unsafe
   [ "$status" -ne 0 ]
   [[ "$output" == *'--ack-desktop'* ]]
-  [ ! -e "$HOME/.local/state/dot/adoption.json" ]
+  python3 - "$HOME/.local/state/dot/adoption.json" <<'PY'
+import json, sys
+assert json.load(open(sys.argv[1]))['entries'] == {}
+PY
   "$DOT" intent apply "$PLAN" --approve "$TOKEN" --ack-unsafe --ack-desktop
 }
 
@@ -159,6 +171,7 @@ PY
 }
 
 @test "warning removal and broadened OS require renewed separate desktop acknowledgment" {
+  local_machine
   python3 - "$REQUEST" <<'PY'
 import json, sys
 p = sys.argv[1]; d = json.load(open(p)); d['selections'][0]['warnings'] = ['desktop-arch-compatibility']
@@ -185,6 +198,7 @@ PY
 }
 
 @test "broader OS applicability without a warning still needs separate desktop consent" {
+  local_machine
   python3 - "$REQUEST" <<'PY'
 import json, sys
 p = sys.argv[1]; d = json.load(open(p))
