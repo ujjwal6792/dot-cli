@@ -112,7 +112,7 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 				return nil
 			}
 			rel, _ := filepath.Rel(e.config.Home, path)
-			if within(path, e.config.State) || within(path, e.config.Source) || sensitive(rel) {
+			if within(path, e.config.State) || within(path, e.config.Source) || path == e.config.TrackerConfig || sensitive(rel) {
 				if d.IsDir() {
 					return filepath.SkipDir
 				}

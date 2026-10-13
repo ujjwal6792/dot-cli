@@ -38,7 +38,7 @@ func (m *model) machineCommand(action string) tea.Cmd {
 	}
 	m.loading = true
 	return func() tea.Msg {
-		result, err := e.InitMachine(context.Background(), request)
+		result, err := e.InitMachine(m.setupCtx(), request)
 		return machineMsg{action, result, err}
 	}
 }
@@ -50,10 +50,13 @@ func (m model) machineResult(msg machineMsg) (tea.Model, tea.Cmd) {
 		return m, m.machineInput.Focus()
 	}
 	if msg.action == "save" {
-		m.stage = "done"
+		m.stage = "dependencies"
 		m.machineInput.Blur()
-		m.message = "Source connected. Local machine " + msg.result.Machine.ID + " saved; no files adopted, tracker, commit or push performed."
-		return m, nil
+		m.currentMachine = msg.result.Machine
+		m.dependenciesNext = "tracker"
+		m.message = "Local machine " + msg.result.Machine.ID + " saved; no files adopted or tracker created."
+		cmd := m.setupCommand("dependencies", nil)
+		return m, cmd
 	}
 	m.machineInput = textinput.New()
 	m.machineInput.CharLimit = 128
@@ -66,6 +69,9 @@ func (m model) machineResult(msg machineMsg) (tea.Model, tea.Cmd) {
 func (m model) updateMachine(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
 	case "esc", "ctrl+c":
+		if m.setupCancel != nil {
+			m.setupCancel()
+		}
 		return m, tea.Quit
 	case "enter":
 		action := "save"
