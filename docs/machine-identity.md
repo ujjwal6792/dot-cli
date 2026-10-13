@@ -1,5 +1,8 @@
 # Local machine identity
 
+This is the retained #14 behavioral contract. The Python implementation was
+retired; #17 owns its native Go replacement and integration tests.
+
 After connecting or continuing a source, `dot init` opens an editable machine
 identity page. Merely opening the page writes nothing. Enter confirms the id;
 Escape quits without saving. Identity setup does not adopt files or install a
@@ -27,8 +30,6 @@ be discovered; uniqueness is against the locally available source catalog.
 
 V3 is the identity source of truth, including for v1 manifests; subsequent
 Adopt preserves it rather than downgrading to v2. The existing contract protocol
-and manifest/approval capability negotiation are unchanged. Legacy sidecar
-identity is read only when no v3 record exists. Once v3 exists, changing or
-removing `machine.json` cannot change the executing machine. Legacy group scopes
+and manifest/approval capability negotiation remain required. Legacy group scopes
 are not migrated by identity setup; malformed records and symlinked state paths
-fail closed. Machine assignments are a separate feature.
+fail closed. Assignment and adoption policy are owned by #16.

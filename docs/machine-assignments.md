@@ -1,5 +1,9 @@
 # Machine assignments and local adoption
 
+This is the retained #15 behavioral contract. The Python implementation was
+retired; #16 must implement and verify it in the native Go engine. Current UI
+tests alone do not establish persistence or policy enforcement.
+
 New Track entries default to:
 
 ```json
