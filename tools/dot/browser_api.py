@@ -69,6 +69,8 @@ def safe_error(error):
         return 'invalid request structure'
     if isinstance(error, ValueError):
         message = str(error)
+        if message.startswith('source:'):
+            return clean(message)
         if message.startswith('packages:'):
             # Package errors are fixed policy messages, never source bytes or
             # arbitrary manager stderr. The manager identifier is allowlisted.
@@ -340,6 +342,7 @@ def handle(request):
         'preview': common | {'plan'},
         'apply': common | {'plan', 'approve', 'ack_unsafe', 'ack_desktop', 'replace_skills_backup'},
         'packages': common | {'request', 'plan', 'approve'},
+        'init-source': common | {'request'},
     }
     if command not in allowed:
         raise ValueError('unsupported bridge command')
@@ -348,6 +351,17 @@ def handle(request):
     for key in ('engine', 'source'):
         if not isinstance(request.get(key), str) or not Path(request[key]).is_absolute():
             raise ValueError('explicit engine and source paths required')
+    if command == 'init-source':
+        engine_path = Path(request['engine']).resolve()
+        if Path(__file__).resolve().parent != engine_path:
+            raise ValueError('bridge must execute from the negotiated independent engine')
+        home = request.get('home')
+        if not isinstance(home, str) or not Path(home).is_absolute() or not Path(home).is_dir() or home == '/':
+            raise ValueError('explicit HOME must be an existing absolute directory')
+        os.environ['HOME'] = home
+        import init
+        result = init.source_flow(Path(request['source']), engine_path, request.get('request'))
+        return {'version': 1, 'ok': True, 'result': result}
     negotiated = contract.check(Path(request['engine']), Path(request['source']))
     engine_path, source_path = Path(negotiated['engine']), Path(negotiated['source'])
     if Path(__file__).resolve().parent != engine_path:

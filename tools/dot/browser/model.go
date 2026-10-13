@@ -95,6 +95,10 @@ type model struct {
 	currentOS                        string
 	logicalRequest                   map[string]any
 	initMode                         bool
+	sourceChoice                     int
+	sourceInput                      textinput.Model
+	sourceAction, sourceBackup       string
+	sourcePlan                       map[string]any
 }
 
 type inventoryMsg struct {
@@ -181,6 +185,14 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case sourceMsg:
+		return m.sourceResult(value)
+	case tea.PasteMsg:
+		if m.initMode && m.stage == "source-url" && !m.loading {
+			var cmd tea.Cmd
+			m.sourceInput, cmd = m.sourceInput.Update(value)
+			return m, cmd
+		}
 	case packagesMsg:
 		if !m.packageView || value.generation != m.packageGeneration {
 			return m, nil
@@ -365,18 +377,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.packageView {
 			return m.updatePackages(value)
 		}
-		if m.initMode && (m.stage == "welcome" || m.stage == "done") {
-			switch value.String() {
-			case "q", "esc", "ctrl+c":
-				return m, tea.Quit
-			case "enter":
-				if m.stage == "welcome" {
-					m.stage = "done"
-					return m, nil
-				}
-				return m, tea.Quit
-			}
-			return m, nil
+		if m.initMode {
+			return m.updateInit(value)
 		}
 		if value.String() == "P" && m.stage == "" && !m.searching {
 			m.packageView = true
@@ -637,6 +639,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.search.SetValue("")
 			m.filter()
 		}
+	}
+	if m.initMode && m.stage == "source-url" && !m.loading {
+		var cmd tea.Cmd
+		m.sourceInput, cmd = m.sourceInput.Update(msg)
+		return m, cmd
 	}
 	return m, nil
 }
@@ -1215,6 +1222,9 @@ func fitHeight(value string, height int) string {
 }
 
 func (m model) render() string {
+	if m.initMode && strings.HasPrefix(m.stage, "source-") {
+		return m.renderSource()
+	}
 	if m.packageView {
 		return m.renderPackages()
 	}
@@ -1274,11 +1284,15 @@ func (m model) render() string {
 		return b.String()
 	}
 	if m.stage == "welcome" && m.initMode {
-		return "Welcome to dot\nSingle TUI app for first run and day-2 verbs · no prompts outside the app\n\ndot init --check is read-only and reports an old-user/new-user verdict\n\nEnter continue · q quit"
+		message := m.message
+		if m.loading {
+			message = "Checking source…"
+		}
+		return "Welcome to dot\nSingle TUI app for first run and day-2 verbs · no prompts outside the app\n\ndot init --check is read-only and reports an old-user/new-user verdict\n\nEnter continue · q quit\n" + message
 	}
 	if m.stage == "done" {
 		if m.initMode {
-			return "Done\nSetup complete · adoption scope unchanged · empty scope is not whole-machine parity\n\nEnter quit · q quit"
+			return "Done\n" + m.message + "\nAdoption scope unchanged · empty scope is not whole-machine parity\n\nEnter quit · q quit"
 		}
 		if m.rounds {
 			return "Applied reviewed plan.\nEnter next optional round · q quit"
