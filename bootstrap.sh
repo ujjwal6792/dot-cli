@@ -3,7 +3,7 @@
 set -Eeuo pipefail
 umask 077
 YES=false REPLACE_CHEZMOI=false STAGE=install DIRECTORY="${HOME:?HOME is required}/.local/share/dot-config" ENGINE_DIRECTORY="${HOME:?HOME is required}/.local/share/dot-cli" BROWSER_URL='' BROWSER_SHA256=''
-REPOSITORY=ujjwal6792/dotfiles SOURCE_URL='' ENGINE_URL='' ENGINE_REPOSITORY=ujjwal6792/dots-cli UPDATE=ask PROFILE=personal ZSH_DIRECTORY=''
+REPOSITORY='' SOURCE_URL='' ENGINE_URL='' ENGINE_REPOSITORY=ujjwal6792/dots-cli UPDATE=ask ZSH_DIRECTORY=''
 DEPENDENCIES=(bash git curl gh python3)
 TEMP='' PHASE=arguments PLATFORM='' UBUNTU_VERSION='' DEB_ARCH=''
 OWNED_BROWSER_TMP=''
@@ -25,10 +25,10 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --yes) YES=true; shift ;;
     --replace-chezmoi) REPLACE_CHEZMOI=true; shift ;;
-    --directory|--engine-directory|--zsh-directory|--existing|--profile|--repository|--source-url|--engine-url|--browser-url|--browser-sha256|--stage)
+    --directory|--engine-directory|--zsh-directory|--existing|--repository|--source-url|--engine-url|--browser-url|--browser-sha256|--stage)
       [ $# -ge 2 ] || fail "missing value for $1"
       case "$1" in
-        --directory) DIRECTORY="$2" ;; --engine-directory) ENGINE_DIRECTORY="$2" ;; --zsh-directory) ZSH_DIRECTORY="$2" ;; --existing) UPDATE="$2" ;; --profile) PROFILE="$2" ;;
+        --directory) DIRECTORY="$2" ;; --engine-directory) ENGINE_DIRECTORY="$2" ;; --zsh-directory) ZSH_DIRECTORY="$2" ;; --existing) UPDATE="$2" ;;
         --repository) REPOSITORY="$2" ;; --source-url) SOURCE_URL="$2" ;; --engine-url) ENGINE_URL="$2" ;; --browser-url) BROWSER_URL="$2" ;; --browser-sha256) BROWSER_SHA256="$2" ;; --stage) STAGE="$2" ;;
       esac
       shift 2 ;;
@@ -38,14 +38,15 @@ while [ $# -gt 0 ]; do
 done
 case "$DIRECTORY" in /*) ;; *) fail '--directory must be absolute' ;; esac
 case "$ENGINE_DIRECTORY" in /*) ;; *) fail '--engine-directory must be absolute' ;; esac
-case "$PROFILE" in personal|work) ;; *) fail 'profile must be personal or work' ;; esac
 case "$UPDATE" in ask|update|keep) ;; *) fail 'existing choice must be update or keep' ;; esac
   case "$STAGE" in install|dependencies|migration|adoption) ;; *) fail 'unknown stage' ;; esac
-[[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'repository must be OWNER/REPO, without credentials'
 if [ -n "$SOURCE_URL" ]; then
   case "$SOURCE_URL" in /*) ;; *) fail '--source-url accepts only absolute local fixture paths' ;; esac
-else
+elif [ -n "$REPOSITORY" ]; then
+  [[ "$REPOSITORY" =~ ^[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+$ ]] || fail 'repository must be OWNER/REPO, without credentials'
   SOURCE_URL="https://github.com/$REPOSITORY.git"
+else
+  fail 'no private source given; pass --source-url <absolute local fixture> or --repository OWNER/REPO'
 fi
 if [ -n "$ENGINE_URL" ]; then case "$ENGINE_URL" in /*) ;; *) fail '--engine-url accepts only absolute local fixture paths' ;; esac; else ENGINE_URL="https://github.com/$ENGINE_REPOSITORY.git"; fi
 if [ -n "$BROWSER_URL" ]; then
@@ -404,14 +405,14 @@ for tool in bash git curl python3; do compatible "$tool" || { [ "$STAGE" = depen
 # preflight checks and atomic, ownership-checked installation of local metadata.
 local_setup() {
   python3 - --action "$1" --home "$HOME" --directory "$DIRECTORY" \
-    --source "$SOURCE_URL" --profile "$PROFILE" --brew-bin "$BREW_BIN" \
+    --source "$SOURCE_URL" --brew-bin "$BREW_BIN" \
     --python-bin "$PYTHON_BIN" --zsh-directory "$ZSH_DIRECTORY" --yes "$YES" --replace "$REPLACE_CHEZMOI" --engine-directory "$ENGINE_DIRECTORY" <<'PY'
 import argparse, hashlib, json, os, pathlib, re, shlex, shutil, stat, subprocess, sys, tempfile, tomllib, uuid
 parser = argparse.ArgumentParser(add_help=False)
-for name in ('action', 'home', 'directory', 'source', 'profile', 'brew-bin', 'python-bin', 'zsh-directory', 'yes', 'replace', 'engine-directory'):
+for name in ('action', 'home', 'directory', 'source', 'brew-bin', 'python-bin', 'zsh-directory', 'yes', 'replace', 'engine-directory'):
     parser.add_argument('--' + name, required=True)
 settings = parser.parse_args()
-action, source, profile = settings.action, settings.source, settings.profile
+action, source = settings.action, settings.source
 home = pathlib.Path(settings.home)
 checkout = pathlib.Path(settings.directory)
 engine = pathlib.Path(settings.engine_directory)
@@ -1057,7 +1058,7 @@ def configure_chezmoi(record):
         subprocess.run([str(engine / 'tools/dot/dot'), 'scope', 'init'], env={**os.environ, 'DOT_SOURCE': str(checkout), 'DOT_ENGINE': str(engine / 'tools/dot')}, check=True)
         name = subprocess.check_output(['git', 'config', 'user.name'], text=True).strip()
         email = subprocess.check_output(['git', 'config', 'user.email'], text=True).strip()
-        atomic(config, 'sourceDir = ' + json.dumps(str(checkout / 'home')) + '\ncacheDir = ' + json.dumps(str(current_cache)) + '\npersistentState = ' + json.dumps(str(current_state)) + '\n[data]\nname = ' + json.dumps(name) + '\nemail = ' + json.dumps(email) + '\nprofile = ' + json.dumps(profile) + '\ndotEngine = ' + json.dumps(str(engine / 'tools/dot')) + '\n')
+        atomic(config, 'sourceDir = ' + json.dumps(str(checkout / 'home')) + '\ncacheDir = ' + json.dumps(str(current_cache)) + '\npersistentState = ' + json.dumps(str(current_state)) + '\n[data]\nname = ' + json.dumps(name) + '\nemail = ' + json.dumps(email) + '\ndotEngine = ' + json.dumps(str(engine / 'tools/dot')) + '\n')
     elif (checkout / 'home').is_dir() and tomllib.loads(config.read_text()).get('sourceDir') == str(checkout):
         sys.path.insert(0, str(engine / 'tools/dot'))
         sys.dont_write_bytecode = True
@@ -1139,6 +1140,14 @@ compatible gh || fail 'missing/incompatible prerequisite gh; dot init owns depen
 export GIT_TERMINAL_PROMPT=0 GH_PROMPT_DISABLED=1
 check_source_access() {
   local metadata
+  case "$SOURCE_URL" in /*)
+    # Absolute local fixture path: no hosting API identity to verify.
+    if ! git ls-remote "$SOURCE_URL" HEAD >/dev/null 2>&1; then
+      ACCESS_PROBLEM='private Git access denied'; return 1
+    fi
+    return 0 ;;
+  esac
+  [ -n "$REPOSITORY" ] || { ACCESS_PROBLEM='no repository identity to verify; pass --repository OWNER/REPO'; return 1; }
   if ! metadata="$(gh api "repos/$REPOSITORY" 2>/dev/null)"; then
     ACCESS_PROBLEM='private repository API access denied'; return 1
   fi
