@@ -85,14 +85,126 @@ def validate_source_url(url):
     """Reject credential-bearing, query, or fragment URLs before any network use."""
     if not url:
         raise ValueError('source URL is empty; rerun with --url <your-repo-url>')
-    split = urllib.parse.urlsplit(url)
-    if split.username or split.password or re.search(r'://[^/]*:[^/@]*@', url):
+    if not isinstance(url, str) or any(c.isspace() or ord(c) < 32 for c in url):
+        raise ValueError('source URL must be a credential-free HTTPS or SSH URL')
+    try:
+        split = urllib.parse.urlsplit(url)
+        host = split.hostname
+        _ = split.port
+    except ValueError:
+        raise ValueError('source URL must be a credential-free HTTPS or SSH URL') from None
+    if split.password is not None or (split.username is not None and split.scheme != 'ssh'):
         raise ValueError('source URL must not contain credentials; use a credential-free HTTPS or SSH URL')
     if split.query or split.fragment or '?' in url or '#' in url:
         raise ValueError('source URL must not contain query parameters or fragments')
-    if split.scheme in ('https', 'ssh', 'file') or url.startswith('git@') or os.path.isabs(url):
+    if (split.scheme in ('https', 'ssh') and host and split.path not in ('', '/')
+            and (not split.username or re.fullmatch(r'[a-zA-Z0-9_-]+', split.username))):
+        return url
+    if re.fullmatch(r'git@[a-zA-Z0-9.-]+:[^?#\s]+', url):
+        return url
+    if split.scheme == 'file' or os.path.isabs(url):
         return url
     raise ValueError('source URL must be HTTPS, SSH (git@host:...), file://, or an absolute local path')
+
+
+def source_flow(source, engine, request):
+    """First-run source operations, independent of tracker/adoption state."""
+    if not isinstance(request, dict) or set(request) - {'action', 'url', 'plan'}:
+        raise ValueError('source: unsupported request')
+    safe_path(source)
+    home = Path(os.environ['HOME']).resolve()
+    resolved_source = source.resolve()
+    if resolved_source == home or resolved_source in home.parents:
+        raise ValueError('source: checkout must not be HOME or its ancestor; left untouched')
+    if engine == resolved_source or resolved_source in engine.parents or engine in resolved_source.parents:
+        raise ValueError('engine and private source must be independent')
+    action = request.get('action')
+
+    def git(*args):
+        env = dict(os.environ, GIT_TERMINAL_PROMPT='0')
+        result = subprocess.run(['git', *args], capture_output=True, text=True, env=env)
+        if result.returncode:
+            raise ValueError('source: Git operation failed; checkout retained; verify access and retry')
+        return result.stdout.strip()
+
+    def checked():
+        root = git('-C', str(source), 'rev-parse', '--show-toplevel')
+        if Path(root).resolve() != source.resolve():
+            raise ValueError('source: private source must be the Git checkout root')
+        git('-C', str(source), 'remote', 'get-url', 'origin')
+        try:
+            contract.check(engine, source)
+        except (OSError, ValueError, KeyError, TypeError):
+            raise ValueError('source: incompatible or missing contract; checkout retained for review') from None
+        return {'exists': True, 'valid': True}
+
+    if action == 'detect':
+        if not source.exists():
+            return {'exists': False, 'valid': False}
+        try:
+            return checked()
+        except ValueError:
+            return {'exists': True, 'valid': False}
+    if action == 'continue':
+        return checked()
+    if action == 'backup-plan':
+        from datetime import datetime, timezone
+        info = source.stat()
+        if not source.is_dir():
+            raise ValueError('source: existing source is not a directory; left untouched')
+        backup = str(source) + '.backup-' + datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S.%fZ')
+        plan = {'source': str(source), 'device': info.st_dev, 'inode': info.st_ino,
+                'backup': backup + '/checkout'}
+        return {'exists': True, 'backup': plan['backup'], 'plan': plan}
+    if action == 'replace':
+        plan = request.get('plan')
+        if not isinstance(plan, dict) or set(plan) != {'source', 'device', 'inode', 'backup'}:
+            raise ValueError('source: exact backup confirmation required')
+        backup = plan.get('backup')
+        prefix = re.escape(str(source)) + r'\.backup-\d{8}T\d{6}\.\d{6}Z/checkout'
+        info = source.stat()
+        if (plan['source'] != str(source) or not isinstance(backup, str)
+                or not re.fullmatch(prefix, backup)
+                or (info.st_dev, info.st_ino) != (plan['device'], plan['inode'])):
+            raise ValueError('source: stale backup confirmation; review again; original retained')
+        destination = Path(backup)
+        safe_path(destination)
+        # Exclusive reservation avoids overwriting even an empty backup directory.
+        # Failed operations retain the reservation as well as the original.
+        destination.parent.mkdir(mode=0o700)
+        source.rename(destination)
+        return {'exists': False, 'valid': False, 'backup': backup}
+    if action not in ('clone', 'new'):
+        raise ValueError('source: unsupported action')
+    try:
+        url = validate_source_url(request.get('url'))
+    except ValueError as error:
+        raise ValueError('source: ' + str(error)) from None
+    # The interactive source flow accepts only network URLs. Local URLs remain
+    # supported by the existing scriptable --url interface.
+    if not (url.startswith(('https://', 'ssh://', 'git@'))):
+        raise ValueError('source: use a credential-free HTTPS or SSH URL')
+    if source.exists():
+        raise ValueError('source: checkout already exists; Continue or confirm Replace first')
+    source.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
+    source.mkdir(mode=0o700)
+    if action == 'clone':
+        git('clone', '--', url, str(source))
+    else:
+        git('init', str(source))
+        git('-C', str(source), 'remote', 'add', 'origin', url)
+        # Empty declarative source, not a hosting repository, commit, or apply.
+        (source / 'home').mkdir()
+        (source / 'home/.gitkeep').touch()
+        (source / 'manifest.json').write_text(json.dumps({'version': 1, 'entries': {}, 'profiles': {}}) + '\n')
+        (source / 'dot-contract.json').write_text(json.dumps({
+            'protocol': 1, 'engine_api': {'min': 1, 'max': 1}, 'manifest_version': 1,
+            'approval_version': 2, 'manifest': 'manifest.json', 'home_source': 'home',
+            'required_adapters': ['intent', 'scope', 'gitconfig', 'skills', 'layout']}) + '\n')
+    # --get reads the configured URL, not a Git insteadOf transport rewrite.
+    if git('-C', str(source), 'config', '--get', 'remote.origin.url') != url:
+        raise ValueError('source: origin verification failed; checkout retained for review')
+    return checked()
 
 
 def ensure_source(source, engine, url):

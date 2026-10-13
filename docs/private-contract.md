@@ -18,6 +18,21 @@ dot contract check --engine "$DOT_ENGINE" --source "$DOT_SOURCE"
 dot init --check
 ```
 
+The init TUI connects a credential-free HTTPS or SSH source using system Git.
+Existing users clone, then verify the configured origin and contract. New users
+create an empty repository on their own hosting platform; dot only initializes
+local Git, adds origin, and writes an empty declarative contract/manifest. It
+does not create a hosting repository, commit, push, configure the tracker, or
+adopt files during source setup. URL input is hidden and cleared on submission;
+credentials, query parameters, and fragments are rejected without echoing them.
+
+Existing local directories offer Continue or Replace. Replace requires a second
+confirmation displaying the exact timestamped backup path, defaults to Cancel,
+and moves the entire checkout (including dirty/untracked files and `.git`) into
+an exclusively created sibling `dot-config.backup-<UTC timestamp>/checkout`.
+Nothing is deleted or overwritten. Failed clone/contract checks retain their
+checkout for inspection; retry through Continue or backup-first Replace.
+
 Required public adapters are `intent`, `scope`, `gitconfig`, `skills`, and
 `layout`, mapped to Python modules by `engine.json`. Private native ignore,
 removal, bounded Git and skills controls must resolve this same explicit engine

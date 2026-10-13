@@ -16,7 +16,7 @@ PUBLIC = ('README.md', 'bootstrap.sh', 'install.sh', 'scripts/create-private-rep
 BUILD = ('scripts/export-public.py', 'scripts/build-release.py', 'scripts/check-release.py',
          'scripts/restore-release-executables.py')
 WORKFLOWS = ('.github/workflows/release.yml',)
-GO = ('go.mod', 'go.sum', 'client.go', 'json.go', 'model.go', 'packages.go', 'cmd/dot-browser/main.go')
+GO = ('go.mod', 'go.sum', 'client.go', 'json.go', 'model.go', 'packages.go', 'source.go', 'cmd/dot-browser/main.go')
 
 
 def export(output):
