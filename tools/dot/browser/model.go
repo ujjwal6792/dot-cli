@@ -56,6 +56,7 @@ type model struct {
 	engine                           Engine
 	entries                          []Entry
 	profiles                         []Profile
+	machines                         []string
 	inventoryReady                   bool
 	presetPending                    bool
 	visible                          []int
@@ -64,6 +65,8 @@ type model struct {
 	metadataEdits                    map[string]map[string]any
 	mode                             string
 	profile                          string
+	selectedProfiles                 []string
+	adoptTouched                     bool
 	hidden                           bool
 	search                           textinput.Model
 	searching                        bool
@@ -267,6 +270,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentOS = value.value.OS
 			m.entries = value.value.Entries
 			m.profiles = value.value.Profiles
+			m.machines = value.value.Machines
 			m.filter()
 			if m.presetPending {
 				m.openPresets()
@@ -408,6 +412,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selected = nil
 			m.unsafeAck, m.desktopAck, m.backupAck = false, false, false
 			m.profile = "default"
+			m.selectedProfiles = nil
+			m.adoptTouched = false
 			m.search.SetValue("")
 			m.searching = false
 			m.cursor = 0
@@ -453,7 +459,6 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			case "enter":
 				if len(m.profiles) > 0 {
 					profile := m.profiles[m.presetChoice]
-					m.basket = map[string]map[string]any{}
 					m.logicalRequest = nil
 					m.generation++
 					for _, entry := range m.entries {
@@ -465,8 +470,18 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 						}
 					}
 					m.profile = profile.Name
+					found := false
+					for _, name := range m.selectedProfiles {
+						if name == profile.Name {
+							found = true
+						}
+					}
+					if !found {
+						m.selectedProfiles = append(m.selectedProfiles, profile.Name)
+					}
+					sort.Strings(m.selectedProfiles)
 					m.stage = ""
-					m.message = fmt.Sprintf("Selected exact preset %s (%d visible entries); no apply consent.", profile.Name, len(m.basket))
+					m.message = fmt.Sprintf("Composed profiles %s (%d exact entries); Space deselects locally; no apply consent.", strings.Join(m.selectedProfiles, " + "), len(m.basket))
 				}
 			}
 			return m, nil
@@ -598,6 +613,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 			}
 		case "tab":
+			return m.retargetCurrent()
+		case "shift+tab":
+			m.selectedProfiles = nil
+			m.adoptTouched = false
 			m.logicalRequest = nil
 			if m.mode == "track" {
 				m.mode = "adopt"
@@ -614,6 +633,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			return m, m.loadInventory
 		case "u":
+			m.selectedProfiles = nil
+			m.adoptTouched = false
 			m.logicalRequest = nil
 			if m.mode == "untrack" {
 				m.mode = "track"
@@ -698,7 +719,10 @@ func (m *model) highlightCurrent() tea.Cmd {
 		for k, v := range selected {
 			selection[k] = v
 		}
-		allowed := map[string]bool{"path": true, "destination": true, "os": true, "portability": true, "impact": true, "template": true, "tools": true, "removals": true, "warnings": true, "integrations": true, "requires": true, "notices": true, "git_keys": true}
+		allowed := map[string]bool{"path": true, "destination": true, "os": true, "portability": true, "impact": true, "template": true, "tools": true, "removals": true, "warnings": true, "integrations": true, "requires": true, "notices": true, "git_keys": true, "machines": true}
+		if selection["logical"] != nil {
+			allowed = map[string]bool{"path": true, "logical": true, "destinations": true, "common": true, "machine": true, "os_metadata": true, "machines": true, "template": true}
+		}
 		for k := range selection {
 			if !allowed[k] {
 				delete(selection, k)
@@ -786,6 +810,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 	entry := m.entries[i]
 	if entry.Kind == "directory" {
 		if m.mode == "adopt" {
+			m.adoptTouched = true
 			// Freeze the currently inventoried file IDs, not a recursive path or
 			// profile: later repository entries never acquire implicit consent.
 			children := []Entry{}
@@ -830,11 +855,17 @@ func (m *model) toggleCurrent() tea.Cmd {
 		return nil
 	}
 	if _, exists := m.basket[entry.Path]; exists {
+		if m.mode == "adopt" {
+			m.adoptTouched = true
+		}
 		delete(m.basket, entry.Path)
 		m.generation++
 		return nil
 	}
 	if m.mode == "adopt" || m.mode == "untrack" {
+		if m.mode == "adopt" {
+			m.adoptTouched = true
+		}
 		id := entry.ID
 		item := map[string]any{"path": entry.Path, "id": id}
 		for k, v := range entry.Metadata {
@@ -917,7 +948,7 @@ func (m *model) beginEdit(entry Entry) {
 }
 
 func (m *model) plan() tea.Cmd {
-	if len(m.basket) == 0 && m.logicalRequest == nil {
+	if len(m.basket) == 0 && m.logicalRequest == nil && !(m.mode == "adopt" && (m.adoptTouched || len(m.selectedProfiles) > 0)) {
 		m.message = "Select at least one exact eligible file."
 		return nil
 	}
@@ -931,11 +962,18 @@ func (m *model) plan() tea.Cmd {
 		selections = append(selections, cloneMetadata(m.basket[p]))
 	}
 	request := map[string]any{"version": 1, "mode": m.mode, "profile": m.profile}
+	if m.mode == "adopt" && len(m.selectedProfiles) > 1 {
+		request["profiles"] = append([]string{}, m.selectedProfiles...)
+	}
 	if m.mode == "track" {
-		allowed := map[string]bool{"path": true, "destination": true, "os": true, "portability": true, "impact": true, "template": true, "tools": true, "removals": true, "warnings": true, "integrations": true, "requires": true, "notices": true, "git_keys": true}
+		allowed := map[string]bool{"path": true, "destination": true, "os": true, "portability": true, "impact": true, "template": true, "tools": true, "removals": true, "warnings": true, "integrations": true, "requires": true, "notices": true, "git_keys": true, "machines": true}
 		for _, selection := range selections {
+			fields := allowed
+			if selection["logical"] != nil {
+				fields = map[string]bool{"path": true, "logical": true, "destinations": true, "common": true, "machine": true, "os_metadata": true, "machines": true, "template": true}
+			}
 			for key := range selection {
-				if !allowed[key] {
+				if !fields[key] {
 					delete(selection, key)
 				}
 			}
@@ -1289,7 +1327,7 @@ func (m model) render() string {
 	}
 	if m.stage == "preset" {
 		var b strings.Builder
-		b.WriteString("OPT-IN EXACT REPOSITORY PRESET\nNo apply consent\n\n")
+		b.WriteString("OPT-IN EXACT REPOSITORY PRESET · COMPOSE PROFILES\nUnion of flat lists · Space deselects locally after selection · no apply consent\n\n")
 		for i, p := range m.profiles {
 			mark := "  "
 			if i == m.presetChoice {
@@ -1324,12 +1362,12 @@ func (m model) render() string {
 	if m.rounds {
 		header += "\n" + muted.Render("Optional rounds · Finish without selection")
 	}
-	footer := fmt.Sprintf("%d selected · %s · H hidden %t · / search · Space select · e metadata · M logical metadata · u stop tracking · p preview · Tab direction · q quit", len(m.basket), m.mode, m.hidden)
+	footer := fmt.Sprintf("%d selected · %s · H hidden %t · / search · Space select · e metadata · M logical metadata · u stop tracking · p preview · Tab machines · Shift+Tab direction · s profiles · q quit", len(m.basket), m.mode, m.hidden)
 	if m.width < 100 {
-		footer = fmt.Sprintf("%d selected · %s · H hidden · Space select · p preview · J/K scroll · q quit", len(m.basket), m.mode)
+		footer = fmt.Sprintf("%d selected · %s · Space select · Tab machines · p preview\nShift+Tab direction · s profiles · H hidden · J/K scroll · q quit", len(m.basket), m.mode)
 	}
 	if m.searching {
-		footer = "Search " + m.search.View() + " · Enter apply filter · Esc cancel"
+		footer = fmt.Sprintf("%d selected · Search %s · Enter apply filter · Esc cancel", len(m.basket), m.search.View())
 	}
 	message := m.message
 	if m.err != nil {
@@ -1339,6 +1377,10 @@ func (m model) render() string {
 		footer += "\n" + message
 	}
 	preview := m.previewCard()
+	if m.width < 100 {
+		m.previewViewport.SetHeight(max(3, min(6, m.height/3)))
+		preview = m.previewCard()
+	}
 	detailLines := m.compactDetail()
 	var tree strings.Builder
 	modeLabel := strings.ToUpper(m.mode)
@@ -1408,6 +1450,9 @@ func (m model) render() string {
 			fmt.Fprintf(&detail, "OS applicability: %s\n", safeTerminal(e.OSStatus))
 		}
 		fmt.Fprintf(&detail, "Approved scope: %t\n", e.Approved)
+		if _, ok := e.Metadata["machines"]; !ok {
+			detail.WriteString("Machines: all\n")
+		}
 		if e.Destination != "" {
 			fmt.Fprintf(&detail, "Destination: %s\n", safeTerminal(e.Destination))
 		}
@@ -1449,6 +1494,18 @@ func (m model) compactDetail() []string {
 	if i := m.current(); i >= 0 {
 		e := m.entries[i]
 		lines = append(lines, safeTerminal(e.Path), "Status: "+safeTerminal(e.Status))
+		values := e.Metadata
+		if selected, ok := m.basket[e.Path]; ok {
+			values = selected
+		}
+		machines := "all"
+		if assignment, ok := values["machines"].(map[string]any); ok {
+			machines = strings.Join(metadataList(assignment["include"]), ",")
+			if excluded := metadataList(assignment["exclude"]); len(excluded) > 0 {
+				machines += " except " + strings.Join(excluded, ",")
+			}
+		}
+		lines = append(lines, "Machines: "+safeTerminal(machines))
 		if e.TargetStatus != "" {
 			lines = append(lines, "Target file: "+safeTerminal(e.TargetStatus))
 		}
