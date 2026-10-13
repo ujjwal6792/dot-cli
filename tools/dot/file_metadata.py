@@ -9,6 +9,8 @@ import state_paths
 SYSTEMS = {'darwin', 'linux'}
 FIELDS = {'portability', 'impact', 'tools', 'removals', 'hooks', 'warnings',
           'integrations', 'requires', 'notices'}
+CUSTOM_FIELDS = {'os', 'impact', 'removals', 'tools', 'warnings', 'integrations',
+                 'requires', 'notices', 'git_keys'}
 
 
 def current_os():
@@ -36,6 +38,26 @@ def machine_identifier(value):
         return machine_id(value)
     except ValueError:
         return identifier(value)
+
+
+def assignment(value):
+    if not isinstance(value, dict) or set(value) != {'include', 'exclude'}:
+        raise ValueError('assignment: expected only include and exclude lists')
+    for field in ('include', 'exclude'):
+        members = value[field]
+        if not isinstance(members, list) or any(not isinstance(m, str) for m in members):
+            raise ValueError('assignment: include and exclude must be lists of machine ids')
+        if len(set(members)) != len(members):
+            raise ValueError('assignment: duplicate machine id')
+        for member in members:
+            if member != 'all':
+                try:
+                    machine_identifier(member)
+                except ValueError as error:
+                    raise ValueError('assignment: invalid machine id; all is the only wildcard') from error
+    if not value['include']:
+        raise ValueError('assignment: include must not be empty; use all or explicit machine ids')
+    return value
 
 
 def machine_setup(home, data, request):
@@ -117,7 +139,7 @@ def identity(home, data):
     if not isinstance(record, dict) or set(record) != {'version', 'id'} or type(record['version']) is not int or record['version'] != 1:
         raise ValueError('invalid explicit machine identity')
     key = machine_identifier(record['id'])
-    if path.stat().st_mode & 0o7777 != 0o600 or key not in data['machines']:
+    if path.stat().st_mode & 0o7777 != 0o600 or key not in data.get('machines', {}):
         raise ValueError('unknown or insecure explicit machine identity')
     machine = data['machines'][key]
     if machine['os'] != current_os():
@@ -140,6 +162,8 @@ def compile_entries(logical, definition, machine_id=None):
         if machine_id is not None:
             values.update(definition['machine'].get(machine_id, {}))
         values.update(definition['os_metadata'].get(system, {}))
+        if isinstance(definition['machines'], dict):
+            values['machines'] = assignment(definition['machines'])
         source = definition['sources'][system]
         relative(destination)
         result[logical + '@' + system] = metadata(dict(values, destination=destination, source=source, os=[system]))
@@ -173,7 +197,9 @@ def validate(data):
             for value in definition[field].values():
                 layer(value)
         members = definition['machines']
-        if not isinstance(members, list) or any(m not in data['machines'] for m in members) or len(set(members)) != len(members):
+        if isinstance(members, dict):
+            assignment(members)
+        elif not isinstance(members, list) or any(m not in data['machines'] for m in members) or len(set(members)) != len(members):
             raise ValueError('unknown machine applicability')
         compiled = compile_entries(logical, definition)
         for key, entry in compiled.items():
@@ -186,22 +212,33 @@ def validate(data):
 
 
 def entries(data, home):
-    if data['version'] == 1:
-        return data['entries']
-    machine = identity(home, data)
+    import scope
+    from intent import metadata
     result = dict(data['entries'])
-    for logical, definition in data['tracking'].items():
-        result.update(compile_entries(logical, definition, machine['id']))
+    if data['version'] == 2:
+        machine = identity(home, data)
+        for logical, definition in data['tracking'].items():
+            result.update(compile_entries(logical, definition, machine['id']))
+    state = scope.load(home)
+    for key, changes in (state or {}).get('customs', {}).items():
+        if key in result:
+            result[key] = metadata(dict(result[key], **changes))
     return result
 
 
 def applicable(data, home, key):
+    assigned = data['entries'][key].get('machines')
+    if assigned and assigned != {'include': ['all'], 'exclude': []}:
+        machine = identity(home, data)['id']
+        if ('all' in assigned['exclude'] or machine in assigned['exclude'] or
+                ('all' not in assigned['include'] and machine not in assigned['include'])):
+            return False
     if data['version'] == 1:
         return True
     machine = identity(home, data)
     for logical, definition in data['tracking'].items():
         if key in compile_entries(logical, definition):
-            return not definition['machines'] or machine['id'] in definition['machines']
+            return isinstance(definition['machines'], dict) or not definition['machines'] or machine['id'] in definition['machines']
     return True
 
 
@@ -275,11 +312,25 @@ def track(root, home, data, selection, selected, inputs, actions):
                   'sources': {system: intent.source_name(dest, template, bool(mode & 0o111), template or not bool(mode & 0o044)) for system, dest in destination_map.items()},
                   'common': common, 'machine': selection.get('machine', old['machine'] if old else {}),
                   'os_metadata': selection.get('os_metadata', old['os_metadata'] if old else {}),
-                  'machines': selection.get('machines', old['machines'] if old else [])}
+                  'machines': selection.get('machines', old['machines'] if old else {'include': ['all'], 'exclude': []})}
     existing = set()
     if old:
-        if old['machines'] and machine['id'] not in old['machines']:
+        if isinstance(old['machines'], list) and old['machines'] and machine['id'] not in old['machines']:
             raise ValueError('entry is not applicable to this explicit machine')
+        if (destination_map == old['destinations'] and
+                all(definition[field] == old[field] for field in ('common', 'machine', 'os_metadata'))):
+            # Same exact logical file: assignment/content changes belong to Track,
+            # and do not grant any local adoption or new OS destinations.
+            definition['sources'] = dict(old['sources'])
+            data['tracking'][logical] = definition
+            compiled = compile_entries(logical, definition)
+            data['entries'].update(compiled)
+            entry = compiled[logical + '@' + machine['os']]
+            source = intent.bounded(root, entry['source'])
+            actions.append({'path': entry['source'], 'before': intent.file_state(source), 'text': text, 'remove': False})
+            validate(data)
+            selected.update(compile_entries(logical, definition, machine['id']))
+            return
         if (not set(old['destinations']) < set(destination_map) or
                 any(destination_map.get(system) != dest for system, dest in old['destinations'].items()) or
                 any(definition[field] != old[field] for field in ('common', 'machine', 'machines')) or
@@ -339,7 +390,7 @@ def edit(root, home, data, changes, state, actions, selected, inputs):
         if logical not in data['tracking'] or not isinstance(change, dict) or set(change) - {'destinations', 'common', 'machine', 'os_metadata', 'machines'}:
             raise ValueError('unsupported logical metadata edit')
         old = data['tracking'][logical]
-        if old['machines'] and machine['id'] not in old['machines']:
+        if isinstance(old['machines'], list) and old['machines'] and machine['id'] not in old['machines']:
             raise ValueError('entry is not applicable to this explicit machine')
         old_entries = compile_entries(logical, old)
         updated = dict(old, **change)
