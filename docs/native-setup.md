@@ -44,8 +44,8 @@ nothing is automatically adopted, committed or pushed.
 | `--name` | `Name` | Tracker-only fallback when Git user.name is unset |
 | `--email` | `Email` | Tracker-only fallback when Git user.email is unset |
 
-Flags bind values only. **`cmd/dot` routing is intentionally owned by #18 and
-has not been implemented in this ticket.** #18 registers action flags itself:
+Flags bind values only. **`cmd/dot` routing is delivered by #18**, documented in
+[native-distribution.md](native-distribution.md). The router registers action flags:
 `init --check` calls `engine.Check(ctx)` and prints its `old-user`/`new-user`
 verdict or a meaningful failure. It must not install dependencies, create any
 directories, or conflate an invalid existing checkout with a new user.

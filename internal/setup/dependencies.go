@@ -9,6 +9,7 @@ import (
 	"regexp"
 	"strings"
 
+	"github.com/ujjwal6792/dots-cli/internal/distribution"
 	"github.com/ujjwal6792/dots-cli/internal/native"
 	"github.com/ujjwal6792/dots-cli/internal/tui"
 )
@@ -76,16 +77,14 @@ func (e *Engine) dependencies(ctx context.Context) (tui.DependencyResult, depend
 	p := dependencyPlan{Missing: []string{}, Commands: []command{}, Paths: map[string]string{}}
 	p.Environment = hash(encode(managerEnv()))
 	p.UID = os.Geteuid()
-	for _, tool := range []struct{ name, path, link, prefix string }{
-		{"git", e.options.Git, "https://git-scm.com/", "git version "},
-		{"chezmoi", e.options.Chezmoi, "https://www.chezmoi.io/", "chezmoi version "},
+	for _, tool := range []struct{ name, path, link string }{
+		{"git", e.options.Git, "https://git-scm.com/"},
+		{"chezmoi", e.options.Chezmoi, "https://www.chezmoi.io/"},
 	} {
 		resolved, err := binary(tool.path, tool.name)
 		p.Paths[tool.name] = resolved
 		if err == nil {
-			c := exec.CommandContext(ctx, resolved, "--version")
-			b, er := c.Output()
-			if er == nil && strings.HasPrefix(string(b), tool.prefix) {
+			if distribution.CheckTool(ctx, resolved, tool.name) == nil {
 				continue
 			}
 			out.Rows = append(out.Rows, tui.DependencyRow{Tool: tool.name, Link: tool.link, Problem: "existing executable is incompatible; repair manually (never overwritten)"})
