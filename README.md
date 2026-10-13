@@ -65,6 +65,8 @@ repository; Adopt writes exact repository entries to this machine. Nothing is
 preselected. Space selects, `e` edits metadata, `M` opens logical-file metadata,
 Tab retargets machines in Track, Shift+Tab changes direction, `s` composes Adopt
 profiles, `p` previews, and `a` enters Cancel-default final confirmation.
+Use your terminal's paste/copy shortcut; dot accepts bracketed paste and does
+not launch system clipboard helpers for Ctrl+V/Ctrl+Shift+C.
 Unsafe (`u`), desktop (`d`) and applicable backup replacement (`b`) gates are
 independent. Every changed input requires a fresh plan.
 

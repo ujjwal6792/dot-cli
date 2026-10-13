@@ -141,7 +141,8 @@ func (h harness) setupKeyboard(home, url, id, action string) error {
 	} else {
 		steps = append(steps, keyboardStep{"\r", "Input hidden"})
 	}
-	steps = append(steps, keyboardStep{url + "\r", "Source connected and contract-checked"})
+	steps = append(steps, keyboardStep{"\x16", "terminal paste/copy shortcut"})
+	steps = append(steps, keyboardStep{"\x1b[200~" + url + "\x1b[201~\r", "Source connected and contract-checked"})
 	steps = append(steps, setupTail(id)...)
 	if err := h.keyboard(home, "keyboard-"+id, steps); err != nil {
 		return err

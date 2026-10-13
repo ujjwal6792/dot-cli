@@ -53,6 +53,16 @@ func TestMachineFormValidatesBeforeSubmitting(t *testing.T) {
 	}
 }
 
+func TestSourceInputUsesTerminalPasteWithoutClipboardHelpers(t *testing.T) {
+	m := sendAndRun(NewInitModel(&sourceFixture{}), "enter")
+	m = sendAndRun(m, "j")
+	m = sendAndRun(m, "enter")
+	next, cmd := m.Update(tea.KeyPressMsg{Code: 'v', Mod: tea.ModCtrl})
+	if cmd != nil || !strings.Contains(next.View().Content, "terminal paste") {
+		t.Fatal("source input attempted an external clipboard helper")
+	}
+}
+
 func TestSourcePendingOperationCannotBeSubmittedTwice(t *testing.T) {
 	e := &sourceFixture{}
 	m, cmd := NewInitModel(e).Update(key("enter"))
