@@ -2,7 +2,8 @@
 
 Public reusable `dot` CLI, safety engine, prebuilt configuration browser and
 agent interaction skills for `ujjwal6792/dots-cli`. The private source of truth
-is `ujjwal6792/dotfiles`; no private manifests, configuration, credentials,
+is your own private repository (passed via `--source-url` or `--repository`);
+no private manifests, configuration, credentials,
 history, machine inventories, approvals or recovery backups belong here.
 
 This is a staged review candidate, not a claim that a new release is published.
@@ -66,8 +67,10 @@ bash bootstrap.sh --help
 
 Use immutable reviewed platform asset URLs and independently reviewed SHA-256
 values. Compare checksums before executing downloaded code. A checksum fetched
-beside an untrusted artifact is not publisher identity/provenance. Interactive
-questions use `/dev/tty`; `--yes` is explicit installer consent only. This legacy
+beside an untrusted artifact is not publisher identity/provenance. `dot init`
+is non-interactive and never assumes a repository: it stops with guidance
+unless an explicit `--url` is given, and only the prebuilt browser (`--rounds`
+/ `browse`) owns a terminal; `--yes` is explicit installer consent only. This legacy
 bootstrap remains for existing Git/config installations. New public CLI installs
 should use `install.sh` above. It does not install dependencies or create a
 chezmoi tracker (the installer does not install dependencies or create a
@@ -185,14 +188,14 @@ Dotfiles Track/Adopt, self-update and migration have no package-install or
 tracker-creation effects. Packages is the browser's separately gated install
 entrypoint below. `--replace-chezmoi` is not a bootstrap repair/retirement shortcut.
 
-After initialization, init offers **Finish** (default), `packages` (separately
-reviewed Install missing with exact plan-ID consent), and `rounds` (prebuilt
-Track/Adopt browser). `dot init --rounds` enters optional rounds after setup;
-`--profile personal|work` chooses only new tracker machine data, not adoption scope.
-Init has no blanket `--yes`. Each dependency gets its own reviewed manager
-operation and default-No consent. Tracker creation separately previews the
-complete config with actual `home/`, HOME, engine, cache/state paths and preserved
-Git identity; private templates/hooks never execute during creation.
+After initialization, init finishes without adopting anything (empty scope is
+not whole-machine parity). `dot init --rounds` enters optional Track/Adopt
+rounds in the prebuilt browser after setup. Init has no blanket `--yes` and no
+`--profile` flag: the tracker records only name, email, engine, and paths, not
+adoption scope. Missing dependencies are reported, never installed: install
+them with the platform package manager and rerun. Tracker creation uses the
+private source Git identity (or `--name`/`--email`, which never change Git
+settings); private templates/hooks never execute during creation.
 
 Separate optional Track and Adopt rounds start with no
 entries selected and **Finish is the default**. Bootstrap `--yes` skips rounds; installing
