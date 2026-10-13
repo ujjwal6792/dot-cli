@@ -31,6 +31,13 @@ approve() {
   TOKEN="$(python3 -c 'import json,sys;print(json.load(open(sys.argv[1]))["id"])' "$PLAN")"
   "$DOT" intent apply "$PLAN" --approve "$TOKEN" "$@"
 }
+local_machine() {
+  python3 - <<'PY' | python3 "$DOT_ENGINE/browser_api.py"
+import json, os
+print(json.dumps(dict(version=1, command='init-machine', engine=os.environ['DOT_ENGINE'],
+    source=os.environ['DOT_SOURCE'], home=os.environ['HOME'], request=dict(action='save', id='fixture_machine'))))
+PY
+}
 
 @test "skills adoption previews exact Gemini output and backs up only approved canonical files" {
   mkdir -p "$HOME/.agents/skills/example" "$HOME/.agents/skills/custom" "$HOME/.gemini/skills/custom"
@@ -114,6 +121,7 @@ approve() {
 }
 
 @test "skill retirement removes only separately approved exact files preserving silo runtime and future skills" {
+  local_machine
   mkdir -p "$HOME/.agents/skills/old" "$HOME/.codex/skills/old" "$HOME/.config/opencode/skills/old" "$HOME/.gemini/skills/old"
   for root in .agents .codex .config/opencode .gemini; do
     printf 'obsolete\n' > "$HOME/$root/skills/old/SKILL.md"
@@ -176,20 +184,24 @@ approve() {
   [[ "$output" == *'symlink/path escape'* ]]
 }
 
-@test "reviewed Adopt selections commit a reusable exact profile without machine state" {
+@test "reviewed Adopt selections store local exact approval without rewriting shared profiles" {
+  local_machine
+  BEFORE="$(git -C "$DOT_SOURCE" rev-parse HEAD)"
+  cp "$DOT_SOURCE/tools/dot/manifest.json" "$BATS_TEST_TMPDIR/manifest-before"
   printf '{"version":1,"mode":"adopt","profile":"my-skills","entries":["example"]}\n' > "$REQUEST"
   "$DOT" intent plan "$REQUEST" --out "$PLAN"
   approve
-  python3 - "$DOT_SOURCE/tools/dot/manifest.json" <<'PY'
+  python3 - "$HOME/.local/state/dot/adoption.json" <<'PY'
 import json, sys
 d = json.load(open(sys.argv[1]))
-assert d['profiles']['my-skills'] == ['example']
+assert d['version'] == 3 and d['machine']['id'] == 'fixture_machine'
+assert d['profile'] == 'my-skills' and list(d['entries']) == ['example']
 PY
-  [ "$(git -C "$DOT_SOURCE" diff HEAD~ --name-only)" = tools/dot/manifest.json ]
+  cmp "$DOT_SOURCE/tools/dot/manifest.json" "$BATS_TEST_TMPDIR/manifest-before"
+  [ "$(git -C "$DOT_SOURCE" rev-parse HEAD)" = "$BEFORE" ]
   [ -z "$(git -C "$DOT_SOURCE" status --porcelain)" ]
   [ ! -e "$DOT_SOURCE/.local/state/dot" ]
   grep -q 'my-skills' "$HOME/.local/state/dot/adoption.json"
-  git -C "$DOT_SOURCE" log -1 --format=%s | grep -q 'Adopt reviewed configuration'
 }
 
 @test "secret-free Bearer environment references are eligible but literal credential suffixes are rejected" {

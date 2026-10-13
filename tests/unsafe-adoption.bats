@@ -29,7 +29,7 @@ args = sys.argv[1:]
 if args and args[0] == "-B":
     args = args[1:]
     sys.dont_write_bytecode = True
-if args and args[0].endswith("/intent.py"):
+if args and args[0].endswith(("/intent.py", "/scope.py", "/browser_api.py", "/skills.py", "/gitconfig.py")):
     sys.platform = os.environ["FIXTURE_OS"]
     sys.argv = args
     sys.path.insert(0, os.path.dirname(args[0]))
@@ -52,6 +52,13 @@ approve() {
 }
 native() {
   chezmoi --source "$DOT_SOURCE/home" --destination "$HOME" --config "$DOT_CONFIG" --override-data "{\"chezmoi\":{\"os\":\"$FIXTURE_OS\"}}" "$@"
+}
+local_machine() {
+  python3 - <<'PY' | python3 "$DOT_ENGINE/browser_api.py"
+import json, os
+print(json.dumps(dict(version=1, command='init-machine', engine=os.environ['DOT_ENGINE'],
+    source=os.environ['DOT_SOURCE'], home=os.environ['HOME'], request=dict(action='save', id='fixture_machine'))))
+PY
 }
 
 @test "Unsafe shell selection adds simple gt aliases for Bash and Zsh on both OSes only after consent" {
@@ -301,6 +308,7 @@ GIT
 }
 
 @test "Git key subsets preserve unselected identity and payload additions remain opt-in" {
+  local_machine
   printf '[user]\nname = Local\nemail = keep@example.org\n' > "$HOME/.gitconfig"
   printf '{"version":1,"mode":"adopt","profile":"fixture","entries":[".gitconfig"],"metadata":{".gitconfig":{"git_keys":["user.name"]}}}\n' > "$REQUEST"
   "$DOT" intent plan "$REQUEST" --out "$PLAN"
