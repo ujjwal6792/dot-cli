@@ -437,6 +437,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.templateInput.SetWidth(max(20, value.Width-8))
 		m.templateInput.SetHeight(max(4, value.Height-10))
 	case tea.KeyPressMsg:
+		// Bubbles/Huh system-clipboard shortcuts invoke platform helpers. Dot
+		// instead accepts the terminal's bracketed PasteMsg, keeping runtime
+		// dependencies confined to Git/chezmoi and explicitly approved managers.
+		if value.String() == "ctrl+v" || value.String() == "ctrl+shift+c" {
+			m.message = "Use your terminal paste/copy shortcut; dot does not run clipboard helpers."
+			return m, nil
+		}
 		if value.String() == "ctrl+c" {
 			if m.setupCancel != nil {
 				m.setupCancel()
