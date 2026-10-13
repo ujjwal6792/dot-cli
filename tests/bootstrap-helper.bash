@@ -96,7 +96,7 @@ case "$1" in
     if [ -e "$HOME/gh-installed" ] || [ -e "$HOME/bottle-gh" ]; then echo 'gh version 2.80.0'; else echo "gh version ${FAKE_GH_VERSION:-2.80.0}"; fi ;;
   api)
     [ "${API_STILL_DENIED:-no}" != yes ] && { [ "${ACCESS_DENIED:-no}" != yes ] || [ -e "$HOME/logged-in" ]; } || exit 1
-    printf '{"full_name":"%s","private":%s,"default_branch":"main"}\n' "${FAKE_REPO_IDENTITY:-ujjwal6792/dotfiles}" "${FAKE_REPO_PRIVATE:-true}" ;;
+    printf '{"full_name":"%s","private":%s,"default_branch":"main"}\n' "${FAKE_REPO_IDENTITY:-fixture-owner/fixture-private}" "${FAKE_REPO_PRIVATE:-true}" ;;
   auth)
     case "$2" in
       login)

@@ -239,14 +239,13 @@ load bootstrap-helper
 
 @test "private repository identity and visibility must match before cloning" {
   export FAKE_REPO_IDENTITY=unrelated/reused-name
-  run install_dot --yes
+  run bash "$BOOT" --yes --repository fixture/expected-name --engine-url "$FIXTURE_ENGINE_REMOTE"
   [ "$status" -ne 0 ]
   [[ "$output" == *'identity/visibility mismatch'* ]]
   [ ! -e "$HOME/.local/share/dot-cli" ]
   [ ! -e "$HOME/.local/share/dot-config" ]
-  unset FAKE_REPO_IDENTITY
-  export FAKE_REPO_PRIVATE=false
-  run install_dot --yes
+  export FAKE_REPO_IDENTITY=fixture/expected-name FAKE_REPO_PRIVATE=false
+  run bash "$BOOT" --yes --repository fixture/expected-name --engine-url "$FIXTURE_ENGINE_REMOTE"
   [ "$status" -ne 0 ]
   [[ "$output" == *'identity/visibility mismatch'* ]]
   [ ! -e "$HOME/.local/bin/dot" ]

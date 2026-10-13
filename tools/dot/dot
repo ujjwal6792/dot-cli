@@ -28,12 +28,21 @@ case "${1:-}" in
   --help|-h|help)
     cat <<'EOF'
 dot — independent configuration CLI
-usage: dot init [--check] [--source ABS] [--config ABS] [--rounds] [--profile personal|work]
+usage: dot init [--check] [--source ABS] [--config ABS] [--rounds] [--url URL] [--name NAME] [--email EMAIL]
        dot --version | dot --help
-       dot status | diff | pull | self-update | browse | …
+       dot status | diff [--direction repo-to-machine|machine-to-repo] | push --message TEXT
+       dot pull [--yes] | self-update [--yes] | browse
+       dot add --class shared|templated|os-only [--os darwin|linux] PATH | remove PATH
+       dot update NAME VERSION | run NAME [ARGS...] | doctor
+       dot scope init|show|catalog|expand GROUP... [--yes] [--ack-unsafe] [--ack-desktop]
+       dot intent rounds|pick [--mode track|adopt]|inventory PATH|plan REQUEST --out PLAN|preview PLAN|apply PLAN --approve ID [--ack-unsafe] [--ack-desktop] [--replace-skills-backup]
+       dot layout plan --out PLAN|apply PLAN --approve ID
+       dot contract check | migrate
 
 Help and version are independent of Python and private configuration. `dot init
 --check` performs read-only prerequisite, connection, and tracker detection.
+With no arguments, use `dot browse` for the interactive browser or one of the
+verbs above; only plumbing stays outside the app.
 EOF
     exit 0 ;;
   --version|version)
@@ -85,7 +94,7 @@ if [ "${1:-}" = init ]; then
     else
       echo 'Python 3.11+: missing; install it using your platform package manager, then rerun dot init. No dependency was installed.'
     fi
-    for requirement in bash git curl gh python3 chezmoi gum; do
+    for requirement in bash git curl python3 chezmoi; do
       if command -v "$requirement" >/dev/null 2>&1; then
         printf 'Requirement %s: available\n' "$requirement"
       else
