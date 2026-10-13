@@ -1,245 +1,57 @@
-name: Publish reviewed release
+name: Release
 
 on:
-  workflow_dispatch:
-    inputs:
-      approved_version:
-        description: Explicit owner-selected new version (v0.1.0-rc.N)
-        required: true
-        type: string
-
-concurrency:
-  group: release-${{ inputs.approved_version }}
-  cancel-in-progress: false
+  push:
+    tags:
+      - 'v*'
 
 permissions:
-  contents: read
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
 
 jobs:
-  verify:
-    if: github.repository == 'ujjwal6792/dots-cli'
-    runs-on: macos-14
-    timeout-minutes: 45
+  release:
+    runs-on: ubuntu-latest
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      CGO_ENABLED: '0'
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
+      - uses: actions/setup-go@v7
         with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: tools/dot/browser/go.mod
-          cache-dependency-path: tools/dot/browser/go.sum
-      - name: Check dispatch, current main, and monotonic version
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_EVENT_NAME: ${{ github.event_name }}
-          GH_REF: ${{ github.ref }}
-          GH_SHA: ${{ github.sha }}
-          GH_TOKEN: ${{ github.token }}
-          APPROVED_VERSION: ${{ inputs.approved_version }}
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+      - name: Build release archives
+        shell: bash
         run: |
-          git fetch --force origin main --tags
-          CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list)"
-          python3 scripts/release-gate.py \
-            --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
-            --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
-            --version "$APPROVED_VERSION" --existing-tags "$EXISTING_VERSIONS"
-      - name: Install isolated test tools
-        run: brew install bats-core chezmoi gitleaks gum tmux zsh
-      - name: Run public test suite
-        run: ./scripts/run-tests.sh all
-      - name: Scan complete public Git history
-        run: gitleaks git --redact --log-opts='--all' .
-
-  build:
-    needs: verify
-    if: github.repository == 'ujjwal6792/dots-cli'
-    runs-on: ubuntu-24.04
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: tools/dot/browser/go.mod
-          cache-dependency-path: tools/dot/browser/go.sum
-      - name: Recheck dispatch and current main before building
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_EVENT_NAME: ${{ github.event_name }}
-          GH_REF: ${{ github.ref }}
-          GH_SHA: ${{ github.sha }}
-          GH_TOKEN: ${{ github.token }}
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-        run: |
-          git fetch --force origin main --tags
-          CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list)"
-          python3 scripts/release-gate.py \
-            --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
-            --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
-            --version "$APPROVED_VERSION" --existing-tags "$EXISTING_VERSIONS"
-      - name: Build all supported public packages from checked-out main
-        env:
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-        run: |
-          VERSION="${APPROVED_VERSION#v}"
-          python3 scripts/build-release.py --version "$VERSION" --output candidate
-          python3 scripts/build-release.py --version "$VERSION" --output candidate-repeat
-          python3 scripts/check-release.py candidate
-          python3 scripts/check-release.py candidate-repeat
-          for asset in candidate/*; do
-            cmp "$asset" "candidate-repeat/${asset##*/}"
-          done
-      - uses: actions/upload-artifact@v4
-        with:
-          name: verified-release-assets
-          path: candidate/
-          if-no-files-found: error
-          retention-days: 1
-
-  installed-smoke:
-    needs: build
-    if: github.repository == 'ujjwal6792/dots-cli'
-    runs-on: macos-14
-    timeout-minutes: 45
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - uses: actions/setup-go@v5
-        with:
-          go-version-file: tools/dot/browser/go.mod
-          cache-dependency-path: tools/dot/browser/go.sum
-      - name: Recheck dispatch and current main before installed smoke
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_EVENT_NAME: ${{ github.event_name }}
-          GH_REF: ${{ github.ref }}
-          GH_SHA: ${{ github.sha }}
-          GH_TOKEN: ${{ github.token }}
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-        run: |
-          git fetch --force origin main --tags
-          CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list)"
-          python3 scripts/release-gate.py \
-            --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
-            --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
-            --version "$APPROVED_VERSION" --existing-tags "$EXISTING_VERSIONS"
-      - uses: actions/download-artifact@v4
-        with:
-          name: verified-release-assets
-          path: candidate
-      - name: Restore browser executable modes after artifact download
-        env:
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-        run: |
-          VERSION="${APPROVED_VERSION#v}"
-          python3 scripts/restore-release-executables.py candidate "$VERSION"
-      - name: Install isolated smoke-test tools
-        run: brew install bats-core chezmoi gum tmux zsh
-      - name: Verify all archives and exercise the extracted macOS package
-        env:
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-        run: |
-          python3 scripts/check-release.py candidate
-          VERSION="${APPROVED_VERSION#v}"
-          PACKAGE="candidate/dot-cli-${VERSION}-darwin-arm64.tar.gz"
-          mkdir extracted
-          tar -xzf "$PACKAGE" -C extracted
-          mkdir -p "$RUNNER_TEMP/dot-cli-smoke"
-          python3 scripts/accept-installed.py \
-            --release extracted/dot-cli \
-            --temporary-directory "$RUNNER_TEMP/dot-cli-smoke"
-
-  publish:
-    needs: [verify, build, installed-smoke]
-    if: github.repository == 'ujjwal6792/dots-cli'
-    runs-on: ubuntu-24.04
-    permissions:
-      contents: write
-      actions: read
-    steps:
-      - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-          persist-credentials: false
-      - uses: actions/setup-python@v5
-        with:
-          python-version: '3.12'
-      - name: Final main/version gate and existing-release check
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          GH_EVENT_NAME: ${{ github.event_name }}
-          GH_REF: ${{ github.ref }}
-          GH_SHA: ${{ github.sha }}
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          git fetch --force origin main --tags
-          CURRENT_MAIN="$(git ls-remote origin refs/heads/main | cut -f1)"
-          EXISTING_VERSIONS="$(git tag --list)"
-          python3 scripts/release-gate.py \
-            --repository "$GH_REPOSITORY" --event-name "$GH_EVENT_NAME" \
-            --ref "$GH_REF" --sha "$GH_SHA" --current-main "$CURRENT_MAIN" \
-            --version "$APPROVED_VERSION" --existing-tags "$EXISTING_VERSIONS"
-      - uses: actions/download-artifact@v4
-        with:
-          name: verified-release-assets
-          path: candidate
-      - name: Restore browser executable modes after artifact download
-        env:
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-        run: |
-          VERSION="${APPROVED_VERSION#v}"
-          python3 scripts/restore-release-executables.py candidate "$VERSION"
-      - name: Stage verified assets as a draft, then publish atomically
-        env:
-          GH_REPOSITORY: ${{ github.repository }}
-          APPROVED_VERSION: ${{ inputs.approved_version }}
-          GH_TOKEN: ${{ github.token }}
-        run: |
-          python3 scripts/check-release.py candidate
-          cat > release-notes.md <<'NOTES'
-          ## Review and platform notes
-
-          This prerelease was built by GitHub Actions from the exact public `main` commit shown for this release. The archives contain the public CLI only; no private manifest, inventory, credentials, backups, or private history are included.
-
-          Supported packages: macOS Apple Silicon (darwin-arm64), Linux x86_64 (linux-amd64), and Linux ARM64 (linux-arm64). Native Linux installation and package-manager behavior are not provided or implied.
-
-          No credentials or GitHub authentication are bundled. Access to a user's private configuration repository requires that user to authenticate separately with GitHub CLI and have repository access.
-
-          `SHA256SUMS` and `BROWSER_SHA256SUMS` detect accidental corruption and bind the browser to each archive. Checksums are not a cryptographic attestation or independent proof of provenance. Review the workflow run and source commit before installation. The macOS GitHub-hosted installed-package smoke is not native Linux acceptance evidence.
-          NOTES
-          RELEASE_ID="$(python3 scripts/draft-release.py \
-            --repository "$GH_REPOSITORY" --tag "$APPROVED_VERSION" \
-            --target "$GITHUB_SHA" --directory candidate --inspect-only --allow-missing)"
-          if [[ -z "$RELEASE_ID" ]]; then
-            shopt -s nullglob
-            ASSETS=(candidate/*)
-            if ((${#ASSETS[@]} == 0)); then
-              echo 'no release assets found' >&2
-              exit 1
-            fi
-            gh release create "$APPROVED_VERSION" "${ASSETS[@]}" \
-              --target "$GITHUB_SHA" --title "$APPROVED_VERSION" \
-              --notes-file release-notes.md --prerelease --draft
+          if [[ ! "$RELEASE_TAG" =~ ^v[0-9]+\.[0-9]+\.[0-9]+(-[0-9A-Za-z.-]+)?(\+[0-9A-Za-z.-]+)?$ ]]; then
+            echo "Expected a version tag such as v1.2.3 or v1.2.3-rc.1" >&2
+            exit 1
           fi
-          python3 scripts/check-release.py candidate
-          python3 scripts/draft-release.py \
-            --repository "$GH_REPOSITORY" --tag "$APPROVED_VERSION" \
-            --target "$GITHUB_SHA" --directory candidate
+          mkdir -p dist
+          for target in darwin-arm64 linux-amd64 linux-arm64; do
+            stage="$RUNNER_TEMP/dot-release/$target"
+            mkdir -p "$stage"
+            GOOS="${target%-*}" GOARCH="${target#*-}" \
+              go build -trimpath -ldflags "-s -w -X main.version=${RELEASE_TAG#v}" \
+              -o "$stage/dot" ./cmd/dot
+            tar -czf "dist/dot-${RELEASE_TAG#v}-$target.tar.gz" -C "$stage" dot
+          done
+      - name: Generate checksums
+        working-directory: dist
+        run: sha256sum -- *.tar.gz > SHA256SUMS
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        shell: bash
+        run: |
+          flags=()
+          if [[ "${RELEASE_TAG%%+*}" == *-* ]]; then
+            flags+=(--prerelease)
+          fi
+          gh release create "$RELEASE_TAG" dist/* \
+            --verify-tag --title "$RELEASE_TAG" --generate-notes "${flags[@]}"

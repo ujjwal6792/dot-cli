@@ -1,1 +1,0 @@
-{"eza":{"risk":"Safe","os":["darwin","linux"],"paths":[".config/eza"]},"shell":{"risk":"Unsafe","os":["darwin","linux"],"paths":[".zshrc"]},"skills":{"risk":"Safe","os":["darwin","linux"],"paths":[".agents/skills",".gemini/skills"]}}
