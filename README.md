@@ -9,12 +9,14 @@ requested dependency installation.
 ## Current development status
 
 The legacy Bash/Python implementation, subprocess bridge, installers, and
-release pipeline have been removed intentionally. This checkout is a **Go
-rewrite foundation, not a functioning configuration manager or release**.
+release scripts have been removed intentionally. The shared native engine,
+complete setup app, command router and Go release tooling are now implemented.
+Whole-spec acceptance and final user documentation remain owned by #19; this
+development checkout is not a tagged release.
 
-The Go TUI components and their model tests remain in `internal/tui`. The native
-engine and integrated app are pending. `cmd/dot` currently provides help/version
-and returns an explicit error for unfinished operations; it has no legacy fallback.
+`cmd/dot` routes interactive and scriptable operations through the same native
+engine. See [native CLI/distribution](docs/native-distribution.md) for command
+syntax, retained/retired aliases, packaging and local artifact acceptance.
 
 ```sh
 go run ./cmd/dot --help
@@ -23,25 +25,28 @@ go vet ./...
 go build -o dot ./cmd/dot
 ```
 
-Bare `go run ./cmd/dot` will open the app once the native runtime is implemented.
-It currently reports that the runtime is unfinished.
+Bare `go run ./cmd/dot` and `go run ./cmd/dot init` open the same app.
+Development builds require system Git and chezmoi v2.73.1; packaged binaries
+resolve their private pinned chezmoi bundle, never a checkout fallback.
 
 ## Releases
 
 GitHub Actions runs only when a version tag such as `v1.2.3` is pushed. It builds
 `darwin-arm64`, `linux-amd64`, and `linux-arm64` archives, generates `SHA256SUMS`,
 and creates a GitHub release. Tags such as `v1.2.3-rc.1` create prereleases.
-Each archive currently contains `dot`; Git and chezmoi remain external dependencies.
+Each archive contains `dot`, private pinned chezmoi v2.73.1, its license and
+verified release metadata. System Git remains an external dependency.
 
 There are no pull-request or branch-push checks. Agents run tests, vet, and builds
 locally before pushing. Release tags publish the tagged code, including its
 current implementation status.
 
-## Remaining implementation
+## Implementation ownership
 
 [Spec #10](https://github.com/ujjwal6792/dots-cli/issues/10) defines the product.
-The remaining issues own native replacements for behavior removed with the old
-engine, including work previously implemented for #13–#15:
+The issues below own native replacements for behavior removed with the old
+engine, including work previously implemented for #13–#15. #16/#17 are merged;
+#18 delivers CLI/distribution; #19 owns the remaining whole-spec gate:
 
 | Issue | Ownership |
 | --- | --- |
