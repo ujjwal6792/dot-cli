@@ -44,6 +44,9 @@ type Diff struct {
 }
 
 type model struct {
+	returning                                   bool
+	returningChoice                             int
+	returningOperation                          string
 	packageView                                 bool
 	packages                                    PackageResult
 	packageStage, packageManager, packageReview string
@@ -95,6 +98,7 @@ type model struct {
 	highlight                        HighlightResult
 	highlightPath                    string
 	currentOS                        string
+	currentMachine                   Machine
 	logicalRequest                   map[string]any
 	initMode                         bool
 	sourceChoice                     int
@@ -164,7 +168,7 @@ func NewInitModel(engine Engine) tea.Model {
 	return model{engine: engine, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 func (m model) Init() tea.Cmd {
-	if m.stage == "setup" || m.initMode {
+	if m.stage == "setup" || m.initMode || m.returning {
 		return nil
 	}
 	return m.loadInventory
@@ -189,6 +193,22 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case returningMsg:
+		m.loading = false
+		m.err = value.err
+		if value.remote {
+			m.stage = "returning-home"
+			m.returningChoice = 0
+			m.message = "Explicit " + m.returningOperation + " completed; no files applied or committed."
+			if value.err != nil {
+				m.message = value.err.Error()
+			}
+		} else {
+			m.stage = "returning-inspect"
+			m.viewport.SetContent(safeTerminal(value.text))
+			m.viewport.GotoTop()
+		}
+		return m, nil
 	case machineMsg:
 		return m.machineResult(value)
 	case sourceMsg:
@@ -265,6 +285,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inventoryReady = value.err == nil
 		if value.err == nil {
 			m.currentOS = value.value.OS
+			m.currentMachine = value.value.Machine
 			m.entries = value.value.Entries
 			m.profiles = value.value.Profiles
 			m.machines = value.value.Machines
@@ -384,6 +405,13 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.templateInput.SetWidth(max(20, value.Width-8))
 		m.templateInput.SetHeight(max(4, value.Height-10))
 	case tea.KeyPressMsg:
+		if m.returning && strings.HasPrefix(m.stage, "returning-") {
+			return m.updateReturning(value)
+		}
+		if m.returning && (m.stage == "done" && value.String() == "enter" || m.stage == "" && !m.searching && value.String() == "esc") {
+			m.resetReturning()
+			return m, nil
+		}
 		if m.packageView {
 			return m.updatePackages(value)
 		}
@@ -1271,6 +1299,9 @@ func fitHeight(value string, height int) string {
 }
 
 func (m model) render() string {
+	if m.returning && strings.HasPrefix(m.stage, "returning-") {
+		return m.renderReturning()
+	}
 	if m.initMode && m.stage == "machine" {
 		return m.renderMachine()
 	}
@@ -1356,6 +1387,9 @@ func (m model) render() string {
 		leftWidth = m.width - 2
 	}
 	header := strong.Render("DOTS-CLI · Dotfiles  |  Packages (P)") + "\n" + muted.Render("Track: HOME → REPOSITORY     Adopt: REPOSITORY → TARGET")
+	if m.currentMachine.ID != "" {
+		header += "\nMachine: " + safeTerminal(m.currentMachine.ID) + " · " + safeTerminal(m.currentMachine.OS)
+	}
 	if m.rounds {
 		header += "\n" + muted.Render("Optional rounds · Finish without selection")
 	}
