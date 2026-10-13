@@ -24,8 +24,91 @@ def identifier(value):
     return value
 
 
+def machine_id(value):
+    if not isinstance(value, str) or not re.fullmatch(r'[a-z0-9_]{1,128}', value):
+        raise ValueError('machine: use lowercase a-z, 0-9 and underscore (1–128 characters)')
+    return value
+
+
+def machine_identifier(value):
+    """Read new ids plus existing explicit ids without rewriting legacy state."""
+    try:
+        return machine_id(value)
+    except ValueError:
+        return identifier(value)
+
+
+def machine_setup(home, data, request):
+    """Offline identity selection; only the adoption record is written."""
+    import getpass
+    import platform
+    import secrets
+    import scope
+    if not isinstance(request, dict) or set(request) - {'action', 'id'}:
+        raise ValueError('machine: unsupported request')
+    state = scope.load(home)
+    current = current_os()
+    existing = state.get('machine') if state and state['version'] == 3 else None
+    if existing and existing['os'] != current:
+        raise ValueError('machine: existing identity OS mismatch; state left untouched')
+    reserved = set(data.get('machines', {}))
+    if existing:
+        reserved.discard(existing['id'])
+    action = request.get('action')
+    if action == 'suggest':
+        if existing:
+            return {'machine': existing}
+        def normalize(value, fallback):
+            return re.sub(r'[^a-z0-9_]+', '_', value.lower()).strip('_') or fallback
+        token = 'macos' if current == 'darwin' else 'linux'
+        if current == 'linux':
+            try:
+                release = platform.freedesktop_os_release()
+                token = normalize(release.get('ID', ''), '') or normalize(release.get('ID_LIKE', ''), '') or token
+            except OSError:
+                pass
+        suggested = (normalize(token, current) + '_' + normalize(getpass.getuser(), 'user'))[:125]
+        candidate = suggested
+        if candidate in reserved:
+            alphabet = 'abcdefghijklmnopqrstuvwxyz0123456789'
+            available = [suggested + '_' + a + b for a in alphabet for b in alphabet
+                         if suggested + '_' + a + b not in reserved]
+            if not available:
+                raise ValueError('machine: collision suffixes exhausted; choose a unique id')
+            candidate = secrets.choice(available)
+        return {'machine': {'id': candidate, 'os': current}}
+    if action != 'save':
+        raise ValueError('machine: unsupported action')
+    if existing and request.get('id') == existing['id']:
+        return {'machine': existing}
+    key = machine_id(request.get('id'))
+    if key in reserved:
+        raise ValueError('machine: id already exists locally; choose a unique id')
+    machine = {'id': key, 'os': current}
+    if state and state['version'] == 1:
+        raise ValueError('machine: legacy group scope requires explicit migration; state left untouched')
+    if existing and existing != machine:
+        raise ValueError('machine: existing identity is immutable; state left untouched')
+    from tracking import pending
+    pending(Path(home))
+    scope.save(home, {'version': 3, 'profile': state['profile'] if state else 'unapproved',
+                      'entries': state['entries'] if state else {}, 'machine': machine})
+    return {'machine': machine}
+
+
 def identity(home, data):
     from intent import file_state
+    import scope
+    state = scope.load(home)
+    if state and state['version'] == 3:
+        machine = state['machine']
+        if machine['os'] != current_os():
+            raise ValueError('machine identity OS mismatch')
+        declaration = data.get('machines', {}).get(machine['id'])
+        if declaration and declaration['os'] != machine['os']:
+            raise ValueError('machine identity OS mismatch')
+        return dict(machine, label=declaration['label'] if declaration else machine['id'],
+                    file=file_state(scope.profile_path(home)))
     path = state_paths.state_dir(home) / 'machine.json'
     if path.resolve() != state_paths.state_dir(home).resolve() / 'machine.json' or not path.is_file() or path.is_symlink():
         raise ValueError('stable explicit machine identity required')
@@ -33,7 +116,7 @@ def identity(home, data):
     record = read_json(path)
     if not isinstance(record, dict) or set(record) != {'version', 'id'} or type(record['version']) is not int or record['version'] != 1:
         raise ValueError('invalid explicit machine identity')
-    key = identifier(record['id'])
+    key = machine_identifier(record['id'])
     if path.stat().st_mode & 0o7777 != 0o600 or key not in data['machines']:
         raise ValueError('unknown or insecure explicit machine identity')
     machine = data['machines'][key]
@@ -68,7 +151,7 @@ def validate(data):
     if not isinstance(data['machines'], dict) or not data['machines'] or not isinstance(data['tracking'], dict):
         raise ValueError('invalid private machine/tracking catalog')
     for key, machine in data['machines'].items():
-        identifier(key)
+        machine_identifier(key)
         if (not isinstance(machine, dict) or set(machine) != {'label', 'os'} or
                 machine['os'] not in SYSTEMS or not isinstance(machine['label'], str) or not machine['label'] or
                 any(ord(c) < 32 or ord(c) == 127 for c in machine['label'])):
@@ -126,8 +209,6 @@ def check_scope(data, home, state):
     if state is None:
         return
     if state['version'] == 3:
-        if data['version'] != 2:
-            raise ValueError('machine-bound scope requires manifest v2')
         machine = identity(home, data)
         if state['machine'] != {'id': machine['id'], 'os': machine['os']}:
             raise ValueError('approved machine identity changed; fresh adoption required')
@@ -136,7 +217,9 @@ def check_scope(data, home, state):
 
 
 def approved(data, home, profile, selected):
-    if data['version'] == 1:
+    import scope
+    state = scope.load(home)
+    if data['version'] == 1 and not (state and state['version'] == 3):
         return {'version': 2, 'profile': profile, 'entries': selected}
     machine = identity(home, data)
     return {'version': 3, 'profile': profile, 'entries': selected, 'machine': {'id': machine['id'], 'os': machine['os']}}
