@@ -243,7 +243,7 @@ class TrackingCliTest(unittest.TestCase):
         self.assertEqual(self.git('status', '--porcelain'), '')
         self.assertEqual(json.loads((backup / 'transaction.json').read_text())['status'], 'rolled-back')
 
-    def test_changed_valid_machine_identity_requires_fresh_adoption(self):
+    def test_legacy_sidecar_cannot_change_adoption_owned_machine_identity(self):
         self.metadata_fixture()
         current = 'linux' if sys.platform.startswith('linux') else sys.platform
         self.catalog['machines']['second-fixture-id'] = {'label': 'Second fixture', 'os': current}
@@ -258,7 +258,10 @@ class TrackingCliTest(unittest.TestCase):
         self.cli('intent', 'apply', str(path), '--approve', plan['id'])
         identity = self.home / '.local/state/dot/machine.json'
         identity.write_text(json.dumps({'version': 1, 'id': 'second-fixture-id'}))
-        self.cli('intent', 'update', '--yes', ok=False)
+        before = self.scope.read_bytes()
+        self.cli('intent', 'update', '--yes')
+        self.assertEqual(self.scope.read_bytes(), before)
+        self.assertEqual(json.loads(before)['machine']['id'], 'fixture-stable-id')
         self.assertEqual((self.home / 'mapped.conf').read_text(), 'live preference\n')
 
     def test_legacy_remove_cannot_bypass_review_on_unapproved_contract_source(self):
@@ -289,7 +292,7 @@ class TrackingCliTest(unittest.TestCase):
         self.cli('remove', str(self.live), ok=False)
         self.assertFalse(marker.exists(), 'raw chezmoi called without an exact plan')
 
-    def test_native_status_uses_resolved_machine_scope_and_rejects_identity_change(self):
+    def test_native_status_uses_adoption_owned_machine_scope_without_sidecar(self):
         if shutil.which('chezmoi') is None:
             self.skipTest('chezmoi required for isolated native parity')
         self.metadata_fixture()
@@ -313,7 +316,9 @@ class TrackingCliTest(unittest.TestCase):
         self.assertFalse((self.home / 'future.conf').exists())
         identity = self.home / '.local/state/dot/machine.json'
         identity.unlink()
-        self.cli('status', ok=False)
+        before = self.scope.read_bytes()
+        self.cli('status')
+        self.assertEqual(self.scope.read_bytes(), before)
         self.assertFalse(identity.exists(), 'detection must not create identity')
         self.assertEqual((self.home / 'mapped.conf').read_text(), 'live preference\n')
 

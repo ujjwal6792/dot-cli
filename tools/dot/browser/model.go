@@ -99,6 +99,8 @@ type model struct {
 	sourceInput                      textinput.Model
 	sourceAction, sourceBackup       string
 	sourcePlan                       map[string]any
+	machineInput                     textinput.Model
+	machineOS                        string
 }
 
 type inventoryMsg struct {
@@ -185,9 +187,16 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case machineMsg:
+		return m.machineResult(value)
 	case sourceMsg:
 		return m.sourceResult(value)
 	case tea.PasteMsg:
+		if m.initMode && m.stage == "machine" && !m.loading {
+			var cmd tea.Cmd
+			m.machineInput, cmd = m.machineInput.Update(value)
+			return m, cmd
+		}
 		if m.initMode && m.stage == "source-url" && !m.loading {
 			var cmd tea.Cmd
 			m.sourceInput, cmd = m.sourceInput.Update(value)
@@ -639,6 +648,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.search.SetValue("")
 			m.filter()
 		}
+	}
+	if m.initMode && m.stage == "machine" && !m.loading {
+		var cmd tea.Cmd
+		m.machineInput, cmd = m.machineInput.Update(msg)
+		return m, cmd
 	}
 	if m.initMode && m.stage == "source-url" && !m.loading {
 		var cmd tea.Cmd
@@ -1222,6 +1236,9 @@ func fitHeight(value string, height int) string {
 }
 
 func (m model) render() string {
+	if m.initMode && m.stage == "machine" {
+		return m.renderMachine()
+	}
 	if m.initMode && strings.HasPrefix(m.stage, "source-") {
 		return m.renderSource()
 	}

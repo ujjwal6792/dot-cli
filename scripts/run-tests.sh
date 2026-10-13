@@ -19,7 +19,7 @@ case "$PART" in
     ;;
   cli)
     run_bats tests/dot.bats tests/dot-ui.bats tests/intent.bats tests/scope.bats \
-      tests/safe-adoption.bats tests/unsafe-adoption.bats tests/tracking-ui.bats \
+      tests/safe-adoption.bats tests/unsafe-adoption.bats tests/tracking-ui.bats tests/machine-ui.bats \
       tests/layout.bats tests/engine-contract.bats tests/installed-engine.bats \
       tests/installed-adapters.bats
     ;;
@@ -61,6 +61,7 @@ case "$PART" in
     python3 tests/browser-api-test.py
     python3 tests/tracking-cli-test.py
     python3 tests/packages-test.py
+    python3 tests/machine-identity-test.py
     python3 tests/release-gate-test.py
     ;;
   go)
