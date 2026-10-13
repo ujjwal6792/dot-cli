@@ -288,8 +288,11 @@ def approved(root, home):
         if entry['removals'] or entry.get('requires') or entry.get('warnings'):
             raise ValueError('legacy Git cannot acquire new capabilities; review exact adoption first')
         return entry
+    from file_metadata import entries as resolve_entries, applicable, check_scope
+    check_scope(catalog, home, state)
+    resolved = resolve_entries(catalog, home)
     entries = [e for k, e in state['entries'].items() if 'git-config' in e.get('integrations', [])
-               and catalog['entries'].get(k) == e]
+               and resolved.get(k) == e and applicable(catalog, home, k)]
     if len(entries) != 1:
         raise ValueError('Git preservation requires unchanged exact approved metadata')
     return entries[0]
