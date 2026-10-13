@@ -37,7 +37,7 @@ func TestMachineSuggestionFailureStillAllowsEditing(t *testing.T) {
 	}
 	m, _ = m.Update(tea.PasteMsg{Content: "unique_machine"})
 	m = sendAndRun(m, "enter")
-	if e.saved != "unique_machine" || !strings.Contains(m.View().Content, "Done") {
+	if e.saved != "unique_machine" || !strings.Contains(m.View().Content, "Dependencies") || strings.HasPrefix(m.View().Content, "Done\n") {
 		t.Fatal("suggestion failure prevented editing: " + m.View().Content)
 	}
 }

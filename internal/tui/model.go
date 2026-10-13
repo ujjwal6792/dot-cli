@@ -107,6 +107,14 @@ type model struct {
 	sourcePlan                       map[string]any
 	machineInput                     textinput.Model
 	machineOS                        string
+	dependencies                     DependencyResult
+	dependenciesNext                 string
+	trackerPlan                      map[string]any
+	trackerReview                    string
+	trackerName, trackerEmail        textinput.Model
+	trackerField                     int
+	setupContext                     context.Context
+	setupCancel                      context.CancelFunc
 }
 
 type inventoryMsg struct {
@@ -158,6 +166,12 @@ func NewModel(engine Engine, rounds bool, mode string) tea.Model {
 }
 
 func NewInitModel(engine Engine) tea.Model {
+	return NewInitModelContext(context.Background(), engine)
+}
+
+// NewInitModelContext binds explicit setup effects to the app's cancellation.
+func NewInitModelContext(ctx context.Context, engine Engine) tea.Model {
+	ctx, cancel := context.WithCancel(ctx)
 	input := textinput.New()
 	input.Placeholder = "filter paths"
 	input.Prompt = "/ "
@@ -165,7 +179,7 @@ func NewInitModel(engine Engine) tea.Model {
 	templateEditor.Placeholder = "Secret-free template"
 	templateEditor.SetWidth(72)
 	templateEditor.SetHeight(12)
-	return model{engine: engine, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
+	return model{engine: engine, setupContext: ctx, setupCancel: cancel, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 func (m model) Init() tea.Cmd {
 	if m.stage == "setup" || m.initMode || m.returning {
@@ -193,6 +207,8 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case setupMsg:
+		return m.setupResult(value)
 	case returningMsg:
 		m.loading = false
 		m.err = value.err
@@ -214,6 +230,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	case sourceMsg:
 		return m.sourceResult(value)
 	case tea.PasteMsg:
+		if m.initMode && m.stage == "tracker-edit" && !m.loading {
+			return m.updateTrackerInput(value)
+		}
 		if m.initMode && m.stage == "machine" && !m.loading {
 			var cmd tea.Cmd
 			m.machineInput, cmd = m.machineInput.Update(value)
@@ -387,6 +406,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.width, m.height = value.Width, value.Height
 		m.viewport.SetWidth(max(20, value.Width-4))
 		m.viewport.SetHeight(max(4, value.Height-9))
+		if m.initMode {
+			switch m.stage {
+			case "dependencies":
+				m.viewport.SetHeight(max(3, value.Height-9))
+			case "tracker-confirm":
+				m.viewport.SetHeight(max(3, value.Height-10))
+			case "source-confirm":
+				m.viewport.SetHeight(max(3, value.Height-7))
+			}
+		}
 		m.viewport.SoftWrap = true
 		previewWidth := value.Width - value.Width/3 - value.Width/4
 		previewHeight := max(4, value.Height-10)
@@ -699,6 +728,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		var cmd tea.Cmd
 		m.machineInput, cmd = m.machineInput.Update(msg)
 		return m, cmd
+	}
+	if m.initMode && m.stage == "tracker-edit" && !m.loading {
+		return m.updateTrackerInput(msg)
 	}
 	if m.initMode && m.stage == "source-url" && !m.loading {
 		var cmd tea.Cmd
@@ -1267,7 +1299,11 @@ func (m model) View() tea.View {
 	if height < 1 {
 		height = 24
 	}
-	return tea.NewView(fitHeight(safeTerminal(m.render()), height))
+	content := safeTerminal(m.render())
+	if m.initMode {
+		content = lipgloss.NewStyle().Width(max(20, m.width)).Render(content)
+	}
+	return tea.NewView(fitHeight(content, height))
 }
 
 var muted = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -1299,6 +1335,9 @@ func fitHeight(value string, height int) string {
 }
 
 func (m model) render() string {
+	if m.initMode && (m.stage == "dependencies" || strings.HasPrefix(m.stage, "tracker-") || m.stage == "setup-incomplete") {
+		return m.renderSetup()
+	}
 	if m.returning && strings.HasPrefix(m.stage, "returning-") {
 		return m.renderReturning()
 	}
@@ -1371,11 +1410,11 @@ func (m model) render() string {
 		if m.loading {
 			message = "Checking source…"
 		}
-		return "Welcome to dot\nSingle TUI app for first run and day-2 verbs · no prompts outside the app\n\ndot init --check is read-only and reports an old-user/new-user verdict\n\nEnter continue · q quit\n" + message
+		return "Welcome to dot\nWelcome → Source → Machine → Dependencies → Tracker → Done\nConnect your repository and this machine. Adoption stays a separate decision.\n\ndot init --check is offline/read-only. Entering setup changes nothing.\nPackage-manager prompts run natively only after Install consent.\n\nEnter continue · q quit\n" + message
 	}
 	if m.stage == "done" {
 		if m.initMode {
-			return "Done\n" + m.message + "\nAdoption scope unchanged · empty scope is not whole-machine parity\n\nEnter quit · q quit"
+			return "Done\n" + m.message + "\nAdoption scope unchanged · empty scope is not whole-machine parity\n\nEnter open returning menu · q quit"
 		}
 		if m.rounds {
 			return "Applied reviewed plan.\nEnter next optional round · q quit"
