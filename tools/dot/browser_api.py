@@ -71,6 +71,8 @@ def safe_error(error):
         message = str(error)
         if message.startswith('source:'):
             return clean(message)
+        if message.startswith('machine:'):
+            return clean(message)
         if message.startswith('packages:'):
             # Package errors are fixed policy messages, never source bytes or
             # arbitrary manager stderr. The manager identifier is allowlisted.
@@ -343,6 +345,7 @@ def handle(request):
         'apply': common | {'plan', 'approve', 'ack_unsafe', 'ack_desktop', 'replace_skills_backup'},
         'packages': common | {'request', 'plan', 'approve'},
         'init-source': common | {'request'},
+        'init-machine': common | {'request'},
     }
     if command not in allowed:
         raise ValueError('unsupported bridge command')
@@ -426,7 +429,10 @@ def handle(request):
     sys.modules.pop('scope', None)
     intent.scope = importlib.import_module('scope')
 
-    if command == 'inventory':
+    if command == 'init-machine':
+        from file_metadata import machine_setup
+        result = machine_setup(home, intent.manifest(source_path), request.get('request'))
+    elif command == 'inventory':
         mode = request.get('mode', 'track')
         if mode not in ('track', 'adopt', 'untrack'):
             raise ValueError('unsupported inventory mode')

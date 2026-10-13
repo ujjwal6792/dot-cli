@@ -39,10 +39,10 @@ def load(home):
         if set(data) != fields or not isinstance(data['entries'], dict):
             raise ValueError('invalid exact adoption profile')
         if data['version'] == 3:
-            from file_metadata import identifier, SYSTEMS
+            from file_metadata import machine_identifier, SYSTEMS
             if not isinstance(data['machine'], dict) or set(data['machine']) != {'id', 'os'} or data['machine']['os'] not in SYSTEMS:
                 raise ValueError('invalid approved machine identity')
-            identifier(data['machine']['id'])
+            machine_identifier(data['machine']['id'])
         profile_name(data['profile'])
         for key, entry in data['entries'].items():
             if not isinstance(key, str):
