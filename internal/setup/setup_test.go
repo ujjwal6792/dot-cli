@@ -123,7 +123,7 @@ func step(m tea.Model, k string) tea.Model {
 		code = tea.KeySpace
 	}
 	next, cmd := m.Update(tea.KeyPressMsg{Code: code})
-	for i := 0; cmd != nil && i < 3; i++ {
+	for i := 0; cmd != nil && i < 12; i++ {
 		next, cmd = next.Update(cmd())
 	}
 	return next

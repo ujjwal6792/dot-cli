@@ -2,9 +2,11 @@ package tui
 
 import (
 	"context"
+	"fmt"
+	"regexp"
 
-	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 )
 
 type MachineEngine interface {
@@ -34,7 +36,7 @@ func (m *model) machineCommand(action string) tea.Cmd {
 	}
 	request := map[string]any{"action": action}
 	if action == "save" {
-		request["id"] = m.machineInput.Value()
+		request["id"] = m.machineForm.GetString("id")
 	}
 	m.loading = true
 	return func() tea.Msg {
@@ -47,23 +49,49 @@ func (m model) machineResult(msg machineMsg) (tea.Model, tea.Cmd) {
 	m.loading = false
 	if msg.err != nil {
 		m.message = msg.err.Error()
-		return m, m.machineInput.Focus()
+		value := ""
+		if m.machineForm != nil {
+			value, _ = m.machineForm.GetFocusedField().GetValue().(string)
+		}
+		m.newMachineForm(value)
+		return m, m.machineForm.Init()
 	}
 	if msg.action == "save" {
 		m.stage = "dependencies"
-		m.machineInput.Blur()
 		m.currentMachine = msg.result.Machine
 		m.dependenciesNext = "tracker"
 		m.message = "Local machine " + msg.result.Machine.ID + " saved; no files adopted or tracker created."
 		cmd := m.setupCommand("dependencies", nil)
 		return m, cmd
 	}
-	m.machineInput = textinput.New()
-	m.machineInput.CharLimit = 128
-	m.machineInput.SetValue(msg.result.Machine.ID)
+	m.newMachineForm(msg.result.Machine.ID)
 	m.machineOS = msg.result.Machine.OS
 	m.message = "Source connected and contract-checked. Identity stays local; nothing adopted."
-	return m, m.machineInput.Focus()
+	return m, m.machineForm.Init()
+}
+
+var formMachineID = regexp.MustCompile(`^[a-z0-9_]{1,128}$`)
+
+func (m *model) newMachineForm(value string) {
+	m.machineForm = huh.NewForm(huh.NewGroup(huh.NewInput().Key("id").Title("Machine id").
+		Value(&value).CharLimit(128).Validate(func(s string) error {
+		if !formMachineID.MatchString(s) {
+			return fmt.Errorf("Use lowercase a-z, 0-9 and underscore (1–128 characters)")
+		}
+		return nil
+	}))).WithWidth(max(20, m.width-8)).WithShowHelp(true)
+	// Embedded model only: never call Run or open a second program/prompt.
+}
+
+func (m model) updateMachineForm(msg tea.Msg) (tea.Model, tea.Cmd) {
+	if m.machineForm == nil {
+		return m, nil
+	}
+	_, cmd := m.machineForm.Update(msg)
+	if m.machineForm.State == huh.StateCompleted {
+		return m, m.machineCommand("save")
+	}
+	return m, cmd
 }
 
 func (m model) updateMachine(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
@@ -73,20 +101,8 @@ func (m model) updateMachine(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.setupCancel()
 		}
 		return m, tea.Quit
-	case "enter":
-		action := "save"
-		if m.machineInput.Value() == "" {
-			action = "suggest"
-		}
-		cmd := m.machineCommand(action)
-		return m, cmd
-	case "ctrl+u":
-		m.machineInput.SetValue("")
-		return m, nil
 	}
-	var cmd tea.Cmd
-	m.machineInput, cmd = m.machineInput.Update(key)
-	return m, cmd
+	return m.updateMachineForm(key)
 }
 
 func (m model) renderMachine() string {
@@ -94,5 +110,9 @@ func (m model) renderMachine() string {
 	if m.loading {
 		status = "Checking local machine identity…"
 	}
-	return "Machine identity · " + m.machineOS + "\nEdit the suggested id: lowercase a-z, 0-9 and underscore; unique locally.\n" + m.machineInput.View() + "\n\nEnter save local identity · Ctrl+U clear · Esc quit without saving\n" + status
+	form := ""
+	if m.machineForm != nil {
+		form = m.machineForm.View()
+	}
+	return "Machine identity · " + m.machineOS + "\nEdit the suggested id; uniqueness is checked locally.\n" + form + "\n\nEnter save local identity · Ctrl+U clear · Esc quit without saving\n" + status
 }

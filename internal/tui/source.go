@@ -125,8 +125,7 @@ func (m model) sourceResult(msg sourceMsg) (tea.Model, tea.Cmd) {
 		m.message = "Original checkout preserved at " + msg.result.Backup
 	case "continue", "clone", "new":
 		m.stage = "machine"
-		m.machineInput = textinput.New()
-		m.machineInput.CharLimit = 128
+		m.newMachineForm("")
 		cmd := m.machineCommand("suggest")
 		return m, cmd
 	}
@@ -134,13 +133,16 @@ func (m model) sourceResult(msg sourceMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if key.String() == "ctrl+c" || key.String() == "q" && m.stage != "machine" && m.stage != "source-url" && m.stage != "tracker-edit" {
+	if key.String() == "ctrl+c" {
 		if m.setupCancel != nil {
 			m.setupCancel()
 		}
-		return m, tea.Quit
+		return m, tea.Interrupt
 	}
-	if key.String() == "ctrl+c" {
+	if key.String() == "q" && m.stage != "machine" && m.stage != "source-url" && m.stage != "tracker-edit" {
+		if m.setupCancel != nil {
+			m.setupCancel()
+		}
 		return m, tea.Quit
 	}
 	if m.loading {
@@ -194,9 +196,6 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "welcome":
 			return m.startSource("detect", nil)
 		case "done":
-			if m.setupCancel != nil {
-				m.setupCancel()
-			}
 			m.initMode = false
 			m.returning = true
 			m.resetReturning()

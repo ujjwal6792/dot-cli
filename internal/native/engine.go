@@ -48,7 +48,7 @@ func within(p, root string) bool {
 func (e *Engine) Config() Config { return e.config }
 func (e *Engine) git(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, e.config.Git, append([]string{"-C", e.config.Source}, args...)...)
-	cmd.Env = append(os.Environ(), "HOME="+e.config.Home, "XDG_CONFIG_HOME="+filepath.Join(e.config.Home, ".config"), "GIT_TERMINAL_PROMPT=0", "GIT_CONFIG_NOSYSTEM=1")
+	cmd.Env = append(os.Environ(), "HOME="+e.config.Home, "XDG_CONFIG_HOME="+filepath.Join(e.config.Home, ".config"), "GIT_TERMINAL_PROMPT=0")
 	b, err := cmd.CombinedOutput()
 	if err != nil {
 		return nil, fmt.Errorf("git %s failed: %w", args[0], err)

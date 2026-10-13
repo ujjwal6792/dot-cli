@@ -1,7 +1,7 @@
 # Local machine identity
 
-This is the retained #14 behavioral contract. The Python implementation was
-retired; #17 owns its native Go replacement and integration tests.
+This is the native setup identity contract. The real extracted app's edited
+identity journey and machine isolation are recorded in [acceptance](native-acceptance.md).
 
 After connecting or continuing a source, `dot init` opens an editable machine
 identity page. Merely opening the page writes nothing. Enter confirms the id;

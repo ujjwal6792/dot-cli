@@ -15,18 +15,6 @@ import (
 var machineID = regexp.MustCompile(`^[a-z0-9_]{1,128}$`)
 
 func (a *Assignment) UnmarshalJSON(b []byte) error {
-	if len(b) > 0 && b[0] == '[' {
-		var ids []string
-		if err := Decode(b, &ids); err != nil {
-			return err
-		}
-		if len(ids) == 0 {
-			ids = []string{"all"}
-		}
-		a.Include = ids
-		a.Exclude = []string{}
-		return validateAssignment(a)
-	}
 	type plain Assignment
 	var p plain
 	if err := Decode(b, &p); err != nil {
@@ -52,6 +40,23 @@ func (x *Entry) UnmarshalJSON(b []byte) error {
 	return nil
 }
 func (x *Logical) UnmarshalJSON(b []byte) error {
+	// Only historical logical-file metadata used a list. New entries and
+	// requests must use the nonempty include/exclude object.
+	var legacy map[string]json.RawMessage
+	if err := Decode(b, &legacy); err != nil {
+		return err
+	}
+	if raw := bytes.TrimSpace(legacy["machines"]); len(raw) > 0 && raw[0] == '[' {
+		var ids []string
+		if err := Decode(raw, &ids); err != nil {
+			return err
+		}
+		if len(ids) == 0 {
+			ids = []string{"all"}
+		}
+		legacy["machines"], _ = json.Marshal(Assignment{Include: ids, Exclude: []string{}})
+		b, _ = json.Marshal(legacy)
+	}
 	type plain Logical
 	var value plain
 	if err := Decode(b, &value); err != nil {

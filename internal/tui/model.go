@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	"charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -105,7 +107,7 @@ type model struct {
 	sourceInput                      textinput.Model
 	sourceAction, sourceBackup       string
 	sourcePlan                       map[string]any
-	machineInput                     textinput.Model
+	machineForm                      *huh.Form
 	machineOS                        string
 	dependencies                     DependencyResult
 	dependenciesNext                 string
@@ -188,7 +190,7 @@ func (m model) Init() tea.Cmd {
 	return m.loadInventory
 }
 func (m model) loadInventory() tea.Msg {
-	value, err := m.engine.InventoryMode(context.Background(), m.mode)
+	value, err := m.engine.InventoryMode(m.setupCtx(), m.mode)
 	return inventoryMsg{m.inventoryGeneration, m.mode, value, err}
 }
 
@@ -234,9 +236,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateTrackerInput(value)
 		}
 		if m.initMode && m.stage == "machine" && !m.loading {
-			var cmd tea.Cmd
-			m.machineInput, cmd = m.machineInput.Update(value)
-			return m, cmd
+			return m.updateMachineForm(value)
 		}
 		if m.initMode && m.stage == "source-url" && !m.loading {
 			var cmd tea.Cmd
@@ -360,7 +360,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err == nil {
 			m.loading = true
 			return m, func() tea.Msg {
-				preview, err := m.engine.Preview(context.Background(), value.value.Plan)
+				preview, err := m.engine.Preview(m.setupCtx(), value.value.Plan)
 				return previewMsg{value.generation, value.value, preview, err}
 			}
 		}
@@ -404,6 +404,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = value.Width, value.Height
+		if m.machineForm != nil {
+			m.machineForm.WithWidth(max(20, value.Width-8))
+		}
 		m.viewport.SetWidth(max(20, value.Width-4))
 		m.viewport.SetHeight(max(4, value.Height-9))
 		if m.initMode {
@@ -434,6 +437,12 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.templateInput.SetWidth(max(20, value.Width-8))
 		m.templateInput.SetHeight(max(4, value.Height-10))
 	case tea.KeyPressMsg:
+		if value.String() == "ctrl+c" {
+			if m.setupCancel != nil {
+				m.setupCancel()
+			}
+			return m, tea.Interrupt
+		}
 		if m.returning && strings.HasPrefix(m.stage, "returning-") {
 			return m.updateReturning(value)
 		}
@@ -597,6 +606,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(value)
 		}
 		if value.String() == "q" {
+			if m.setupCancel != nil {
+				m.setupCancel()
+			}
 			return m, tea.Quit
 		}
 		switch value.String() {
@@ -649,7 +661,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					request["metadata"] = map[string]any{entry.LogicalID: definition}
 				} else {
 					request["mode"] = "track"
-					request["selections"] = []map[string]any{{"path": entry.Path, "logical": "reviewed-file", "destinations": map[string]string{m.currentOS: entry.Path}, "common": map[string]any{"portability": "managed-shared", "impact": "Safe"}, "machine": map[string]any{}, "os_metadata": map[string]any{}, "machines": []string{}}}
+					request["selections"] = []map[string]any{{"path": entry.Path, "logical": fmt.Sprintf("file_%x", sha256.Sum256([]byte(entry.Path))), "destinations": map[string]string{m.currentOS: entry.Path}, "common": map[string]any{"portability": "managed-shared", "impact": "Safe"}, "machine": map[string]any{}, "os_metadata": map[string]any{}, "machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}}
 				}
 				body, _ := json.Marshal(request)
 				m.templateInput.SetValue(string(body))
@@ -725,9 +737,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.initMode && m.stage == "machine" && !m.loading {
-		var cmd tea.Cmd
-		m.machineInput, cmd = m.machineInput.Update(msg)
-		return m, cmd
+		return m.updateMachineForm(msg)
 	}
 	if m.initMode && m.stage == "tracker-edit" && !m.loading {
 		return m.updateTrackerInput(msg)
@@ -790,7 +800,7 @@ func (m *model) highlightCurrent() tea.Cmd {
 	m.previewGeneration++
 	generation := m.previewGeneration
 	return func() tea.Msg {
-		result, err := m.engine.Highlight(context.Background(), m.mode, entry.Path, request)
+		result, err := m.engine.Highlight(m.setupCtx(), m.mode, entry.Path, request)
 		return highlightMsg{generation, result, err}
 	}
 }
@@ -902,7 +912,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 		generation := m.generation
 		m.loading = true
 		return func() tea.Msg {
-			result, err := m.engine.Snapshot(context.Background(), entry.Path)
+			result, err := m.engine.Snapshot(m.setupCtx(), entry.Path)
 			return snapshotMsg{generation, entry.Path, result, err}
 		}
 	}
@@ -1069,7 +1079,7 @@ func (m *model) plan() tea.Cmd {
 	generation := m.generation
 	m.loading = true
 	return func() tea.Msg {
-		value, err := m.engine.Plan(context.Background(), request)
+		value, err := m.engine.Plan(m.setupCtx(), request)
 		return planMsg{generation, value, err}
 	}
 }
@@ -1287,7 +1297,7 @@ func (m model) updateConfirm(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		id, _ := r.Plan["id"].(string)
 		m.loading = true
 		return m, func() tea.Msg {
-			err := m.engine.Apply(context.Background(), r.Plan, id, m.unsafeAck, m.desktopAck, m.backupAck)
+			err := m.engine.Apply(m.setupCtx(), r.Plan, id, m.unsafeAck, m.desktopAck, m.backupAck)
 			return applyMsg{err}
 		}
 	}
@@ -1702,13 +1712,16 @@ func (m model) renderReview() string {
 }
 
 func Run(ctx context.Context, engine Engine, rounds bool, mode string) error {
-	program := tea.NewProgram(NewModel(engine, rounds, mode))
+	m := NewModel(engine, rounds, mode).(model)
+	m.setupContext, m.setupCancel = context.WithCancel(ctx)
+	defer m.setupCancel()
+	program := tea.NewProgram(m, tea.WithContext(ctx))
 	_, err := program.Run()
 	return err
 }
 
 func RunInit(ctx context.Context, engine Engine) error {
-	program := tea.NewProgram(NewInitModel(engine))
+	program := tea.NewProgram(NewInitModelContext(ctx, engine), tea.WithContext(ctx))
 	_, err := program.Run()
 	return err
 }

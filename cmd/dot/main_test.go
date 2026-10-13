@@ -20,6 +20,21 @@ func TestHelpBeforePrivateGates(t *testing.T) {
 	}
 }
 
+func TestCompleteHelpDocumentsAppAliasesAndRetiredInventory(t *testing.T) {
+	t.Setenv("HOME", "malformed")
+	for _, args := range [][]string{{"--help"}, {"intent", "inventory", "--help"}} {
+		var out, errs bytes.Buffer
+		if code := run(context.Background(), args, strings.NewReader(""), &out, &errs); code != 0 {
+			t.Fatalf("help failed: %d %s", code, &errs)
+		}
+		for _, want := range []string{"Bare dot", "read-only", "--format json", "intent rounds", "Retired:", "no checkout fallback"} {
+			if !strings.Contains(out.String(), want) {
+				t.Fatalf("%v help omits %q", args, want)
+			}
+		}
+	}
+}
+
 func TestScriptedSetupAndExactIntent(t *testing.T) {
 	home := t.TempDir()
 	home, _ = filepath.EvalSymlinks(home)

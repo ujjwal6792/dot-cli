@@ -52,6 +52,18 @@ func customize(x Entry, c map[string]any) (Entry, error) {
 	return x, err
 }
 func (e *Engine) Plan(ctx context.Context, r Request) (Plan, error) {
+	// Plans cross the serialized CLI/view boundary. Normalize omitted empty
+	// metadata maps once and own the request so recomputation has identical
+	// semantics and caller-owned maps cannot be mutated during planning.
+	b, err := json.Marshal(r)
+	if err != nil {
+		return Plan{}, err
+	}
+	var canonical Request
+	if err := Decode(b, &canonical); err != nil {
+		return Plan{}, err
+	}
+	r = canonical
 	p := Plan{Version: 1, Request: r, Selected: map[string]Entry{}, Actions: []Action{}}
 	if r.Version != 1 || !has([]string{"adopt", "update", "track", "untrack", "metadata"}, r.Mode) || r.Profile == "" {
 		return p, fmt.Errorf("invalid intent protocol/mode/profile")
@@ -234,12 +246,21 @@ func (e *Engine) Plan(ctx context.Context, r Request) (Plan, error) {
 	next.Entries = p.Selected
 	if r.Mode == "adopt" {
 		next.Profiles = profiles
+		// Exclusions are machine-local intent, not just the current profile's
+		// complement. Explicit reselection clears an exclusion; switching away
+		// from a profile must not silently forget it.
 		next.Deselected = []string{}
-		for _, id := range sortedKeys(pool) {
-			if applicable(m.Entries[id], a.Machine) && !seen[id] {
+		for _, id := range a.Deselected {
+			if !seen[id] {
 				next.Deselected = append(next.Deselected, id)
 			}
 		}
+		for _, id := range sortedKeys(pool) {
+			if applicable(m.Entries[id], a.Machine) && !seen[id] && !has(next.Deselected, id) {
+				next.Deselected = append(next.Deselected, id)
+			}
+		}
+		sort.Strings(next.Deselected)
 		if next.Customs == nil {
 			next.Customs = map[string]map[string]any{}
 		}

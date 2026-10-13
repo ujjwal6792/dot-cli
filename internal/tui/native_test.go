@@ -64,6 +64,48 @@ func TestNativeAdapterUsesRealReviewedApply(t *testing.T) {
 		t.Fatal("adapter did not apply")
 	}
 }
+
+func TestReturningInspectionUsesApplicationContext(t *testing.T) {
+	e, _ := realNative(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	m := NewReturningModelContext(ctx, e)
+	for i := 0; i < 3; i++ {
+		m, _ = m.Update(tea.KeyPressMsg{Code: 'j'})
+	}
+	m, cmd := m.Update(tea.KeyPressMsg{Code: tea.KeyEnter})
+	if cmd == nil {
+		t.Fatal("missing inspection command")
+	}
+	m, _ = m.Update(cmd())
+	if m.(model).err == nil {
+		t.Fatal("inspection ignored canceled application context")
+	}
+}
+
+func TestLogicalEditorDefaultPlansAgainstNativeSchema(t *testing.T) {
+	e, c := realNative(t)
+	if err := os.WriteFile(filepath.Join(c.Source, "dot-contract.json"), []byte(`{"protocol":1,"engine_api":{"min":1,"max":1},"manifest_version":2,"approval_version":3,"manifest":"manifest.json","home_source":"home","required_adapters":["intent","scope"]}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.Source, "manifest.json"), []byte(`{"version":2,"entries":{},"profiles":{},"tracking":{}}`), 0600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(c.Home, "prefs"), []byte("logical bytes\n"), 0600); err != nil {
+		t.Fatal(err)
+	}
+	m := NewModel(e, false, "track")
+	m, cmd := m.Update(m.Init()())
+	for cmd != nil {
+		m, cmd = m.Update(cmd())
+	}
+	m = send(m, "M")
+	m, _ = m.Update(tea.KeyPressMsg{Code: 19})
+	m = sendAndRun(m, "p")
+	if m.(model).stage != "review" || m.(model).err != nil {
+		t.Fatalf("native logical plan: %s %v", m.(model).stage, m.(model).err)
+	}
+}
 func TestReturningMenuDefaultsFinishAndRemoteDefaultsCancel(t *testing.T) {
 	e, c := realNative(t)
 	m := NewReturningModel(e).(model)

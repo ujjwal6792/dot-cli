@@ -19,10 +19,11 @@ import (
 type harness struct {
 	ctx                         context.Context
 	dot, git, dir, path, global string
+	extra                       []string
 }
 
 func (h harness) env(home string) []string {
-	return []string{"HOME=" + home, "PATH=" + h.path, "LC_ALL=C", "TERM=xterm-256color", "GIT_CONFIG_GLOBAL=" + h.global, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"}
+	return append([]string{"HOME=" + home, "PATH=" + h.path, "LC_ALL=C", "TERM=xterm-256color", "GIT_CONFIG_GLOBAL=" + h.global, "GIT_CONFIG_NOSYSTEM=1", "GIT_TERMINAL_PROMPT=0"}, h.extra...)
 }
 func (h harness) invoke(home, input string, args ...string) ([]byte, error) {
 	c := exec.CommandContext(h.ctx, h.dot, args...)
@@ -61,6 +62,9 @@ func (h harness) plan(home string, r native.Request) (native.Plan, error) {
 		return p, err
 	}
 	err = native.Decode(b, &p)
+	if err == nil {
+		err = write(filepath.Join(h.dir, "plans", filepath.Base(home)+"-"+p.ID+".json"), b, 0600)
+	}
 	return p, err
 }
 func (h harness) apply(home string, p native.Plan) error {
@@ -155,22 +159,34 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 	if err := os.Symlink(git, filepath.Join(path, "git")); err != nil {
 		return err
 	}
-	h := harness{ctx, filepath.Join(bundle, "dot"), git, dir, path, filepath.Join(dir, "gitconfig")}
+	h := harness{ctx, filepath.Join(bundle, "dot"), git, dir, path, filepath.Join(dir, "gitconfig"), nil}
 	home := filepath.Join(dir, "home-one")
 	if err := os.Mkdir(home, 0700); err != nil {
 		return err
 	}
 	// PATH contains ONLY system Git. No shell, interpreter, gum, gh, Go compiler,
 	// package manager or system chezmoi is available to dot.
-	for _, args := range [][]string{{"--help"}, {"intent", "apply", "--help"}, {"--version"}, {"--health"}, {"uninstall", "--help"}} {
-		if _, err := h.invoke(home, "", args...); err != nil {
+	helpEvidence := map[string]string{}
+	for _, args := range [][]string{{"--help"}, {"init", "--help"}, {"browse", "--help"}, {"status", "--help"}, {"diff", "--help"}, {"scope", "show", "--help"}, {"contract", "check", "--help"}, {"intent", "inventory", "--help"}, {"intent", "plan", "--help"}, {"intent", "preview", "--help"}, {"intent", "apply", "--help"}, {"intent", "rounds", "--help"}, {"intent", "pick", "--help"}, {"pull", "--help"}, {"push", "--help"}, {"recovery", "--help"}, {"recover", "--help"}, {"install", "--help"}, {"self-update", "--help"}, {"uninstall", "--help"}, {"install-recover", "--help"}, {"health", "--help"}, {"doctor", "--help"}, {"-u", "--help"}, {"--uninstall", "--help"}, {"--version"}, {"--health"}} {
+		output, err := h.invoke(home, "", args...)
+		if err != nil {
 			return err
 		}
+		helpEvidence[strings.Join(args, " ")] = string(output)
+	}
+	if err := write(filepath.Join(dir, "help-evidence.json"), []byte(marshal(helpEvidence)), 0600); err != nil {
+		return err
 	}
 	if err := h.openApp(home, "Welcome"); err != nil {
 		return err
 	}
 	if err := h.openApp(home, "Welcome", "init"); err != nil {
+		return err
+	}
+	if err := h.interruptKeyboard(); err != nil {
+		return err
+	}
+	if err := h.managerCases(); err != nil {
 		return err
 	}
 	b, err := h.invoke(home, "", "init", "--check")
@@ -181,14 +197,17 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 		return fmt.Errorf("read-only check wrote HOME")
 	}
 	url := "https://native.example.invalid/config.git"
-	if _, err := h.invoke(home, "", "init", "--action", "new", "--url", url); err != nil {
-		return err
-	}
 	id := "macos_one"
 	if runtime.GOOS == "linux" {
 		id = "linux_one"
 	}
-	if err := h.tracker(home, id); err != nil {
+	if err := h.setupKeyboard(home, url, id, "new"); err != nil {
+		return err
+	}
+	if err := h.continueReplace(url); err != nil {
+		return err
+	}
+	if err := h.trackKeyboard(home); err != nil {
 		return err
 	}
 	if err := h.openApp(home, "returning-user actions"); err != nil {
@@ -251,14 +270,14 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 	if err := os.Mkdir(two, 0700); err != nil {
 		return err
 	}
-	if _, err := h.invoke(two, "", "init", "--action", "clone", "--url", url); err != nil {
-		return err
-	}
 	idTwo := "macos_two"
 	if runtime.GOOS == "linux" {
 		idTwo = "linux_two"
 	}
-	if err := h.tracker(two, idTwo); err != nil {
+	if err := h.setupKeyboard(two, url, idTwo, "clone"); err != nil {
+		return err
+	}
+	if err := h.adoptKeyboard(two); err != nil {
 		return err
 	}
 	if _, err := h.invoke(two, "", "pull", "--yes"); err != nil {
@@ -310,6 +329,9 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 		return err
 	}
 	// Installation ownership, checksum-before-promotion, local self-update and
+	if err := h.policyCases(home, two); err != nil {
+		return err
+	}
 	// uninstall are isolated from host directories and private machine state.
 	root := filepath.Join(dir, "installation")
 	if _, err := h.invoke(home, "", "install", "--root", root, "--archive", archive, "--sha256", strings.Repeat("0", 64), "--yes"); err == nil {
@@ -319,6 +341,9 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 		return fmt.Errorf("bad checksum mutated installation root")
 	}
 	if _, err := h.invoke(home, "", "install", "--root", root, "--archive", archive, "--sha256", checksum, "--yes"); err != nil {
+		return err
+	}
+	if err := h.initialInstallRecovery(home, archive, checksum); err != nil {
 		return err
 	}
 	installed := h
@@ -363,6 +388,6 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 	if err != nil || !bytes.Equal(before, after) {
 		return fmt.Errorf("uninstall changed private approval")
 	}
-	fmt.Printf("PASS: real extracted %s setup, tracker, Track, clone, explicit pull/push, machine JSON, exact adoption/staleness, private install/update/recovery/uninstall\nFixtures retained at %s\n", distribution.Platform(), dir)
+	fmt.Printf("PASS: real extracted %s full keyboard setup/Continue/Replace/Track/Adopt, Huh identity, manager/source interrupts, assignments/profile unions/local overrides/gates, machine JSON, byte/mode/stale/concurrent/recovery/offline safety, private install/update/recovery/uninstall\nFixtures retained at %s\n", distribution.Platform(), dir)
 	return nil
 }

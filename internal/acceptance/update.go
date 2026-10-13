@@ -37,7 +37,7 @@ func Upgrade(ctx context.Context, archive, sha, updateArchive, updateSHA, dir st
 	if err != nil {
 		return err
 	}
-	h := harness{ctx, filepath.Join(dir, "extracted/dot"), git, dir, filepath.Join(dir, "path"), filepath.Join(dir, "gitconfig")}
+	h := harness{ctx, filepath.Join(dir, "extracted/dot"), git, dir, filepath.Join(dir, "path"), filepath.Join(dir, "gitconfig"), nil}
 	home := filepath.Join(dir, "home-two")
 	root := filepath.Join(dir, "upgrade-installation")
 	if _, err := h.invoke(home, "", "install", "--root", root, "--archive", archive, "--sha256", sha, "--yes"); err != nil {

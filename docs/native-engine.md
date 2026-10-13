@@ -1,4 +1,4 @@
-# Native engine handoff (#16 → #17/#18)
+# Native configuration engine
 
 `internal/native` is the shared, in-process policy package. `native.New(Config)`
 requires explicit absolute, non-symlink `Source`, `Home`, and `State` paths;
@@ -44,7 +44,8 @@ source/state/tracker targets remain excluded from enrollment.
   back only reviewed actions and refuses post-interruption conflicts.
 - `tui.NewNativeEngine(engine)` implements the retained real browser seam.
   `tui.NewReturningModel(adapter)` adds returning-user navigation and separately
-  confirmed pull/push. Routing, CLI flags and packaged acceptance remain #18.
+  confirmed pull/push. The router and app share this engine; packaged execution
+  evidence is in [native acceptance](native-acceptance.md).
 
 Public plans carry exact bytes/modes for ordinary reviewed files; bounded Git
 actions carry only approved `user.name`/`user.email` values and whole-file hashes,
