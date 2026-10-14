@@ -19,6 +19,7 @@ type Entry struct {
 }
 
 type Inventory struct {
+	Machine  Machine   `json:"machine"`
 	Machines []string  `json:"machines,omitempty"`
 	OS       string    `json:"os,omitempty"`
 	Entries  []Entry   `json:"entries"`

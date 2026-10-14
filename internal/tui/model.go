@@ -2,6 +2,7 @@ package tui
 
 import (
 	"context"
+	"crypto/sha256"
 	"encoding/json"
 	"fmt"
 	"regexp"
@@ -12,6 +13,7 @@ import (
 	"charm.land/bubbles/v2/textinput"
 	"charm.land/bubbles/v2/viewport"
 	"charm.land/bubbletea/v2"
+	"charm.land/huh/v2"
 	"charm.land/lipgloss/v2"
 )
 
@@ -44,6 +46,9 @@ type Diff struct {
 }
 
 type model struct {
+	returning                                   bool
+	returningChoice                             int
+	returningOperation                          string
 	packageView                                 bool
 	packages                                    PackageResult
 	packageStage, packageManager, packageReview string
@@ -95,14 +100,23 @@ type model struct {
 	highlight                        HighlightResult
 	highlightPath                    string
 	currentOS                        string
+	currentMachine                   Machine
 	logicalRequest                   map[string]any
 	initMode                         bool
 	sourceChoice                     int
 	sourceInput                      textinput.Model
 	sourceAction, sourceBackup       string
 	sourcePlan                       map[string]any
-	machineInput                     textinput.Model
+	machineForm                      *huh.Form
 	machineOS                        string
+	dependencies                     DependencyResult
+	dependenciesNext                 string
+	trackerPlan                      map[string]any
+	trackerReview                    string
+	trackerName, trackerEmail        textinput.Model
+	trackerField                     int
+	setupContext                     context.Context
+	setupCancel                      context.CancelFunc
 }
 
 type inventoryMsg struct {
@@ -154,6 +168,12 @@ func NewModel(engine Engine, rounds bool, mode string) tea.Model {
 }
 
 func NewInitModel(engine Engine) tea.Model {
+	return NewInitModelContext(context.Background(), engine)
+}
+
+// NewInitModelContext binds explicit setup effects to the app's cancellation.
+func NewInitModelContext(ctx context.Context, engine Engine) tea.Model {
+	ctx, cancel := context.WithCancel(ctx)
 	input := textinput.New()
 	input.Placeholder = "filter paths"
 	input.Prompt = "/ "
@@ -161,16 +181,16 @@ func NewInitModel(engine Engine) tea.Model {
 	templateEditor.Placeholder = "Secret-free template"
 	templateEditor.SetWidth(72)
 	templateEditor.SetHeight(12)
-	return model{engine: engine, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
+	return model{engine: engine, setupContext: ctx, setupCancel: cancel, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 func (m model) Init() tea.Cmd {
-	if m.stage == "setup" || m.initMode {
+	if m.stage == "setup" || m.initMode || m.returning {
 		return nil
 	}
 	return m.loadInventory
 }
 func (m model) loadInventory() tea.Msg {
-	value, err := m.engine.InventoryMode(context.Background(), m.mode)
+	value, err := m.engine.InventoryMode(m.setupCtx(), m.mode)
 	return inventoryMsg{m.inventoryGeneration, m.mode, value, err}
 }
 
@@ -189,15 +209,34 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case setupMsg:
+		return m.setupResult(value)
+	case returningMsg:
+		m.loading = false
+		m.err = value.err
+		if value.remote {
+			m.stage = "returning-home"
+			m.returningChoice = 0
+			m.message = "Explicit " + m.returningOperation + " completed; no files applied or committed."
+			if value.err != nil {
+				m.message = value.err.Error()
+			}
+		} else {
+			m.stage = "returning-inspect"
+			m.viewport.SetContent(safeTerminal(value.text))
+			m.viewport.GotoTop()
+		}
+		return m, nil
 	case machineMsg:
 		return m.machineResult(value)
 	case sourceMsg:
 		return m.sourceResult(value)
 	case tea.PasteMsg:
+		if m.initMode && m.stage == "tracker-edit" && !m.loading {
+			return m.updateTrackerInput(value)
+		}
 		if m.initMode && m.stage == "machine" && !m.loading {
-			var cmd tea.Cmd
-			m.machineInput, cmd = m.machineInput.Update(value)
-			return m, cmd
+			return m.updateMachineForm(value)
 		}
 		if m.initMode && m.stage == "source-url" && !m.loading {
 			var cmd tea.Cmd
@@ -265,6 +304,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.inventoryReady = value.err == nil
 		if value.err == nil {
 			m.currentOS = value.value.OS
+			m.currentMachine = value.value.Machine
 			m.entries = value.value.Entries
 			m.profiles = value.value.Profiles
 			m.machines = value.value.Machines
@@ -320,7 +360,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if value.err == nil {
 			m.loading = true
 			return m, func() tea.Msg {
-				preview, err := m.engine.Preview(context.Background(), value.value.Plan)
+				preview, err := m.engine.Preview(m.setupCtx(), value.value.Plan)
 				return previewMsg{value.generation, value.value, preview, err}
 			}
 		}
@@ -364,8 +404,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = value.Width, value.Height
+		if m.machineForm != nil {
+			m.machineForm.WithWidth(max(20, value.Width-8))
+		}
 		m.viewport.SetWidth(max(20, value.Width-4))
 		m.viewport.SetHeight(max(4, value.Height-9))
+		if m.initMode {
+			switch m.stage {
+			case "dependencies":
+				m.viewport.SetHeight(max(3, value.Height-9))
+			case "tracker-confirm":
+				m.viewport.SetHeight(max(3, value.Height-10))
+			case "source-confirm":
+				m.viewport.SetHeight(max(3, value.Height-7))
+			}
+		}
 		m.viewport.SoftWrap = true
 		previewWidth := value.Width - value.Width/3 - value.Width/4
 		previewHeight := max(4, value.Height-10)
@@ -384,6 +437,26 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		m.templateInput.SetWidth(max(20, value.Width-8))
 		m.templateInput.SetHeight(max(4, value.Height-10))
 	case tea.KeyPressMsg:
+		// Bubbles/Huh system-clipboard shortcuts invoke platform helpers. Dot
+		// instead accepts the terminal's bracketed PasteMsg, keeping runtime
+		// dependencies confined to Git/chezmoi and explicitly approved managers.
+		if value.String() == "ctrl+v" || value.String() == "ctrl+shift+c" {
+			m.message = "Use your terminal paste/copy shortcut; dot does not run clipboard helpers."
+			return m, nil
+		}
+		if value.String() == "ctrl+c" {
+			if m.setupCancel != nil {
+				m.setupCancel()
+			}
+			return m, tea.Interrupt
+		}
+		if m.returning && strings.HasPrefix(m.stage, "returning-") {
+			return m.updateReturning(value)
+		}
+		if m.returning && (m.stage == "done" && value.String() == "enter" || m.stage == "" && !m.searching && value.String() == "esc") {
+			m.resetReturning()
+			return m, nil
+		}
 		if m.packageView {
 			return m.updatePackages(value)
 		}
@@ -540,6 +613,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m.updateConfirm(value)
 		}
 		if value.String() == "q" {
+			if m.setupCancel != nil {
+				m.setupCancel()
+			}
 			return m, tea.Quit
 		}
 		switch value.String() {
@@ -592,7 +668,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					request["metadata"] = map[string]any{entry.LogicalID: definition}
 				} else {
 					request["mode"] = "track"
-					request["selections"] = []map[string]any{{"path": entry.Path, "logical": "reviewed-file", "destinations": map[string]string{m.currentOS: entry.Path}, "common": map[string]any{"portability": "managed-shared", "impact": "Safe"}, "machine": map[string]any{}, "os_metadata": map[string]any{}, "machines": []string{}}}
+					request["selections"] = []map[string]any{{"path": entry.Path, "logical": fmt.Sprintf("file_%x", sha256.Sum256([]byte(entry.Path))), "destinations": map[string]string{m.currentOS: entry.Path}, "common": map[string]any{"portability": "managed-shared", "impact": "Safe"}, "machine": map[string]any{}, "os_metadata": map[string]any{}, "machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}}
 				}
 				body, _ := json.Marshal(request)
 				m.templateInput.SetValue(string(body))
@@ -668,9 +744,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	}
 	if m.initMode && m.stage == "machine" && !m.loading {
-		var cmd tea.Cmd
-		m.machineInput, cmd = m.machineInput.Update(msg)
-		return m, cmd
+		return m.updateMachineForm(msg)
+	}
+	if m.initMode && m.stage == "tracker-edit" && !m.loading {
+		return m.updateTrackerInput(msg)
 	}
 	if m.initMode && m.stage == "source-url" && !m.loading {
 		var cmd tea.Cmd
@@ -730,7 +807,7 @@ func (m *model) highlightCurrent() tea.Cmd {
 	m.previewGeneration++
 	generation := m.previewGeneration
 	return func() tea.Msg {
-		result, err := m.engine.Highlight(context.Background(), m.mode, entry.Path, request)
+		result, err := m.engine.Highlight(m.setupCtx(), m.mode, entry.Path, request)
 		return highlightMsg{generation, result, err}
 	}
 }
@@ -842,7 +919,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 		generation := m.generation
 		m.loading = true
 		return func() tea.Msg {
-			result, err := m.engine.Snapshot(context.Background(), entry.Path)
+			result, err := m.engine.Snapshot(m.setupCtx(), entry.Path)
 			return snapshotMsg{generation, entry.Path, result, err}
 		}
 	}
@@ -1009,7 +1086,7 @@ func (m *model) plan() tea.Cmd {
 	generation := m.generation
 	m.loading = true
 	return func() tea.Msg {
-		value, err := m.engine.Plan(context.Background(), request)
+		value, err := m.engine.Plan(m.setupCtx(), request)
 		return planMsg{generation, value, err}
 	}
 }
@@ -1227,7 +1304,7 @@ func (m model) updateConfirm(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		id, _ := r.Plan["id"].(string)
 		m.loading = true
 		return m, func() tea.Msg {
-			err := m.engine.Apply(context.Background(), r.Plan, id, m.unsafeAck, m.desktopAck, m.backupAck)
+			err := m.engine.Apply(m.setupCtx(), r.Plan, id, m.unsafeAck, m.desktopAck, m.backupAck)
 			return applyMsg{err}
 		}
 	}
@@ -1239,7 +1316,11 @@ func (m model) View() tea.View {
 	if height < 1 {
 		height = 24
 	}
-	return tea.NewView(fitHeight(safeTerminal(m.render()), height))
+	content := safeTerminal(m.render())
+	if m.initMode {
+		content = lipgloss.NewStyle().Width(max(20, m.width)).Render(content)
+	}
+	return tea.NewView(fitHeight(content, height))
 }
 
 var muted = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
@@ -1271,6 +1352,12 @@ func fitHeight(value string, height int) string {
 }
 
 func (m model) render() string {
+	if m.initMode && (m.stage == "dependencies" || strings.HasPrefix(m.stage, "tracker-") || m.stage == "setup-incomplete") {
+		return m.renderSetup()
+	}
+	if m.returning && strings.HasPrefix(m.stage, "returning-") {
+		return m.renderReturning()
+	}
 	if m.initMode && m.stage == "machine" {
 		return m.renderMachine()
 	}
@@ -1340,11 +1427,11 @@ func (m model) render() string {
 		if m.loading {
 			message = "Checking source…"
 		}
-		return "Welcome to dot\nSingle TUI app for first run and day-2 verbs · no prompts outside the app\n\ndot init --check is read-only and reports an old-user/new-user verdict\n\nEnter continue · q quit\n" + message
+		return "Welcome to dot\nWelcome → Source → Machine → Dependencies → Tracker → Done\nConnect your repository and this machine. Adoption stays a separate decision.\n\ndot init --check is offline/read-only. Entering setup changes nothing.\nPackage-manager prompts run natively only after Install consent.\n\nEnter continue · q quit\n" + message
 	}
 	if m.stage == "done" {
 		if m.initMode {
-			return "Done\n" + m.message + "\nAdoption scope unchanged · empty scope is not whole-machine parity\n\nEnter quit · q quit"
+			return "Done\n" + m.message + "\nAdoption scope unchanged · empty scope is not whole-machine parity\n\nEnter open returning menu · q quit"
 		}
 		if m.rounds {
 			return "Applied reviewed plan.\nEnter next optional round · q quit"
@@ -1356,6 +1443,9 @@ func (m model) render() string {
 		leftWidth = m.width - 2
 	}
 	header := strong.Render("DOTS-CLI · Dotfiles  |  Packages (P)") + "\n" + muted.Render("Track: HOME → REPOSITORY     Adopt: REPOSITORY → TARGET")
+	if m.currentMachine.ID != "" {
+		header += "\nMachine: " + safeTerminal(m.currentMachine.ID) + " · " + safeTerminal(m.currentMachine.OS)
+	}
 	if m.rounds {
 		header += "\n" + muted.Render("Optional rounds · Finish without selection")
 	}
@@ -1629,13 +1719,16 @@ func (m model) renderReview() string {
 }
 
 func Run(ctx context.Context, engine Engine, rounds bool, mode string) error {
-	program := tea.NewProgram(NewModel(engine, rounds, mode))
+	m := NewModel(engine, rounds, mode).(model)
+	m.setupContext, m.setupCancel = context.WithCancel(ctx)
+	defer m.setupCancel()
+	program := tea.NewProgram(m, tea.WithContext(ctx))
 	_, err := program.Run()
 	return err
 }
 
 func RunInit(ctx context.Context, engine Engine) error {
-	program := tea.NewProgram(NewInitModel(engine))
+	program := tea.NewProgram(NewInitModelContext(ctx, engine), tea.WithContext(ctx))
 	_, err := program.Run()
 	return err
 }
