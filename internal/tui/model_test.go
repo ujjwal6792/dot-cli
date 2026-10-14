@@ -57,14 +57,14 @@ func (f *fixtureEngine) Apply(_ context.Context, _ any, _ string, unsafe, deskto
 }
 
 func key(s string) tea.KeyPressMsg {
-	code := tea.Key{Code: []rune(s)[0]}
+	code := tea.Key{Code: []rune(s)[0], Text: s}
 	switch s {
 	case "enter":
 		code = tea.Key{Code: tea.KeyEnter}
 	case "esc":
 		code = tea.Key{Code: tea.KeyEsc}
 	case " ":
-		code = tea.Key{Code: tea.KeySpace}
+		code = tea.Key{Code: tea.KeySpace, Text: " "}
 	}
 	return tea.KeyPressMsg(code)
 }
@@ -105,12 +105,16 @@ func TestPublicTerminalSearchAndHiddenToggleDoNotDropBasket(t *testing.T) {
 	e := &fixtureEngine{inventory: Inventory{Entries: []Entry{{Path: "plain", Kind: "file", Status: "eligible"}, {Path: ".private", Kind: "file", Status: "eligible", Metadata: map[string]any{"destination": ".private", "os": []string{"darwin"}, "portability": "managed-shared", "impact": "Safe"}}}}}
 	m := boot(t, e, false, "track")
 	view := m.View().Content
-	if strings.Contains(view, ".private") {
-		t.Fatalf("hidden entry shown before toggle: %s", view)
+	if !strings.Contains(view, ".private") {
+		t.Fatalf("dotfiles must be shown by default: %s", view)
+	}
+	m = send(m, "H")
+	if strings.Contains(m.View().Content, ".private") {
+		t.Fatal("H toggle did not hide .private entry")
 	}
 	m = send(m, "H")
 	if !strings.Contains(m.View().Content, ".private") {
-		t.Fatal("H did not reveal hidden entry")
+		t.Fatal("second H toggle did not reveal .private entry")
 	}
 	m = sendAndRun(m, " ")
 	m = send(m, "/")
@@ -167,7 +171,6 @@ func TestPublicAdoptUsesManifestIDsAndEngineOSScope(t *testing.T) {
 		{Path: ".config/linux-only", ID: "linux-only", Kind: "file", Status: "managed", OSStatus: "unsupported"},
 	}}}
 	m := boot(t, e, false, "adopt")
-	m = send(m, "H")
 	m = send(m, "l")
 	m = send(m, "j")
 	m = send(m, "j")
@@ -269,4 +272,173 @@ func runCmds(m tea.Model, cmd tea.Cmd) tea.Model {
 		m, cmd = m.Update(cmd())
 	}
 	return m
+}
+
+func TestDotfilesShownByDefaultAndGlobalSearchFindsCollapsedFilesAndEmptyMessages(t *testing.T) {
+	// 1. Dotfile-only repository shows .config by default
+	e := &fixtureEngine{inventory: Inventory{Entries: []Entry{
+		{Path: ".config", Kind: "directory", Status: "logical", Open: false},
+		{Path: ".config/prefs.conf", Kind: "file", Status: "managed"},
+	}}}
+	m := boot(t, e, false, "adopt")
+	view := m.View().Content
+	if !strings.Contains(view, ".config") {
+		t.Fatalf(".config was not visible by default in dotfile-only repo: %s", view)
+	}
+	// Initially, .config is collapsed, so .config/prefs.conf is not in visible list
+	if strings.Contains(view, ".config/prefs.conf") {
+		t.Fatal(".config/prefs.conf should be collapsed initially")
+	}
+
+	// 2. Global search reveals .config/prefs.conf even while .config is collapsed!
+	m = send(m, "/")
+	for _, r := range "prefs.conf" {
+		m, _ = m.Update(key(string(r)))
+	}
+	m = send(m, "enter")
+	view = m.View().Content
+	if !strings.Contains(view, ".config/prefs.conf") {
+		t.Fatalf("global search failed to find file inside collapsed directory: %s", view)
+	}
+
+	// 3. Search with no matches displays "No search matches"
+	m = send(m, "/")
+	for _, r := range "nonexistent_file" {
+		m, _ = m.Update(key(string(r)))
+	}
+	m = send(m, "enter")
+	view = m.View().Content
+	if !strings.Contains(view, "No search matches for \"nonexistent_file\"") {
+		t.Fatalf("expected 'No search matches for' message: %s", view)
+	}
+
+	// 4. Hidden toggle hides results, showing "Hidden results (press H to show)"
+	// Clear search first
+	m = send(m, "/")
+	m = send(m, "esc")
+	// Toggle H to hide dotfiles
+	m = send(m, "H")
+	view = m.View().Content
+	if !strings.Contains(view, "Hidden results (press H to show)") {
+		t.Fatalf("expected 'Hidden results (press H to show)' when hidden toggle off: %s", view)
+	}
+
+	// 5. Completely empty repository shows "Empty repository"
+	emptyEngine := &fixtureEngine{inventory: Inventory{Entries: []Entry{}}}
+	mEmpty := boot(t, emptyEngine, false, "track")
+	emptyView := mEmpty.View().Content
+	if !strings.Contains(emptyView, "Empty repository") {
+		t.Fatalf("expected 'Empty repository' for empty inventory: %s", emptyView)
+	}
+}
+
+func TestSmallTerminalReturningActionsKeepActiveSelectionVisible(t *testing.T) {
+	e := &fixtureEngine{}
+	m := NewReturningModel(e)
+	// Set small terminal dimensions (10 rows)
+	m, _ = m.Update(tea.WindowSizeMsg{Width: 80, Height: 10})
+
+	// Iterate through all 8 actions and verify selection indicator is always visible
+	for step := 0; step < 8; step++ {
+		view := m.View().Content
+		if !strings.Contains(view, ">") {
+			t.Fatalf("step %d: selection indicator '>' vanished at 10 terminal rows:\n%s", step, view)
+		}
+		m, _ = m.Update(key("j"))
+	}
+}
+
+func TestMetadataEditorValidatedChoiceCyclingAndGuidance(t *testing.T) {
+	e := &fixtureEngine{
+		inventory: Inventory{
+			Machines: []string{"test_machine"},
+			Entries: []Entry{
+				{
+					Path:   "config.toml",
+					Kind:   "file",
+					Status: "eligible",
+					Metadata: map[string]any{
+						"destination": "config.toml",
+						"os":          []string{"darwin"},
+						"portability": "managed-shared",
+						"impact":      "Safe",
+					},
+				},
+			},
+		},
+	}
+	m := boot(t, e, false, "track")
+	// Open metadata editor with 'e'
+	m = send(m, "e")
+	view := m.View().Content
+	if !strings.Contains(view, "EDIT TRACK METADATA") {
+		t.Fatalf("expected metadata editor view, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Guidance:") {
+		t.Fatalf("expected guidance, got:\n%s", view)
+	}
+
+	// Move to portability field (fields: destination [0], os [1], portability [2])
+	m = send(m, "tab") // field 1: os
+	m = send(m, "tab") // field 2: portability
+	view = m.View().Content
+	if !strings.Contains(view, "> portability") {
+		t.Fatalf("expected focus on portability, got:\n%s", view)
+	}
+	if !strings.Contains(view, "Accepted choices:") {
+		t.Fatalf("expected accepted choices on portability, got:\n%s", view)
+	}
+	if !strings.Contains(view, "[managed-shared]") {
+		t.Fatalf("expected [managed-shared] active, got:\n%s", view)
+	}
+
+	// Cycle choices using Space
+	m = send(m, " ")
+	view = m.View().Content
+	if !strings.Contains(view, "[managed-local]") {
+		t.Fatalf("expected [managed-local] after Space cycle, got:\n%s", view)
+	}
+	m = send(m, " ")
+	view = m.View().Content
+	if !strings.Contains(view, "[managed-templated]") {
+		t.Fatalf("expected [managed-templated] after Space cycle, got:\n%s", view)
+	}
+	m = send(m, " ")
+	view = m.View().Content
+	if !strings.Contains(view, "[managed-os-only]") {
+		t.Fatalf("expected [managed-os-only] after Space cycle, got:\n%s", view)
+	}
+
+	// Move to impact field (field 3)
+	m = send(m, "tab")
+	view = m.View().Content
+	if !strings.Contains(view, "> impact") || !strings.Contains(view, "[Safe]") {
+		t.Fatalf("expected focus on impact with [Safe], got:\n%s", view)
+	}
+	// Cycle impact using Right arrow
+	m, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyRight}))
+	view = m.View().Content
+	if !strings.Contains(view, "[Unsafe]") {
+		t.Fatalf("expected [Unsafe] after Right arrow, got:\n%s", view)
+	}
+
+	// Test validation: clear impact with ctrl+u and type invalid value "Dangerous"
+	m = send(m, "ctrl+u")
+	for _, r := range "Dangerous" {
+		m, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: r, Text: string(r)}))
+	}
+	m = send(m, "enter")
+	view = m.View().Content
+	// Must stay in editor and display validation failure
+	if !strings.Contains(view, "EDIT TRACK METADATA") || !strings.Contains(view, "Invalid impact") {
+		t.Fatalf("expected validation failure message blocking save, got:\n%s", view)
+	}
+
+	// Restore valid impact using Space
+	m = send(m, " ")
+	m = send(m, "enter")
+	// Now saved and returned to browser
+	if strings.Contains(m.View().Content, "EDIT TRACK METADATA") {
+		t.Fatalf("expected exit from metadata editor on valid save, got:\n%s", m.View().Content)
+	}
 }

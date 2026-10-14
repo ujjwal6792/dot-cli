@@ -182,13 +182,32 @@ func (m model) renderReturning() string {
 		return view + "\n\nj/k move · Enter confirm · Esc cancel"
 	}
 	var b strings.Builder
-	b.WriteString("DOT · returning-user actions\nNo files preselected; inspection is not consent.\n\n")
-	for i, label := range returningActions {
+	b.WriteString("DOT · returning-user actions\n")
+	extraLines := 4
+	if m.currentMachine.ID != "" {
+		fmt.Fprintf(&b, "Machine: %s · %s\n", safeTerminal(m.currentMachine.ID), safeTerminal(m.currentMachine.OS))
+		extraLines++
+	}
+	b.WriteString("No files preselected; inspection is not consent.\n\n")
+	if m.loading || m.err != nil || m.message != "" {
+		extraLines++
+	}
+	availableRows := max(1, m.height-extraLines)
+	start := 0
+	end := len(returningActions)
+	if availableRows < len(returningActions) {
+		start = max(0, min(m.returningChoice-availableRows+1, len(returningActions)-availableRows))
+		if m.returningChoice < start {
+			start = m.returningChoice
+		}
+		end = min(len(returningActions), start+availableRows)
+	}
+	for i := start; i < end; i++ {
 		mark := "  "
 		if i == m.returningChoice {
 			mark = "> "
 		}
-		fmt.Fprintf(&b, "%s%s\n", mark, label)
+		fmt.Fprintf(&b, "%s%s\n", mark, returningActions[i])
 	}
 	if m.loading {
 		b.WriteString("\nInspecting…")

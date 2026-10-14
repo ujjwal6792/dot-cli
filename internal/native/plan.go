@@ -1,11 +1,13 @@
 package native
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
 	"os"
 	"sort"
+	"strings"
 )
 
 func validateCustom(c map[string]any) error {
@@ -119,8 +121,12 @@ func (e *Engine) Plan(ctx context.Context, r Request) (Plan, error) {
 	if len(profiles) == 0 {
 		if len(a.Profiles) > 0 && r.Profile == a.Profile {
 			profiles = append(profiles, a.Profiles...)
-		} else {
-			profiles = []string{r.Profile}
+		} else if r.Profile != "" {
+			if _, ok := m.Profiles[r.Profile]; ok {
+				profiles = []string{r.Profile}
+			} else if r.Entries == nil {
+				return p, fmt.Errorf("unknown named profile %q", r.Profile)
+			}
 		}
 	}
 	sort.Strings(profiles)
@@ -366,11 +372,199 @@ func PlanDiffs(p Plan) []Diff {
 		}
 		text := ""
 		if a.Path != ".gitconfig" && len(a.Before.Data)+len(a.After.Data) < 128*1024 {
-			text = "--- before\n+++ after\n-" + string(a.Before.Data) + "\n+" + string(a.After.Data)
+			text = computeLineDiff(a.Before.Data, a.After.Data, 3)
+		} else if a.Path == ".gitconfig" && len(a.GitValues) > 0 {
+			var b strings.Builder
+			b.WriteString("--- before\n+++ after\n")
+			for _, k := range sortedKeys(a.GitValues) {
+				fmt.Fprintf(&b, "@@ %s @@\n+%s\n", k, a.GitValues[k])
+			}
+			text = strings.TrimRight(b.String(), "\n")
 		}
 		out = append(out, Diff{Path: a.Path, Status: status, Summary: p.Direction, Text: text})
 	}
 	return out
+}
+
+type diffOp int
+
+const (
+	diffEqual diffOp = iota
+	diffDelete
+	diffInsert
+)
+
+type diffEdit struct {
+	op   diffOp
+	text string
+}
+
+func computeLineDiff(before, after []byte, contextLines int) string {
+	if bytes.Equal(before, after) {
+		return ""
+	}
+	if len(before) == 0 && len(after) == 0 {
+		return ""
+	}
+
+	splitLines := func(data []byte) []string {
+		if len(data) == 0 {
+			return nil
+		}
+		s := string(data)
+		lines := strings.Split(s, "\n")
+		if len(lines) > 0 && lines[len(lines)-1] == "" {
+			lines = lines[:len(lines)-1]
+		}
+		return lines
+	}
+
+	a := splitLines(before)
+	b := splitLines(after)
+
+	if len(a) == 0 {
+		var buf strings.Builder
+		fmt.Fprintf(&buf, "--- before\n+++ after\n@@ -0,0 +1,%d @@\n", len(b))
+		for _, line := range b {
+			buf.WriteString("+" + line + "\n")
+		}
+		return strings.TrimRight(buf.String(), "\n")
+	}
+
+	if len(b) == 0 {
+		var buf strings.Builder
+		fmt.Fprintf(&buf, "--- before\n+++ after\n@@ -1,%d +0,0 @@\n", len(a))
+		for _, line := range a {
+			buf.WriteString("-" + line + "\n")
+		}
+		return strings.TrimRight(buf.String(), "\n")
+	}
+
+	// Dynamic programming LCS for edit script
+	n := len(a)
+	m := len(b)
+	dp := make([][]int, n+1)
+	for idx := range dp {
+		dp[idx] = make([]int, m+1)
+	}
+	for i := n - 1; i >= 0; i-- {
+		for j := m - 1; j >= 0; j-- {
+			if a[i] == b[j] {
+				dp[i][j] = dp[i+1][j+1] + 1
+			} else if dp[i+1][j] >= dp[i][j+1] {
+				dp[i][j] = dp[i+1][j]
+			} else {
+				dp[i][j] = dp[i][j+1]
+			}
+		}
+	}
+
+	var edits []diffEdit
+	i, j := 0, 0
+	for i < n || j < m {
+		if i < n && j < m && a[i] == b[j] {
+			edits = append(edits, diffEdit{op: diffEqual, text: a[i]})
+			i++
+			j++
+		} else if i < n && (j == m || dp[i+1][j] >= dp[i][j+1]) {
+			edits = append(edits, diffEdit{op: diffDelete, text: a[i]})
+			i++
+		} else {
+			edits = append(edits, diffEdit{op: diffInsert, text: b[j]})
+			j++
+		}
+	}
+
+	type hunkItem struct {
+		edit      diffEdit
+		beforeNum int
+		afterNum  int
+	}
+
+	var items []hunkItem
+	bNum, aNum := 1, 1
+	for _, ed := range edits {
+		item := hunkItem{edit: ed}
+		if ed.op == diffEqual {
+			item.beforeNum = bNum
+			item.afterNum = aNum
+			bNum++
+			aNum++
+		} else if ed.op == diffDelete {
+			item.beforeNum = bNum
+			bNum++
+		} else {
+			item.afterNum = aNum
+			aNum++
+		}
+		items = append(items, item)
+	}
+
+	var changeIndices []int
+	for idx, it := range items {
+		if it.edit.op != diffEqual {
+			changeIndices = append(changeIndices, idx)
+		}
+	}
+	if len(changeIndices) == 0 {
+		return ""
+	}
+
+	type rangePair struct {
+		start int
+		end   int
+	}
+	var hunkRanges []rangePair
+	curStart := max(0, changeIndices[0]-contextLines)
+	curEnd := min(len(items), changeIndices[0]+contextLines+1)
+
+	for _, chIdx := range changeIndices[1:] {
+		hunkStart := max(0, chIdx-contextLines)
+		hunkEnd := min(len(items), chIdx+contextLines+1)
+		if hunkStart <= curEnd {
+			if hunkEnd > curEnd {
+				curEnd = hunkEnd
+			}
+		} else {
+			hunkRanges = append(hunkRanges, rangePair{curStart, curEnd})
+			curStart = hunkStart
+			curEnd = hunkEnd
+		}
+	}
+	hunkRanges = append(hunkRanges, rangePair{curStart, curEnd})
+
+	var buf strings.Builder
+	buf.WriteString("--- before\n+++ after\n")
+	for _, hr := range hunkRanges {
+		slice := items[hr.start:hr.end]
+		bStart, bCount := 0, 0
+		aStart, aCount := 0, 0
+		for _, it := range slice {
+			if it.edit.op == diffEqual || it.edit.op == diffDelete {
+				if bStart == 0 {
+					bStart = it.beforeNum
+				}
+				bCount++
+			}
+			if it.edit.op == diffEqual || it.edit.op == diffInsert {
+				if aStart == 0 {
+					aStart = it.afterNum
+				}
+				aCount++
+			}
+		}
+		fmt.Fprintf(&buf, "@@ -%d,%d +%d,%d @@\n", bStart, bCount, aStart, aCount)
+		for _, it := range slice {
+			prefix := " "
+			if it.edit.op == diffDelete {
+				prefix = "-"
+			} else if it.edit.op == diffInsert {
+				prefix = "+"
+			}
+			buf.WriteString(prefix + it.edit.text + "\n")
+		}
+	}
+	return strings.TrimRight(buf.String(), "\n")
 }
 func (e *Engine) Apply(ctx context.Context, p Plan, consent Consent) error {
 	if consent.Approve == "" || consent.Approve != p.ID || p.ID != planID(p) {

@@ -135,3 +135,89 @@ func TestSourceReplaceRequiresSecondConfirmationNamingBackup(t *testing.T) {
 		t.Fatal(m.View().Content)
 	}
 }
+
+type sourceContractFailureFixture struct {
+	sourceFixture
+	continueCalls int
+}
+
+func (f *sourceContractFailureFixture) InitSource(_ context.Context, request map[string]any) (SourceResult, error) {
+	action := request["action"].(string)
+	f.calls = append(f.calls, action)
+	if action == "continue" {
+		f.continueCalls++
+		return SourceResult{Exists: true, Valid: false}, errors.New(`source contract check failed: entry .bashrc: unsupported portability "invalid-port" (supported: managed-shared, managed-local, managed-templated, managed-os-only)`)
+	}
+	if action == "backup-plan" {
+		return SourceResult{Exists: true, Backup: "/home/source.backup-20261014T120000.000000Z/checkout", Plan: map[string]any{"backup": "/home/source.backup-20261014T120000.000000Z/checkout"}}, nil
+	}
+	return SourceResult{Exists: true, Valid: false, Error: `source contract check failed: entry .bashrc: unsupported portability "invalid-port" (supported: managed-shared, managed-local, managed-templated, managed-os-only)`}, nil
+}
+
+func TestSourceContractIncompatibilityShowsRecoveryGuidanceAndActionableChoices(t *testing.T) {
+	e := &sourceContractFailureFixture{sourceFixture: sourceFixture{exists: true}}
+	// Welcome -> detect -> invalid detected so goes straight to source-recovery
+	m := sendAndRun(NewInitModel(e), "enter")
+	view := m.View().Content
+
+	if !strings.Contains(view, "Contract Compatibility Recovery") {
+		t.Fatalf("expected recovery view, got: %s", view)
+	}
+	if !strings.Contains(view, ".bashrc") {
+		t.Fatalf("expected entry .bashrc in view, got: %s", view)
+	}
+	if !strings.Contains(view, "invalid-port") {
+		t.Fatalf("expected actual value in view, got: %s", view)
+	}
+	if !strings.Contains(view, "managed-shared") || !strings.Contains(view, "managed-os-only") {
+		t.Fatalf("expected supported values in view, got: %s", view)
+	}
+	if !strings.Contains(view, "Diagnostics") || !strings.Contains(view, "Retry") || !strings.Contains(view, "Change source") || !strings.Contains(view, "Replace") {
+		t.Fatalf("expected all 4 recovery choices in view, got: %s", view)
+	}
+
+	// Choice 0: Diagnostics
+	m = send(m, "enter")
+	diagView := m.View().Content
+	if !strings.Contains(diagView, "Contract Diagnostics & Repair Guidance") {
+		t.Fatalf("expected diagnostics view, got: %s", diagView)
+	}
+	if !strings.Contains(diagView, "Invalid applies remain strictly blocked") || !strings.Contains(diagView, "Metadata is preserved intact") {
+		t.Fatalf("expected safety policy in diagnostics, got: %s", diagView)
+	}
+
+	// Esc returns to recovery
+	m = send(m, "esc")
+	if !strings.Contains(m.View().Content, "Contract Compatibility Recovery") {
+		t.Fatalf("expected return to recovery, got: %s", m.View().Content)
+	}
+
+	// Choice 1: Retry
+	m = send(m, "j")
+	m = sendAndRun(m, "enter")
+	if e.continueCalls != 1 {
+		t.Fatalf("expected 1 continue call, got %d", e.continueCalls)
+	}
+	if !strings.Contains(m.View().Content, "Contract Compatibility Recovery") {
+		t.Fatalf("expected return to recovery on failed retry, got: %s", m.View().Content)
+	}
+
+	// Choice 2: Change source (move from 0 -> 1 -> 2)
+	m = send(m, "j")
+	m = send(m, "j")
+	m = send(m, "enter")
+	if !strings.Contains(m.View().Content, "Existing user") || !strings.Contains(m.View().Content, "New user") {
+		t.Fatalf("expected source-choice after Change source, got: %s", m.View().Content)
+	}
+
+	// Test Choice 3 (Replace)
+	e2 := &sourceContractFailureFixture{sourceFixture: sourceFixture{exists: true}}
+	m2 := sendAndRun(NewInitModel(e2), "enter")
+	m2 = send(m2, "j")
+	m2 = send(m2, "j")
+	m2 = send(m2, "j")
+	m2 = sendAndRun(m2, "enter")
+	if !strings.Contains(m2.View().Content, "/home/source.backup-20261014T120000.000000Z/checkout") {
+		t.Fatalf("expected backup review after selecting Replace, got: %s", m2.View().Content)
+	}
+}

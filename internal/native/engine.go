@@ -175,8 +175,11 @@ func (e *Engine) validateEntry(x Entry) error {
 	if x.Impact != "Safe" && x.Impact != "Unsafe" {
 		return fmt.Errorf("entry requires Safe/Unsafe impact")
 	}
-	if !has([]string{"managed-shared", "managed-local", "managed-templated"}, x.Portability) {
-		return fmt.Errorf("unsupported portability")
+	if !has([]string{"managed-shared", "managed-local", "managed-templated", "managed-os-only"}, x.Portability) {
+		return fmt.Errorf("unsupported portability %q (supported: managed-shared, managed-local, managed-templated, managed-os-only)", x.Portability)
+	}
+	if x.Portability == "managed-os-only" && len(x.OS) != 1 {
+		return fmt.Errorf("os-only requires exactly one OS")
 	}
 	if err := validateAssignment(x.Machines); err != nil {
 		return err

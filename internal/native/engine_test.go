@@ -3,6 +3,7 @@ package native_test
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -689,5 +690,99 @@ func TestStrictRequestDecoderRejectsAmbiguousFields(t *testing.T) {
 		if err := native.Decode([]byte(body), &r); err == nil {
 			t.Fatalf("ambiguous request accepted: %s", body)
 		}
+	}
+}
+
+func TestContractCompatibilityManagedOSOnly(t *testing.T) {
+	e, c := fixture(t)
+	var m native.Manifest
+	b, _ := os.ReadFile(filepath.Join(c.Source, "manifest.json"))
+	_ = native.Decode(b, &m)
+	write(t, filepath.Join(c.Source, "home/os-only"), "data\n", 0600)
+	// Valid managed-os-only entry with exactly one OS
+	m.Entries["os-only"] = native.Entry{Source: "home/os-only", Destination: "os-only", OS: []string{"linux"}, Portability: "managed-os-only", Impact: "Safe"}
+	writeJSON(t, filepath.Join(c.Source, "manifest.json"), m)
+	if _, err := e.CheckContract(context.Background()); err != nil {
+		t.Fatalf("managed-os-only rejected by contract check: %v", err)
+	}
+
+	// Multi-OS managed-os-only must be rejected by bounded validation
+	m.Entries["multi-os"] = native.Entry{Source: "home/os-only", Destination: "multi-os", OS: []string{"linux", "darwin"}, Portability: "managed-os-only", Impact: "Safe"}
+	writeJSON(t, filepath.Join(c.Source, "manifest.json"), m)
+	if _, err := e.CheckContract(context.Background()); err == nil {
+		t.Fatal("managed-os-only with multiple OSes was accepted; expected failure")
+	}
+}
+
+func TestManualAdoptSelectionWithoutDefaultProfile(t *testing.T) {
+	e, c := fixture(t)
+	var m native.Manifest
+	b, _ := os.ReadFile(filepath.Join(c.Source, "manifest.json"))
+	_ = native.Decode(b, &m)
+	// Manifest has named profile "work" but NO "default" profile
+	m.Profiles = map[string][]string{"work": {"prefs"}}
+	writeJSON(t, filepath.Join(c.Source, "manifest.json"), m)
+	// Manual exact entry selection with default approval label "default"
+	p, err := e.Plan(context.Background(), native.Request{
+		Version: 1,
+		Mode:    "adopt",
+		Profile: "default",
+		Entries: []string{"prefs"},
+	})
+	if err != nil {
+		t.Fatalf("manual adopt selection failed without default profile: %v", err)
+	}
+	if len(p.Selected) != 1 || p.Selected["prefs"].Destination != "prefs" {
+		t.Fatalf("manual selection did not select prefs: %+v", p.Selected)
+	}
+}
+
+func TestPlanDiffGeneratesContextualLineHunks(t *testing.T) {
+	e, c := fixture(t)
+	// Create a 10-line file
+	var originalLines []string
+	for i := 1; i <= 10; i++ {
+		originalLines = append(originalLines, fmt.Sprintf("line %d", i))
+	}
+	write(t, filepath.Join(c.Home, "prefs"), strings.Join(originalLines, "\n")+"\n", 0600)
+
+	// Modified version has line 5 changed
+	var modifiedLines []string
+	for i := 1; i <= 10; i++ {
+		if i == 5 {
+			modifiedLines = append(modifiedLines, "line 5 - modified")
+		} else {
+			modifiedLines = append(modifiedLines, fmt.Sprintf("line %d", i))
+		}
+	}
+	write(t, filepath.Join(c.Source, "home/prefs"), strings.Join(modifiedLines, "\n")+"\n", 0600)
+
+	p, err := e.Plan(context.Background(), native.Request{
+		Version: 1,
+		Mode:    "adopt",
+		Profile: "base",
+		Entries: []string{"prefs"},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	diffs := native.PlanDiffs(p)
+	if len(diffs) != 1 {
+		t.Fatalf("expected 1 diff, got %d", len(diffs))
+	}
+	diffText := diffs[0].Text
+	// Must contain unified diff header and hunk header
+	if !strings.Contains(diffText, "--- before") || !strings.Contains(diffText, "+++ after") {
+		t.Fatalf("missing diff file headers: %s", diffText)
+	}
+	if !strings.Contains(diffText, "@@ -2,7 +2,7 @@") {
+		t.Fatalf("expected hunk header @@ -2,7 +2,7 @@, got:\n%s", diffText)
+	}
+	if !strings.Contains(diffText, "-line 5") || !strings.Contains(diffText, "+line 5 - modified") {
+		t.Fatalf("missing changed lines in diff: %s", diffText)
+	}
+	// Line 1 and Line 10 should NOT be in the 3-line context hunk (hunk is lines 2..8)
+	if strings.Contains(diffText, "line 1\n") || strings.Contains(diffText, "line 10\n") {
+		t.Fatalf("diff contains out-of-context lines; expected only lines 2-8 in hunk:\n%s", diffText)
 	}
 }
