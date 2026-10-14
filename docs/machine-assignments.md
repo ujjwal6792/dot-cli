@@ -1,8 +1,8 @@
 # Machine assignments and local adoption
 
-This is the retained #15 behavioral contract. The Python implementation was
-retired; #16 must implement and verify it in the native Go engine. Current UI
-tests alone do not establish persistence or policy enforcement.
+This is the shared native engine's assignment/local-adoption contract, verified
+through real plans, filesystem effects and the extracted executable in
+[native acceptance](native-acceptance.md).
 
 New Track entries default to:
 
@@ -68,4 +68,6 @@ survive deselection/reselection and apply only to that target's resolved view.
 Updates use only the existing exact approved scope, retain the local customizations,
 and do not add deselected files. Shared manifest changes still require a separate
 reviewed source-side plan. Changing local state or source invalidates a saved plan.
-Machine-2 onboarding and status/diff JSON are separate work (#16).
+Local deselections survive profile switches; explicit reselection clears the
+corresponding exclusion. Machine-2 onboarding uses the same policy and its own
+state directory; `status`, `diff`, `scope show` expose machine-scoped JSON.

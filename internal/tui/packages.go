@@ -47,18 +47,23 @@ type packagesMsg struct {
 }
 
 // Release Bubble Tea's raw terminal while managers ask for build review/sudo.
-// Native manager execution and terminal stream wiring are owned by issue #17.
+// The native adapter receives every terminal stream; config Apply is unrelated.
 type packageInstall struct {
-	engine PackagesEngine
-	plan   map[string]any
+	engine  PackagesEngine
+	ctx     context.Context
+	plan    map[string]any
+	streams TerminalStreams
 }
 
-func (p *packageInstall) SetStdin(io.Reader)  {}
-func (p *packageInstall) SetStdout(io.Writer) {}
-func (p *packageInstall) SetStderr(io.Writer) {}
+func (p *packageInstall) SetStdin(r io.Reader)  { p.streams.In = r }
+func (p *packageInstall) SetStdout(w io.Writer) { p.streams.Out = w }
+func (p *packageInstall) SetStderr(w io.Writer) { p.streams.Err = w }
 func (p *packageInstall) Run() error {
-	_, err := p.engine.Packages(context.Background(), "apply", nil, p.plan, inputValue(p.plan["id"]))
-	return err
+	e, ok := p.engine.(PackageTerminalEngine)
+	if !ok {
+		return fmt.Errorf("native terminal package installation unavailable; nothing installed")
+	}
+	return e.InstallPackages(p.ctx, p.plan, inputValue(p.plan["id"]), p.streams)
 }
 
 func (m *model) packageCommand(action string, request map[string]any) tea.Cmd {
@@ -72,7 +77,7 @@ func (m *model) packageCommand(action string, request map[string]any) tea.Cmd {
 	m.packageGeneration++
 	generation := m.packageGeneration
 	return func() tea.Msg {
-		result, err := engine.Packages(context.Background(), action, request, nil, "")
+		result, err := engine.Packages(m.setupCtx(), action, request, nil, "")
 		return packagesMsg{generation, action, result, err}
 	}
 }
@@ -83,6 +88,9 @@ func (m model) updatePackages(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.packageStage != "edit" && m.packageStage != "import" {
 		switch key.String() {
 		case "q":
+			if m.setupCancel != nil {
+				m.setupCancel()
+			}
 			return m, tea.Quit
 		case "P":
 			m.packageView = false
@@ -144,7 +152,7 @@ func (m model) updatePackages(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.loading = true
 		m.packageGeneration++
 		generation := m.packageGeneration
-		return m, tea.Exec(&packageInstall{engine: engine, plan: m.packagePlan}, func(err error) tea.Msg {
+		return m, tea.Exec(&packageInstall{engine: engine, ctx: m.setupCtx(), plan: m.packagePlan}, func(err error) tea.Msg {
 			return packagesMsg{generation: generation, action: "apply", err: err}
 		})
 	case "j", "down":

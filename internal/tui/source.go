@@ -3,6 +3,7 @@ package tui
 import (
 	"context"
 	"fmt"
+	"io"
 	"strings"
 
 	"charm.land/bubbles/v2/textinput"
@@ -14,12 +15,32 @@ import (
 type SourceEngine interface {
 	InitSource(context.Context, map[string]any) (SourceResult, error)
 }
+type SourceTerminalEngine interface {
+	InitSourceTerminal(context.Context, map[string]any, TerminalStreams) (SourceResult, error)
+}
+type sourceClone struct {
+	engine  SourceTerminalEngine
+	ctx     context.Context
+	request map[string]any
+	streams TerminalStreams
+	result  SourceResult
+}
+
+func (p *sourceClone) SetStdin(r io.Reader)  { p.streams.In = r }
+func (p *sourceClone) SetStdout(w io.Writer) { p.streams.Out = w }
+func (p *sourceClone) SetStderr(w io.Writer) { p.streams.Err = w }
+func (p *sourceClone) Run() error {
+	var err error
+	p.result, err = p.engine.InitSourceTerminal(p.ctx, p.request, p.streams)
+	return err
+}
 
 type SourceResult struct {
-	Exists bool           `json:"exists"`
-	Valid  bool           `json:"valid"`
-	Backup string         `json:"backup,omitempty"`
-	Plan   map[string]any `json:"plan,omitempty"`
+	NeedsGit bool           `json:"needs_git,omitempty"`
+	Exists   bool           `json:"exists"`
+	Valid    bool           `json:"valid"`
+	Backup   string         `json:"backup,omitempty"`
+	Plan     map[string]any `json:"plan,omitempty"`
 }
 
 type sourceMsg struct {
@@ -40,8 +61,18 @@ func (m *model) sourceCommand(action string, fields map[string]any) tea.Cmd {
 	}
 	m.loading = true
 	m.message = ""
+	if action == "clone" {
+		native, ok := m.engine.(SourceTerminalEngine)
+		if !ok {
+			m.loading = false
+			m.message = "Native Git terminal handoff is unavailable; nothing cloned."
+			return nil
+		}
+		process := &sourceClone{engine: native, ctx: m.setupCtx(), request: request}
+		return tea.Exec(process, func(err error) tea.Msg { return sourceMsg{action: action, result: process.result, err: err} })
+	}
 	return func() tea.Msg {
-		result, err := e.InitSource(context.Background(), request)
+		result, err := e.InitSource(m.setupCtx(), request)
 		return sourceMsg{action, result, err}
 	}
 }
@@ -67,6 +98,12 @@ func (m model) sourceResult(msg sourceMsg) (tea.Model, tea.Cmd) {
 	}
 	switch msg.action {
 	case "detect":
+		if msg.result.NeedsGit {
+			m.stage = "dependencies"
+			m.dependenciesNext = "source"
+			cmd := m.setupCommand("dependencies", nil)
+			return m, cmd
+		}
 		m.sourceChoice = 0
 		if msg.result.Exists {
 			m.stage = "source-existing"
@@ -78,14 +115,17 @@ func (m model) sourceResult(msg sourceMsg) (tea.Model, tea.Cmd) {
 		m.sourceBackup = msg.result.Backup
 		m.sourceChoice = 0
 		m.stage = "source-confirm"
+		m.viewport.SetContent(safeTerminal(backupReview(m.sourceBackup)))
+		m.viewport.SoftWrap = true
+		m.viewport.SetHeight(max(3, m.height-7))
+		m.viewport.GotoTop()
 	case "replace":
 		m.stage = "source-choice"
 		m.sourceChoice = 0
 		m.message = "Original checkout preserved at " + msg.result.Backup
 	case "continue", "clone", "new":
 		m.stage = "machine"
-		m.machineInput = textinput.New()
-		m.machineInput.CharLimit = 128
+		m.newMachineForm("")
 		cmd := m.machineCommand("suggest")
 		return m, cmd
 	}
@@ -94,6 +134,15 @@ func (m model) sourceResult(msg sourceMsg) (tea.Model, tea.Cmd) {
 
 func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.String() == "ctrl+c" {
+		if m.setupCancel != nil {
+			m.setupCancel()
+		}
+		return m, tea.Interrupt
+	}
+	if key.String() == "q" && m.stage != "machine" && m.stage != "source-url" && m.stage != "tracker-edit" {
+		if m.setupCancel != nil {
+			m.setupCancel()
+		}
 		return m, tea.Quit
 	}
 	if m.loading {
@@ -101,6 +150,19 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.stage == "machine" {
 		return m.updateMachine(key)
+	}
+	if m.stage == "source-confirm" {
+		if key.String() == "J" {
+			m.viewport.ScrollDown(1)
+			return m, nil
+		}
+		if key.String() == "K" {
+			m.viewport.ScrollUp(1)
+			return m, nil
+		}
+	}
+	if m.stage == "dependencies" || strings.HasPrefix(m.stage, "tracker-") || m.stage == "setup-incomplete" {
+		return m.updateSetup(key)
 	}
 	if m.stage == "source-url" {
 		switch key.String() {
@@ -134,7 +196,10 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "welcome":
 			return m.startSource("detect", nil)
 		case "done":
-			return m, tea.Quit
+			m.initMode = false
+			m.returning = true
+			m.resetReturning()
+			return m, nil
 		case "source-existing":
 			if m.sourceChoice == 0 {
 				return m.startSource("continue", nil)
@@ -174,17 +239,25 @@ func (m model) renderSource() string {
 		title = "Source · connect your own repository"
 		choices = []string{"Existing user: clone your repository", "New user: local git init + remote add origin"}
 	case "source-confirm":
-		title = "Confirm Replace · original checkout will be moved, never deleted\nBackup path:\n" + m.sourceBackup
+		title = backupReview(m.sourceBackup)
 		choices = []string{"Cancel", "Confirm backup and replace"}
 	case "source-url":
 		title = "Source · paste a credential-free HTTPS or SSH repository URL\nInput hidden to avoid displaying credentials: " + strings.Repeat("•", min(40, len(m.sourceInput.Value())))
 		if m.sourceAction == "new" {
 			title += "\nCreate the empty repository on your platform yourself.\nOnly local git init and remote add; no hosting API, commit or push."
+		} else {
+			title += "\nNative Git/SSH authentication follows terminal handoff. Dot never reads passwords."
 		}
 		if m.loading {
 			title += "\nWorking…"
 		}
 		return title + "\n\nEnter connect · Esc back · Ctrl+C quit\n" + m.message
+	}
+	if m.stage == "source-confirm" {
+		m.viewport.SetContent(safeTerminal(title))
+		m.viewport.SetHeight(max(3, m.height-7))
+		m.viewport.SoftWrap = true
+		title = m.viewport.View()
 	}
 	for i, choice := range choices {
 		mark := "  "
@@ -196,5 +269,12 @@ func (m model) renderSource() string {
 	if m.loading {
 		title += "\nWorking…"
 	}
-	return title + "\n\nj/k move · Enter select · Esc cancel · Ctrl+C quit\n" + m.message
+	controls := "j/k move · Enter select · Esc cancel · Ctrl+C quit"
+	if m.stage == "source-confirm" {
+		controls = "j/k choose · J/K scroll backup path · Enter confirm · Esc cancel"
+	}
+	return title + "\n\n" + controls + "\n" + m.message
+}
+func backupReview(path string) string {
+	return "Confirm Replace · original checkout will be moved, never deleted\nBackup path:\n" + path
 }
