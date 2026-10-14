@@ -5,6 +5,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	tea "charm.land/bubbletea/v2"
@@ -197,5 +198,43 @@ func TestRealBrowserRetargetReviewsAndCancelWritesNothing(t *testing.T) {
 	a, err := e.Policy.LoadAdoption()
 	if err != nil || len(a.Entries) != 0 {
 		t.Fatal("Track implicitly adopted")
+	}
+}
+
+func TestStructuredInspectionViews(t *testing.T) {
+	e, _ := realNative(t)
+	ctx := context.Background()
+
+	status, err := e.Inspect(ctx, "status")
+	if err != nil {
+		t.Fatalf("Inspect status failed: %v", err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(status), "{") {
+		t.Fatalf("status inspection should be structured, not raw JSON: %s", status)
+	}
+	if !strings.Contains(status, "STATUS · Machine-Scoped Repository Inventory") || !strings.Contains(status, "Machines (1): linux_ui") {
+		t.Fatalf("status inspection missing structured sections: %s", status)
+	}
+
+	diffText, err := e.Inspect(ctx, "diff")
+	if err != nil {
+		t.Fatalf("Inspect diff failed: %v", err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(diffText), "{") {
+		t.Fatalf("diff inspection should be structured, not raw JSON: %s", diffText)
+	}
+	if !strings.Contains(diffText, "DIFF · Importable Changes") {
+		t.Fatalf("diff inspection missing structured header: %s", diffText)
+	}
+
+	scope, err := e.Inspect(ctx, "scope")
+	if err != nil {
+		t.Fatalf("Inspect scope failed: %v", err)
+	}
+	if strings.HasPrefix(strings.TrimSpace(scope), "{") {
+		t.Fatalf("scope inspection should be structured, not raw JSON: %s", scope)
+	}
+	if !strings.Contains(scope, "APPROVED SCOPE · Local Adoption Contract") || !strings.Contains(scope, "linux_ui") {
+		t.Fatalf("scope inspection missing structured header: %s", scope)
 	}
 }

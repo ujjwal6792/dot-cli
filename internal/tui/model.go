@@ -107,6 +107,7 @@ type model struct {
 	sourceInput                      textinput.Model
 	sourceAction, sourceBackup       string
 	sourcePlan                       map[string]any
+	sourceError                      string
 	machineForm                      *huh.Form
 	machineOS                        string
 	dependencies                     DependencyResult
@@ -164,7 +165,7 @@ func NewModel(engine Engine, rounds bool, mode string) tea.Model {
 	templateEditor.Placeholder = "Secret-free template"
 	templateEditor.SetWidth(72)
 	templateEditor.SetHeight(12)
-	return model{engine: engine, basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: mode, profile: "default", search: input, templateInput: templateEditor, rounds: rounds, stage: stage, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
+	return model{engine: engine, basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: mode, profile: "default", search: input, templateInput: templateEditor, rounds: rounds, stage: stage, hidden: true, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 
 func NewInitModel(engine Engine) tea.Model {
@@ -181,7 +182,7 @@ func NewInitModelContext(ctx context.Context, engine Engine) tea.Model {
 	templateEditor.Placeholder = "Secret-free template"
 	templateEditor.SetWidth(72)
 	templateEditor.SetHeight(12)
-	return model{engine: engine, setupContext: ctx, setupCancel: cancel, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: false, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
+	return model{engine: engine, setupContext: ctx, setupCancel: cancel, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: true, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 func (m model) Init() tea.Cmd {
 	if m.stage == "setup" || m.initMode || m.returning {
@@ -487,7 +488,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.search.SetValue("")
 			m.searching = false
 			m.cursor = 0
-			m.hidden = false
+			m.hidden = true
 			m.generation++
 			m.previewGeneration++
 			m.message = "Nothing selected. Browsing is not authorization."
@@ -734,6 +735,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.previewViewport.ScrollUp(1)
 		case "/":
 			m.searching = true
+			m.search.SetValue("")
 			m.search.Focus()
 		case "p":
 			cmd := m.plan()
@@ -758,7 +760,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m *model) updateSearch(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
-	if key.String() == "esc" || key.String() == "enter" {
+	if key.String() == "esc" {
+		m.searching = false
+		m.search.Blur()
+		m.search.SetValue("")
+		m.filter()
+		cmd := m.highlightCurrent()
+		return m, cmd
+	}
+	if key.String() == "enter" {
 		m.searching = false
 		m.search.Blur()
 		m.filter()
@@ -823,10 +833,14 @@ func (m *model) filter() {
 		if !m.hidden && hiddenPath(e.Path) {
 			continue
 		}
-		if query != "" && !strings.Contains(strings.ToLower(e.Path), query) {
+		if e.Status == "hidden" && !m.hidden {
 			continue
 		}
-		if e.Status == "hidden" && !m.hidden {
+		if query != "" {
+			if !strings.Contains(strings.ToLower(e.Path), query) {
+				continue
+			}
+			m.visible = append(m.visible, i)
 			continue
 		}
 		parent := parentPath(e.Path)
@@ -1036,7 +1050,7 @@ func (m *model) plan() tea.Cmd {
 		selections = append(selections, cloneMetadata(m.basket[p]))
 	}
 	request := map[string]any{"version": 1, "mode": m.mode, "profile": m.profile}
-	if m.mode == "adopt" && len(m.selectedProfiles) > 1 {
+	if m.mode == "adopt" && len(m.selectedProfiles) > 0 {
 		request["profiles"] = append([]string{}, m.selectedProfiles...)
 	}
 	if m.mode == "track" {
@@ -1141,14 +1155,41 @@ func (m model) updateReview(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
+var metadataChoices = map[string][]string{
+	"portability":  {"managed-shared", "managed-local", "managed-templated", "managed-os-only"},
+	"impact":       {"Safe", "Unsafe"},
+	"os":           {"darwin", "linux", "darwin,linux"},
+	"git_keys":     {"", "user.name", "user.email", "user.name,user.email"},
+	"integrations": {"", "git-config", "gemini-skills", "claude-skills", "desktop"},
+}
+
+var metadataGuidance = map[string]string{
+	"destination":  "Relative destination path under HOME (e.g. .bashrc).",
+	"os":           "Target OS: darwin, linux, or darwin,linux (managed-os-only requires exactly 1 OS).",
+	"portability":  "Portability tier: managed-shared, managed-local, managed-templated, or managed-os-only.",
+	"impact":       "Impact level: Safe (non-destructive) or Unsafe (may overwrite/remove).",
+	"template":     "Template body (managed-templated only). Press Ctrl+T to open multi-line editor.",
+	"git_keys":     "Permitted Git config keys: user.name, user.email (requires managed-templated).",
+	"removals":     "Comma-separated list of paths to remove before applying.",
+	"tools":        "Comma-separated list of tool dependencies required for this entry.",
+	"warnings":     "Comma-separated list of operational warnings.",
+	"integrations": "Permitted integrations: git-config, gemini-skills, claude-skills, desktop.",
+}
+
 func (m model) updateMetadata(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if key.String() == "esc" {
 		m.stage = ""
 		return m, nil
 	}
 	fields := []string{"destination", "os", "portability", "impact", "template", "git_keys", "removals", "tools", "warnings", "integrations"}
-	if key.String() == "tab" {
+	if key.String() == "tab" || key.String() == "down" {
 		m.editField = (m.editField + 1) % len(fields)
+		m.message = ""
+		return m, nil
+	}
+	if key.String() == "shift+tab" || key.String() == "up" {
+		m.editField = (m.editField - 1 + len(fields)) % len(fields)
+		m.message = ""
 		return m, nil
 	}
 	field := fields[m.editField]
@@ -1161,10 +1202,102 @@ func (m model) updateMetadata(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		return m, nil
 	}
 	switch key.String() {
+	case "right", "l":
+		if choices, ok := metadataChoices[field]; ok {
+			cur := inputValue(m.editValue[field])
+			idx := -1
+			for i, c := range choices {
+				if c == cur {
+					idx = i
+					break
+				}
+			}
+			nextIdx := (idx + 1) % len(choices)
+			m.editValue[field] = choices[nextIdx]
+			m.message = ""
+			return m, nil
+		}
+	case "left", "h":
+		if choices, ok := metadataChoices[field]; ok {
+			cur := inputValue(m.editValue[field])
+			idx := -1
+			for i, c := range choices {
+				if c == cur {
+					idx = i
+					break
+				}
+			}
+			prevIdx := (idx - 1 + len(choices)) % len(choices)
+			m.editValue[field] = choices[prevIdx]
+			m.message = ""
+			return m, nil
+		}
+	case " ", "space":
+		if choices, ok := metadataChoices[field]; ok {
+			cur := inputValue(m.editValue[field])
+			idx := -1
+			for i, c := range choices {
+				if c == cur {
+					idx = i
+					break
+				}
+			}
+			nextIdx := (idx + 1) % len(choices)
+			m.editValue[field] = choices[nextIdx]
+			m.message = ""
+			return m, nil
+		}
+		m.editValue[field] = inputValue(m.editValue[field]) + " "
+		return m, nil
 	case "enter":
 		if m.mode == "track" && (m.editValue["destination"] == "" || m.editValue["os"] == nil || m.editValue["os"] == "" || m.editValue["portability"] == nil || m.editValue["portability"] == "" || m.editValue["impact"] == nil || m.editValue["impact"] == "") {
 			m.message = "Destination, OS, portability, and impact are explicit required metadata."
 			return m, nil
+		}
+		portability := inputValue(m.editValue["portability"])
+		if portability != "" && !has([]string{"managed-shared", "managed-local", "managed-templated", "managed-os-only"}, portability) {
+			m.message = fmt.Sprintf("Invalid portability %q (supported: managed-shared, managed-local, managed-templated, managed-os-only)", portability)
+			return m, nil
+		}
+		impact := inputValue(m.editValue["impact"])
+		if impact != "" && impact != "Safe" && impact != "Unsafe" {
+			m.message = fmt.Sprintf("Invalid impact %q (supported: Safe, Unsafe)", impact)
+			return m, nil
+		}
+		osVal := inputValue(m.editValue["os"])
+		if osVal != "" {
+			osList := strings.Split(osVal, ",")
+			for _, o := range osList {
+				o = strings.TrimSpace(o)
+				if o != "darwin" && o != "linux" {
+					m.message = fmt.Sprintf("Invalid OS %q (supported: darwin, linux)", o)
+					return m, nil
+				}
+			}
+			if portability == "managed-os-only" && len(osList) != 1 {
+				m.message = "managed-os-only requires exactly one OS (darwin or linux)"
+				return m, nil
+			}
+		}
+		gitKeysVal := inputValue(m.editValue["git_keys"])
+		if gitKeysVal != "" {
+			for _, k := range strings.Split(gitKeysVal, ",") {
+				k = strings.TrimSpace(k)
+				if k != "" && k != "user.name" && k != "user.email" {
+					m.message = fmt.Sprintf("Invalid git key %q (supported: user.name, user.email)", k)
+					return m, nil
+				}
+			}
+		}
+		integrationsVal := inputValue(m.editValue["integrations"])
+		if integrationsVal != "" {
+			for _, ig := range strings.Split(integrationsVal, ",") {
+				ig = strings.TrimSpace(ig)
+				if ig != "" && !has([]string{"git-config", "gemini-skills", "claude-skills", "desktop"}, ig) {
+					m.message = fmt.Sprintf("Invalid integration %q (supported: git-config, gemini-skills, claude-skills, desktop)", ig)
+					return m, nil
+				}
+			}
 		}
 		value := cloneMetadata(m.editValue)
 		for _, field := range []string{"os", "git_keys", "removals", "tools", "warnings", "integrations", "requires", "notices"} {
@@ -1235,8 +1368,6 @@ func (m model) updateMetadata(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				current = ""
 			}
 			m.editValue[field] = current + key.String()
-		} else if key.String() == "space" {
-			m.editValue[field] = inputValue(m.editValue[field]) + " "
 		}
 	}
 	return m, nil
@@ -1255,6 +1386,15 @@ func inputValue(value any) string {
 		return ""
 	}
 	return fmt.Sprint(value)
+}
+
+func has(list []string, s string) bool {
+	for _, x := range list {
+		if x == s {
+			return true
+		}
+	}
+	return false
 }
 
 func (m model) entriesByPath(path string) Entry {
@@ -1311,18 +1451,6 @@ func (m model) updateConfirm(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-func (m model) View() tea.View {
-	height := m.height
-	if height < 1 {
-		height = 24
-	}
-	content := safeTerminal(m.render())
-	if m.initMode {
-		content = lipgloss.NewStyle().Width(max(20, m.width)).Render(content)
-	}
-	return tea.NewView(fitHeight(content, height))
-}
-
 var muted = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
 var strong = lipgloss.NewStyle().Bold(true)
 var ansiCSI = regexp.MustCompile("\\x1b\\[[0-?]*[ -/]*[@-~]")
@@ -1337,18 +1465,65 @@ func safeTerminal(value string) string {
 	}, value)
 }
 
+func sanitizeTerminalView(value string) string {
+	return strings.Map(func(r rune) rune {
+		if (r < 0x20 && r != '\n' && r != '\t' && r != 0x1b) || r == 0x7f {
+			return -1
+		}
+		return r
+	}, value)
+}
+
 func fitHeight(value string, height int) string {
 	lines := strings.Split(value, "\n")
 	if len(lines) <= height {
 		return value
 	}
-	if height <= 3 {
+	if height <= 2 {
 		return strings.Join(lines[:max(1, height)], "\n")
 	}
-	out := append([]string{}, lines[:height-3]...)
-	out = append(out, "…")
-	out = append(out, lines[len(lines)-2:]...)
-	return strings.Join(out, "\n")
+	focusIdx := -1
+	for idx, line := range lines {
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, ">") || strings.Contains(line, "> ") {
+			focusIdx = idx
+			break
+		}
+	}
+	if focusIdx >= 0 {
+		start := max(0, min(focusIdx-height+1, len(lines)-height))
+		if focusIdx < start {
+			start = focusIdx
+		}
+		end := min(len(lines), start+height)
+		return strings.Join(lines[start:end], "\n")
+	}
+	return strings.Join(lines[:height], "\n")
+}
+
+var modalBoxStyle = lipgloss.NewStyle().
+	Border(lipgloss.RoundedBorder()).
+	BorderForeground(lipgloss.Color("63")).
+	Padding(0, 1)
+
+func (m model) renderOverlay(body string) string {
+	w := m.width
+	if w < 1 {
+		w = 80
+	}
+	boxWidth := min(max(40, w-4), 84)
+	return modalBoxStyle.Width(boxWidth).Render(body)
+}
+
+func (m model) View() tea.View {
+	height := m.height
+	if height < 1 {
+		height = 24
+	}
+	content := sanitizeTerminalView(m.render())
+	v := tea.NewView(fitHeight(content, height))
+	v.AltScreen = true
+	return v
 }
 
 func (m model) render() string {
@@ -1356,7 +1531,7 @@ func (m model) render() string {
 		return m.renderSetup()
 	}
 	if m.returning && strings.HasPrefix(m.stage, "returning-") {
-		return m.renderReturning()
+		return m.renderOverlay(m.renderReturning())
 	}
 	if m.initMode && m.stage == "machine" {
 		return m.renderMachine()
@@ -1374,26 +1549,21 @@ func (m model) render() string {
 		m.height = 24
 	}
 	if m.stage == "review" && m.selected != nil {
-		return m.renderReview()
+		return m.renderOverlay(m.renderReview())
 	}
 	if m.stage == "metadata" {
-		fields := []string{"destination", "os", "portability", "impact", "template", "git_keys", "removals", "tools", "warnings", "integrations"}
-		view := fmt.Sprintf("EDIT %s METADATA · %s\n%s: %v\n\nEnter value explicitly; comma-separate lists.\nTab next field · Ctrl+U clear · Enter save · Esc cancel\nFields: %s", strings.ToUpper(m.mode), m.editPath, fields[m.editField], m.editValue[fields[m.editField]], strings.Join(fields, " · "))
-		if m.message != "" {
-			view += "\n" + safeTerminal(m.message)
-		}
-		return view
+		return m.renderOverlay(m.renderMetadata())
 	}
 	if m.stage == "template" {
-		return "EDIT SECRET-FREE TEMPLATE\n" + m.templateInput.View() + "\n\nCtrl+S save · Esc cancel"
+		return m.renderOverlay("EDIT SECRET-FREE TEMPLATE\n" + m.templateInput.View() + "\n\nCtrl+S save · Esc cancel")
 	}
 	if m.stage == "logical" {
-		return "LOGICAL FILE METADATA · Dotfiles\nCommon → explicit machine → OS; per-OS destinations.\n" + m.templateInput.View() + "\n\nCtrl+S prepare request · Esc cancel · no writes until exact review/approval\n" + safeTerminal(m.message)
+		return m.renderOverlay("LOGICAL FILE METADATA · Dotfiles\nCommon → explicit machine → OS; per-OS destinations.\n" + m.templateInput.View() + "\n\nCtrl+S prepare request · Esc cancel · no writes until exact review/approval\n" + safeTerminal(m.message))
 	}
 	if m.stage == "confirm" {
 		choices := []string{"Cancel", "Apply exact reviewed plan"}
 		selected := m.confirmChoice
-		return fmt.Sprintf("FINAL CONFIRMATION · %s\n\nUnsafe %t · Desktop %t · Backup replacement %t\n\n%s %s\n%s %s\n\nj/k choose · Enter confirm · Esc cancel", m.selected.Direction, m.unsafeAck, m.desktopAck, m.backupAck, map[bool]string{true: ">", false: " "}[selected == 0], choices[0], map[bool]string{true: ">", false: " "}[selected == 1], choices[1])
+		return m.renderOverlay(fmt.Sprintf("FINAL CONFIRMATION · %s\n\nUnsafe %t · Desktop %t · Backup replacement %t\n\n%s %s\n%s %s\n\nj/k choose · Enter confirm · Esc cancel", m.selected.Direction, m.unsafeAck, m.desktopAck, m.backupAck, map[bool]string{true: ">", false: " "}[selected == 0], choices[0], map[bool]string{true: ">", false: " "}[selected == 1], choices[1]))
 	}
 	if m.stage == "setup" {
 		choices := []string{"Finish without further adoption", "Track: HOME → repository", "Adopt: repository → HOME"}
@@ -1407,7 +1577,7 @@ func (m model) render() string {
 			fmt.Fprintf(&b, "%s%s\n", mark, c)
 		}
 		b.WriteString("\nj/k move · Enter select · q quit")
-		return b.String()
+		return m.renderOverlay(b.String())
 	}
 	if m.stage == "preset" {
 		var b strings.Builder
@@ -1420,7 +1590,7 @@ func (m model) render() string {
 			fmt.Fprintf(&b, "%s%s · %d entries\n", mark, p.Name, len(p.Entries))
 		}
 		b.WriteString("\nj/k move · Enter select · Esc cancel")
-		return b.String()
+		return m.renderOverlay(b.String())
 	}
 	if m.stage == "welcome" && m.initMode {
 		message := m.message
@@ -1476,7 +1646,12 @@ func (m model) render() string {
 	}
 	fmt.Fprintf(&tree, "%s\n%s\n", strong.Render("Dotfiles · "+modeLabel), muted.Render("j/k move  h/l folders  Space select"))
 	rowLimit := m.height - 8
-	if m.width < 100 {
+	if m.width >= 100 {
+		headerLines := lipgloss.Height(header)
+		footerLines := lipgloss.Height(muted.Render(footer))
+		paneH := max(6, m.height-headerLines-footerLines-1)
+		rowLimit = max(1, paneH-4)
+	} else {
 		// Reserve the actual wrapped header/detail/preview/footer height before
 		// computing scroll origin; never truncate navigable entries afterwards.
 		style := lipgloss.NewStyle().Width(max(1, m.width))
@@ -1526,6 +1701,17 @@ func (m model) render() string {
 		}
 		fmt.Fprintf(&tree, "%s%s %s  %s\n", cursor, mark, safeTerminal(label), muted.Render(safeTerminal(e.Status)))
 	}
+	if len(m.visible) == 0 {
+		reason := "No entry"
+		if len(m.entries) == 0 {
+			reason = "Empty repository"
+		} else if strings.TrimSpace(m.search.Value()) != "" {
+			reason = fmt.Sprintf("No search matches for %q", m.search.Value())
+		} else if !m.hidden {
+			reason = "Hidden results (press H to show)"
+		}
+		fmt.Fprintf(&tree, "  %s\n", muted.Render(reason))
+	}
 	var detail strings.Builder
 	if i := m.current(); i >= 0 {
 		e := m.entries[i]
@@ -1560,11 +1746,51 @@ func (m model) render() string {
 			fmt.Fprintf(&detail, "%s: %s\n", safeTerminal(key), safeTerminal(fmt.Sprint(value)))
 		}
 	} else {
-		detail.WriteString("SELECTED\nNo entry")
+		reason := "No entry"
+		if len(m.entries) == 0 {
+			reason = "Empty repository"
+		} else if strings.TrimSpace(m.search.Value()) != "" {
+			reason = fmt.Sprintf("No search matches for %q", m.search.Value())
+		} else if !m.hidden {
+			reason = "Hidden results (press H to show)"
+		}
+		fmt.Fprintf(&detail, "%s\n%s", strong.Render("SELECTED"), reason)
 	}
 	content := tree.String() + "\n" + strings.Repeat("─", max(0, leftWidth-2)) + "\n" + detail.String()
 	if m.width >= 100 {
-		return lipgloss.NewStyle().Width(m.width).Render(header) + "\n" + lipgloss.JoinHorizontal(lipgloss.Top, lipgloss.NewStyle().Width(leftWidth).Render(tree.String()), lipgloss.NewStyle().Width(m.width/4).Render(detail.String()), lipgloss.NewStyle().Width(m.width-leftWidth-m.width/4).Render(preview)) + "\n" + muted.Render(footer)
+		w1 := max(32, m.width*36/100)
+		w2 := max(26, m.width*26/100)
+		w3 := max(24, m.width-w1-w2)
+		headerLines := lipgloss.Height(header)
+		footerLines := lipgloss.Height(muted.Render(footer))
+		paneHeight := max(6, m.height-headerLines-footerLines-1)
+
+		treeBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("39")).
+			Padding(0, 1).
+			Width(w1).
+			Height(paneHeight).
+			Render(tree.String())
+
+		detailBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("63")).
+			Padding(0, 1).
+			Width(w2).
+			Height(paneHeight).
+			Render(detail.String())
+
+		previewBox := lipgloss.NewStyle().
+			Border(lipgloss.RoundedBorder()).
+			BorderForeground(lipgloss.Color("75")).
+			Padding(0, 1).
+			Width(w3).
+			Height(paneHeight).
+			Render(preview)
+
+		panes := lipgloss.JoinHorizontal(lipgloss.Top, treeBox, detailBox, previewBox)
+		return header + "\n" + panes + "\n" + muted.Render(footer)
 	}
 	if m.width < 100 {
 		// On narrow terminals prioritize navigable entries, target status, and the
@@ -1605,6 +1831,16 @@ func (m model) compactDetail() []string {
 		if portability != "" || impact != "" {
 			lines = append(lines, "Portability: "+safeTerminal(portability)+" · Impact: "+safeTerminal(impact))
 		}
+	} else {
+		reason := "No entry"
+		if len(m.entries) == 0 {
+			reason = "Empty repository"
+		} else if strings.TrimSpace(m.search.Value()) != "" {
+			reason = fmt.Sprintf("No search matches for %q", m.search.Value())
+		} else if !m.hidden {
+			reason = "Hidden results (press H to show)"
+		}
+		lines = append(lines, reason)
 	}
 	return lines
 }
@@ -1716,6 +1952,53 @@ func (m model) renderReview() string {
 	}
 	footer += "\nj/k scroll · p refresh exact plan · a continue · q cancel"
 	return m.viewport.View() + "\n" + footer
+}
+
+func (m model) renderMetadata() string {
+	fields := []string{"destination", "os", "portability", "impact", "template", "git_keys", "removals", "tools", "warnings", "integrations"}
+	currentField := fields[m.editField]
+	currentVal := inputValue(m.editValue[currentField])
+
+	var b strings.Builder
+	fmt.Fprintf(&b, "EDIT %s METADATA · %s\n\n", strings.ToUpper(m.mode), m.editPath)
+
+	for i, f := range fields {
+		cursor := "  "
+		if i == m.editField {
+			cursor = "> "
+		}
+		val := fmt.Sprint(m.editValue[f])
+		if val == "" || val == "<nil>" {
+			val = "(none)"
+		}
+		fmt.Fprintf(&b, "%s%-14s: %s\n", cursor, f, val)
+	}
+
+	b.WriteString("\n")
+	if guidance, ok := metadataGuidance[currentField]; ok {
+		fmt.Fprintf(&b, "Guidance: %s\n", guidance)
+	}
+	if choices, ok := metadataChoices[currentField]; ok {
+		var choiceStrs []string
+		for _, c := range choices {
+			label := c
+			if label == "" {
+				label = "(empty)"
+			}
+			if c == currentVal {
+				choiceStrs = append(choiceStrs, fmt.Sprintf("[%s]", label))
+			} else {
+				choiceStrs = append(choiceStrs, label)
+			}
+		}
+		fmt.Fprintf(&b, "Accepted choices: %s (Space/Left/Right to cycle)\n", strings.Join(choiceStrs, " · "))
+	}
+
+	b.WriteString("\nTab/Shift+Tab switch field · Space/Left/Right cycle choices · Type edit · Ctrl+U clear · Enter save · Esc cancel")
+	if m.message != "" {
+		b.WriteString("\n" + safeTerminal(m.message))
+	}
+	return b.String()
 }
 
 func Run(ctx context.Context, engine Engine, rounds bool, mode string) error {

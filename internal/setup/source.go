@@ -322,7 +322,12 @@ func (e *Engine) InitSource(ctx context.Context, r map[string]any) (tui.SourceRe
 		if err != nil {
 			return tui.SourceResult{}, err
 		}
-		return tui.SourceResult{Exists: true, Valid: e.Continue(ctx) == nil}, nil
+		contErr := e.Continue(ctx)
+		errMsg := ""
+		if contErr != nil {
+			errMsg = contErr.Error()
+		}
+		return tui.SourceResult{Exists: true, Valid: contErr == nil, Error: errMsg}, nil
 	case "continue":
 		err := e.Continue(ctx)
 		return tui.SourceResult{Exists: true, Valid: err == nil}, err

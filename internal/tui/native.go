@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"sort"
+	"strings"
 
 	"github.com/ujjwal6792/dots-cli/internal/native"
 )
@@ -96,23 +98,135 @@ func (e *NativeEngine) Apply(ctx context.Context, value any, id string, unsafe, 
 	return e.Policy.Apply(ctx, p, native.Consent{Approve: id, Unsafe: unsafe, Desktop: desktop, Backup: backup})
 }
 func (e *NativeEngine) Inspect(ctx context.Context, operation string) (string, error) {
-	var result any
-	var err error
 	switch operation {
 	case "status":
-		result, err = e.Policy.Status(ctx)
+		inv, err := e.Policy.Status(ctx)
+		if err != nil {
+			return "", err
+		}
+		return formatStructuredStatus(inv), nil
 	case "diff":
-		result, err = e.Policy.Diff(ctx)
+		diffs, err := e.Policy.Diff(ctx)
+		if err != nil {
+			return "", err
+		}
+		return formatStructuredDiff(diffs), nil
 	case "scope":
-		result, err = e.Policy.ScopeShow(ctx)
+		scope, err := e.Policy.ScopeShow(ctx)
+		if err != nil {
+			return "", err
+		}
+		return formatStructuredScope(scope), nil
 	default:
 		return "", fmt.Errorf("unknown inspection")
 	}
-	if err != nil {
-		return "", err
+}
+
+func formatStructuredStatus(inv native.Inventory) string {
+	var b strings.Builder
+	b.WriteString("STATUS · Machine-Scoped Repository Inventory\n")
+	b.WriteString(strings.Repeat("─", 50) + "\n")
+	fmt.Fprintf(&b, "Machines (%d): %s\n", len(inv.Machines), strings.Join(inv.Machines, ", "))
+	if len(inv.Profiles) > 0 {
+		b.WriteString("\nProfiles:\n")
+		for _, p := range inv.Profiles {
+			fmt.Fprintf(&b, "  • %-16s (%d entries)\n", p.Name, len(p.Entries))
+		}
 	}
-	b, err := json.MarshalIndent(result, "", "  ")
-	return string(b), err
+	managed, eligible, restricted := 0, 0, 0
+	for _, e := range inv.Entries {
+		switch e.Status {
+		case "managed":
+			managed++
+		case "eligible":
+			eligible++
+		case "restricted":
+			restricted++
+		}
+	}
+	fmt.Fprintf(&b, "\nEntries: %d total (%d managed, %d eligible, %d restricted)\n\n", len(inv.Entries), managed, eligible, restricted)
+	b.WriteString("MANAGED ENTRIES:\n")
+	for _, e := range inv.Entries {
+		if e.Status == "managed" {
+			dest := e.Destination
+			if dest == "" {
+				dest = e.Path
+			}
+			targetStatus := e.TargetStatus
+			if targetStatus == "" {
+				targetStatus = "unchanged"
+			}
+			fmt.Fprintf(&b, "  • %-28s → %-28s [%s, target: %s]\n", e.Path, dest, e.OSStatus, targetStatus)
+		}
+	}
+	if eligible > 0 {
+		b.WriteString("\nELIGIBLE (UNTRACKED / UNADOPTED):\n")
+		for _, e := range inv.Entries {
+			if e.Status == "eligible" {
+				fmt.Fprintf(&b, "  • %s\n", e.Path)
+			}
+		}
+	}
+	if restricted > 0 {
+		b.WriteString("\nRESTRICTED / SENSITIVE:\n")
+		for _, e := range inv.Entries {
+			if e.Status == "restricted" {
+				fmt.Fprintf(&b, "  • %s\n", e.Path)
+			}
+		}
+	}
+	return b.String()
+}
+
+func formatStructuredDiff(diffs []native.Diff) string {
+	var b strings.Builder
+	b.WriteString("DIFF · Importable Changes\n")
+	b.WriteString(strings.Repeat("─", 50) + "\n")
+	if len(diffs) == 0 {
+		b.WriteString("All approved target files match repository state. No pending changes.\n")
+		return b.String()
+	}
+	fmt.Fprintf(&b, "%d file(s) with differences\n\n", len(diffs))
+	for _, d := range diffs {
+		fmt.Fprintf(&b, "=== %s  [%s]  %s ===\n", d.Path, strings.ToUpper(d.Status), d.Summary)
+		if d.Text != "" {
+			b.WriteString(d.Text + "\n\n")
+		} else {
+			b.WriteString("(no text diff available)\n\n")
+		}
+	}
+	return b.String()
+}
+
+func formatStructuredScope(a native.Adoption) string {
+	var b strings.Builder
+	b.WriteString("APPROVED SCOPE · Local Adoption Contract\n")
+	b.WriteString(strings.Repeat("─", 50) + "\n")
+	fmt.Fprintf(&b, "Machine:  %s (%s)\n", a.Machine.ID, a.Machine.OS)
+	fmt.Fprintf(&b, "Approval: %s\n", a.Profile)
+	if len(a.Profiles) > 0 {
+		fmt.Fprintf(&b, "Profiles: %s\n", strings.Join(a.Profiles, ", "))
+	}
+	fmt.Fprintf(&b, "\nApproved Entries (%d):\n", len(a.Entries))
+	keys := make([]string, 0, len(a.Entries))
+	for k := range a.Entries {
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	for _, id := range keys {
+		e := a.Entries[id]
+		fmt.Fprintf(&b, "  • %-24s → %-24s [%s, %s]\n", id, e.Destination, e.Portability, e.Impact)
+	}
+	if len(a.Deselected) > 0 {
+		fmt.Fprintf(&b, "\nDeselected Entries (%d): %s\n", len(a.Deselected), strings.Join(a.Deselected, ", "))
+	}
+	if len(a.Customs) > 0 {
+		fmt.Fprintf(&b, "\nCustom Metadata Edits (%d):\n", len(a.Customs))
+		for id, c := range a.Customs {
+			fmt.Fprintf(&b, "  • %s: %v\n", id, c)
+		}
+	}
+	return b.String()
 }
 func (e *NativeEngine) Remote(ctx context.Context, operation string, confirm bool) error {
 	switch operation {
