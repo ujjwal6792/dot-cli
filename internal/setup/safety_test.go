@@ -75,7 +75,7 @@ func TestSetupFlagBindingAndAppConstructionDoNotAuthorizeWrites(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if m.Init() != nil || !strings.HasPrefix(m.View().Content, "Welcome") {
+	if m.Init() != nil || !strings.Contains(m.View().Content, "Welcome to dot") {
 		t.Fatal("first-run app constructor not welcome/read-only")
 	}
 	if e.Options().Name != "Fixture" || e.Options().State != o.State {

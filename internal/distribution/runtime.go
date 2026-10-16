@@ -77,6 +77,33 @@ func CheckTool(ctx context.Context, path, name string) error {
 	}
 	return fmt.Errorf("%s incompatible version; chezmoi must be pinned v%s, existing tools are never overwritten", name, ChezmoiVersion)
 }
+
+// ToolVersion reports the installed version for setup's dependency table:
+// "2.49.0" for Git, "v2.73.1" for chezmoi. Empty when the executable is
+// absent or its output is unrecognized. Read-only; safe during inspection.
+func ToolVersion(ctx context.Context, path, name string) string {
+	p, err := exec.LookPath(path)
+	if err != nil {
+		return ""
+	}
+	b, err := exec.CommandContext(ctx, p, "--version").Output()
+	if err != nil {
+		return ""
+	}
+	v := strings.TrimSpace(string(b))
+	switch name {
+	case "git":
+		v = strings.TrimPrefix(v, "git version ")
+	case "chezmoi":
+		v = strings.TrimPrefix(v, "chezmoi version ")
+	default:
+		return ""
+	}
+	if v == "" {
+		return ""
+	}
+	return strings.TrimSuffix(strings.Fields(v)[0], ",")
+}
 func ReadBundle(root string) (Manifest, error) {
 	var m Manifest
 	if !filepath.IsAbs(root) || filepath.Clean(root) != root {

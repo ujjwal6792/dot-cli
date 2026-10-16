@@ -433,8 +433,11 @@ Common: --home PATH --source PATH --config PATH --state-dir PATH
         --git PATH --chezmoi PATH --name NAME --email EMAIL
 Paths must be clean absolute paths. Defaults are inside HOME; no checkout fallback.
 Packaged --chezmoi overrides are refused: keep the verified release bundle intact.
-Retired: add/remove, run, update NAME VERSION, layout/migrate, group scope runners,
-personal/work --profile, --rounds and interpreter/browser/engine overrides.
+Retired: add/remove, run, update NAME VERSION, diff --direction, push --message,
+layout/migrate, scope init/catalog/expand and other group scope runners, intent
+inventory PATH and intent update --yes, personal/work --profile, init --rounds,
+self-update via private source, and interpreter/browser/engine
+(DOT_ENGINE/DOT_BROWSER/DOT_PYTHON) overrides.
 Use reviewed Track/Adopt/untrack/update requests, not direct mutations or scripts.
 Exit codes: 0 success, 1 operation/dependency failure, 2 invalid usage, 130 cancelled.`)
 	joined := strings.Join(args, " ")

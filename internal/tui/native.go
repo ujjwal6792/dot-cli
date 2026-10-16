@@ -3,7 +3,9 @@ package tui
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
@@ -37,6 +39,22 @@ func (e *NativeEngine) InventoryMode(ctx context.Context, mode string) (Inventor
 	var out Inventory
 	if err == nil {
 		err = convert(inv, &out)
+	}
+	return out, err
+}
+func (e *NativeEngine) BrowserInventory(ctx context.Context, mode string) (Inventory, error) {
+	inv, err := e.Policy.BrowserInventory(ctx, mode)
+	var out Inventory
+	if err == nil {
+		err = convert(inv, &out)
+	}
+	return out, err
+}
+func (e *NativeEngine) BrowseDirectory(ctx context.Context, path string) ([]Entry, error) {
+	entries, err := e.Policy.BrowseDirectory(ctx, path)
+	var out []Entry
+	if err == nil {
+		err = convert(entries, &out)
 	}
 	return out, err
 }
@@ -125,13 +143,13 @@ func (e *NativeEngine) Inspect(ctx context.Context, operation string) (string, e
 func formatStructuredStatus(inv native.Inventory) string {
 	var b strings.Builder
 	b.WriteString("STATUS · Machine-Scoped Repository Inventory\n")
-	b.WriteString(strings.Repeat("─", 50) + "\n")
 	fmt.Fprintf(&b, "Machines (%d): %s\n", len(inv.Machines), strings.Join(inv.Machines, ", "))
 	if len(inv.Profiles) > 0 {
-		b.WriteString("\nProfiles:\n")
+		names := make([]string, 0, len(inv.Profiles))
 		for _, p := range inv.Profiles {
-			fmt.Fprintf(&b, "  • %-16s (%d entries)\n", p.Name, len(p.Entries))
+			names = append(names, fmt.Sprintf("%s (%d)", p.Name, len(p.Entries)))
 		}
+		fmt.Fprintf(&b, "Profiles (%d): %s\n", len(inv.Profiles), strings.Join(names, " · "))
 	}
 	managed, eligible, restricted := 0, 0, 0
 	for _, e := range inv.Entries {
@@ -144,23 +162,20 @@ func formatStructuredStatus(inv native.Inventory) string {
 			restricted++
 		}
 	}
-	fmt.Fprintf(&b, "\nEntries: %d total (%d managed, %d eligible, %d restricted)\n\n", len(inv.Entries), managed, eligible, restricted)
-	b.WriteString("MANAGED ENTRIES:\n")
-	for _, e := range inv.Entries {
-		if e.Status == "managed" {
-			dest := e.Destination
-			if dest == "" {
-				dest = e.Path
+	fmt.Fprintf(&b, "Entries: %d total (%d managed, %d eligible, %d restricted)\n", len(inv.Entries), managed, eligible, restricted)
+	if managed > 0 {
+		fmt.Fprintf(&b, "\nManaged (%d):\n", managed)
+		for _, e := range inv.Entries {
+			if e.Status != "managed" {
+				continue
 			}
-			targetStatus := e.TargetStatus
-			if targetStatus == "" {
-				targetStatus = "unchanged"
-			}
-			fmt.Fprintf(&b, "  • %-28s → %-28s [%s, target: %s]\n", e.Path, dest, e.OSStatus, targetStatus)
+			b.WriteString(statusLine(e) + "\n")
 		}
+	} else {
+		b.WriteString("\nNo managed files.\n")
 	}
 	if eligible > 0 {
-		b.WriteString("\nELIGIBLE (UNTRACKED / UNADOPTED):\n")
+		b.WriteString("\nEligible:\n")
 		for _, e := range inv.Entries {
 			if e.Status == "eligible" {
 				fmt.Fprintf(&b, "  • %s\n", e.Path)
@@ -168,7 +183,7 @@ func formatStructuredStatus(inv native.Inventory) string {
 		}
 	}
 	if restricted > 0 {
-		b.WriteString("\nRESTRICTED / SENSITIVE:\n")
+		b.WriteString("\nRestricted:\n")
 		for _, e := range inv.Entries {
 			if e.Status == "restricted" {
 				fmt.Fprintf(&b, "  • %s\n", e.Path)
@@ -178,17 +193,33 @@ func formatStructuredStatus(inv native.Inventory) string {
 	return b.String()
 }
 
+// statusLine compresses one inventory entry to a state glyph plus path.
+// Unchanged files stay one quiet line; only anomalies carry a suffix.
+func statusLine(e native.InventoryEntry) string {
+	switch e.TargetStatus {
+	case "", "unchanged":
+		return "  ✓ " + e.Path
+	case "changed", "missing", "error":
+		return "  ● " + e.Path + " · " + e.TargetStatus
+	default:
+		return "  ○ " + e.Path + " · " + e.TargetStatus
+	}
+}
+
 func formatStructuredDiff(diffs []native.Diff) string {
 	var b strings.Builder
 	b.WriteString("DIFF · Importable Changes\n")
-	b.WriteString(strings.Repeat("─", 50) + "\n")
 	if len(diffs) == 0 {
 		b.WriteString("All approved target files match repository state. No pending changes.\n")
 		return b.String()
 	}
 	fmt.Fprintf(&b, "%d file(s) with differences\n\n", len(diffs))
 	for _, d := range diffs {
-		fmt.Fprintf(&b, "=== %s  [%s]  %s ===\n", d.Path, strings.ToUpper(d.Status), d.Summary)
+		if d.Summary != "" {
+			fmt.Fprintf(&b, "● %s — %s\n", d.Path, d.Summary)
+		} else {
+			fmt.Fprintf(&b, "● %s\n", d.Path)
+		}
 		if d.Text != "" {
 			b.WriteString(d.Text + "\n\n")
 		} else {
@@ -201,13 +232,15 @@ func formatStructuredDiff(diffs []native.Diff) string {
 func formatStructuredScope(a native.Adoption) string {
 	var b strings.Builder
 	b.WriteString("APPROVED SCOPE · Local Adoption Contract\n")
-	b.WriteString(strings.Repeat("─", 50) + "\n")
 	fmt.Fprintf(&b, "Machine:  %s (%s)\n", a.Machine.ID, a.Machine.OS)
 	fmt.Fprintf(&b, "Approval: %s\n", a.Profile)
 	if len(a.Profiles) > 0 {
 		fmt.Fprintf(&b, "Profiles: %s\n", strings.Join(a.Profiles, ", "))
 	}
 	fmt.Fprintf(&b, "\nApproved Entries (%d):\n", len(a.Entries))
+	if len(a.Entries) == 0 {
+		b.WriteString("Nothing approved yet. Adopt files from the menu to build approved scope.\n")
+	}
 	keys := make([]string, 0, len(a.Entries))
 	for k := range a.Entries {
 		keys = append(keys, k)
@@ -236,4 +269,63 @@ func (e *NativeEngine) Remote(ctx context.Context, operation string, confirm boo
 		return e.Policy.Push(ctx, confirm)
 	}
 	return fmt.Errorf("unknown remote operation")
+}
+
+// RecoveryPending reports interrupted-operation state without performing
+// recovery. The returning adapter refuses pull/push while it reports true.
+func (e *NativeEngine) RecoveryPending() (bool, error) {
+	if e == nil || e.Policy == nil {
+		return false, fmt.Errorf("native policy unavailable")
+	}
+	_, err := e.Policy.Recovery()
+	if err == nil {
+		return true, nil
+	}
+	if errors.Is(err, os.ErrNotExist) {
+		return false, nil
+	}
+	return false, err
+}
+
+// ConfigPaths exposes source/home/state/tracker paths for the Settings
+// pane. Read-only; setup engines inherit it through embedding.
+func (e *NativeEngine) ConfigPaths() (source, home, state, tracker string) {
+	if e == nil || e.Policy == nil {
+		return "", "", "", ""
+	}
+	c := e.Policy.Config()
+	return c.Source, c.Home, c.State, c.TrackerConfig
+}
+
+// DashboardStatus summarizes tracked state for returning-home. Read-only:
+// single Status pass; TargetStatus already carries changed/missing/error so a
+// second full Diff content pass (which re-reads every file) is skipped. The
+// same Status/Diff reads the inspect screens show on demand.
+func (e *NativeEngine) DashboardStatus(ctx context.Context) (DashboardData, error) {
+	var out DashboardData
+	inv, err := e.Policy.Status(ctx)
+	if err != nil {
+		return out, err
+	}
+	if err := convert(inv.Machine, &out.Machine); err != nil {
+		return out, err
+	}
+	for _, entry := range inv.Entries {
+		switch entry.Status {
+		case "managed":
+			dest := entry.Destination
+			if dest == "" {
+				dest = entry.Path
+			}
+			out.Managed = append(out.Managed, DashboardEntry{Path: entry.Path, Dest: dest, State: entry.TargetStatus, Portability: inputValue(entry.Metadata["portability"]), Impact: inputValue(entry.Metadata["impact"]), Assignment: assignmentDescription(entry.Metadata)})
+			switch entry.TargetStatus {
+			case "changed", "missing", "error":
+				out.Diffs++
+			}
+		case "eligible":
+			out.Adoptable++
+		}
+	}
+	sort.Slice(out.Managed, func(i, j int) bool { return out.Managed[i].Path < out.Managed[j].Path })
+	return out, nil
 }

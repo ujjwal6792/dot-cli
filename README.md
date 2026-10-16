@@ -60,11 +60,22 @@ the verb. Defaults and precedence are in [native setup](docs/native-setup.md).
 
 ## Review configuration
 
-The returning menu defaults to Finish. Track imports exact HOME files into the
-repository; Adopt writes exact repository entries to this machine. Nothing is
+Returning users open Status & Diff in a six-tab workspace. Track imports exact
+HOME files into the repository; Adopt writes exact repository entries to this machine. Nothing is
 preselected. Space selects, `e` edits metadata, `M` opens logical-file metadata,
-Tab retargets machines in Track, Shift+Tab changes direction, `s` composes Adopt
+Tab/Shift+Tab cycles tabs 1–6, `m` retargets machines in Track, `s` composes Adopt
 profiles, `p` previews, and `a` enters Cancel-default final confirmation.
+The workspace uses bounded inventory and diff panes with a persistent key footer.
+Track initially lists HOME's immediate children; `l`/Right/Enter loads a folder
+when expanded, and `h`/Left collapses it or returns to its parent. `/` filters the
+loaded tree as you type; Enter searches all HOME folders. PgUp/PgDn and Home/End
+navigate large lists, `J`/`K` scroll the diff, and `?` opens the complete keymap.
+Folder selection still snapshots exact eligible files recursively. Cursor previews
+are debounced and cancelled when superseded; browsing never authorizes a write.
+Settings groups connection details, paths, tools and source maintenance into
+bordered sections. `/` searches settings; Ctrl+N/Ctrl+P focuses visible actions
+and Enter activates them. `A` expands advanced command details. Machine identity
+and paths are displayed read-only; verification never installs or applies files.
 Use your terminal's paste/copy shortcut; dot accepts bracketed paste and does
 not launch system clipboard helpers for Ctrl+V/Ctrl+Shift+C.
 Unsafe (`u`), desktop (`d`) and applicable backup replacement (`b`) gates are

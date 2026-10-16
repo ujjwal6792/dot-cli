@@ -2,12 +2,13 @@ package tui
 
 import (
 	"context"
-	"fmt"
 	"io"
 	"strings"
 
+	"charm.land/bubbles/v2/table"
 	"charm.land/bubbles/v2/textinput"
 	tea "charm.land/bubbletea/v2"
+	"charm.land/lipgloss/v2"
 )
 
 // TerminalStreams are supplied by tea.Exec after releasing the terminal. Never
@@ -16,7 +17,7 @@ type TerminalStreams struct {
 	In       io.Reader
 	Out, Err io.Writer
 }
-type DependencyRow struct{ Tool, Command, Link, Problem string }
+type DependencyRow struct{ Tool, Command, Link, Problem, Version string }
 type DependencyResult struct {
 	Ready   bool
 	Manager string
@@ -86,6 +87,7 @@ func (m model) setupResult(msg setupMsg) (tea.Model, tea.Cmd) {
 		if msg.action == "tracker-plan" || msg.action == "tracker-apply" {
 			m.stage = "tracker-edit"
 			m.trackerPlan = nil
+			m.trackerEditing = false
 			return m, m.trackerName.Focus()
 		}
 		if msg.action == "complete" {
@@ -109,9 +111,10 @@ func (m model) setupResult(msg setupMsg) (tea.Model, tea.Cmd) {
 		m.trackerReview = msg.tracker.Review
 		m.stage = "tracker-confirm"
 		m.confirmChoice = 0
+		m.trackerEditing = false
 		m.trackerName.Blur()
 		m.trackerEmail.Blur()
-		m.viewport.SetContent(safeTerminal(m.trackerReview))
+		m.viewport.SetContent(sectionedTrackerReview(m.trackerReview))
 		m.viewport.SetHeight(max(3, m.height-10))
 		m.viewport.GotoTop()
 	case "tracker-apply":
@@ -169,7 +172,10 @@ func (m model) updateSetup(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	if m.stage == "tracker-edit" {
 		switch key.String() {
 		case "esc":
-			return m, tea.Quit
+			m.stage = "dependencies"
+			m.dependenciesNext = "tracker-edit"
+			m.message = ""
+			return m, m.setupCommand("dependencies", nil)
 		case "tab":
 			m.trackerField = 1 - m.trackerField
 			m.trackerName.Blur()
@@ -191,7 +197,7 @@ func (m model) updateSetup(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		}
 		return m.updateTrackerInput(key)
 	}
-	if key.String() == "q" {
+	if key.String() == "q" && !m.trackerEditing {
 		return m, tea.Quit
 	}
 	switch m.stage {
@@ -204,13 +210,22 @@ func (m model) updateSetup(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "r":
 			cmd := m.setupCommand("dependencies", nil)
 			return m, cmd
-		case "esc", "space", " ":
+		case "space", " ":
 			m.stage = "setup-incomplete"
 			m.message = "Required dependency step skipped. No installation authorized; setup incomplete."
+		case "esc":
+			m.stage = "machine"
+			return m, m.machineCommand("suggest")
 		case "enter":
 			if m.dependencies.Ready {
 				if m.dependenciesNext == "source" {
 					return m.startSource("detect", nil)
+				}
+				if m.dependenciesNext == "tracker-edit" {
+					m.stage = "tracker-edit"
+					m.trackerField = 0
+					m.trackerEditing = false
+					return m, m.trackerName.Focus()
 				}
 				cmd := m.startTracker()
 				return m, cmd
@@ -224,6 +239,42 @@ func (m model) updateSetup(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			return m, tea.Exec(&dependencyInstall{engine: e, ctx: m.setupCtx(), plan: m.dependencies.Plan}, func(err error) tea.Msg { return setupMsg{action: "install", err: err} })
 		}
 	case "tracker-confirm":
+		if m.trackerEditing {
+			switch key.String() {
+			case "esc":
+				m.trackerEditing = false
+				m.stage = "tracker-edit"
+				m.trackerField = 0
+				m.message = "Connection consent canceled. Back to identity editing — values kept, nothing written."
+				return m, m.trackerName.Focus()
+			case "tab":
+				m.trackerField = 1 - m.trackerField
+				m.trackerName.Blur()
+				m.trackerEmail.Blur()
+				if m.trackerField == 0 {
+					return m, m.trackerName.Focus()
+				}
+				return m, m.trackerEmail.Focus()
+			case "ctrl+u":
+				if m.trackerField == 0 {
+					m.trackerName.SetValue("")
+				} else {
+					m.trackerEmail.SetValue("")
+				}
+				return m, nil
+			case "J":
+				m.viewport.ScrollDown(1)
+				return m, nil
+			case "K":
+				m.viewport.ScrollUp(1)
+				return m, nil
+			case "enter":
+				m.trackerEditing = false
+				cmd := m.setupCommand("tracker-plan", map[string]any{"name": m.trackerName.Value(), "email": m.trackerEmail.Value()})
+				return m, cmd
+			}
+			return m.updateTrackerInput(key)
+		}
 		switch key.String() {
 		case "j", "down":
 			m.confirmChoice = 1
@@ -236,13 +287,20 @@ func (m model) updateSetup(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		case "esc":
 			m.stage = "tracker-edit"
 			m.trackerField = 0
-			m.message = "Connection consent canceled. No tracker or connection written."
+			m.message = "Connection consent canceled. Back to identity editing — values kept, nothing written."
+			return m, m.trackerName.Focus()
+		case "e":
+			m.trackerEditing = true
+			m.trackerField = 0
+			m.trackerName.Blur()
+			m.trackerEmail.Blur()
+			m.message = "Editing identity inline — Enter re-reviews, Esc goes back."
 			return m, m.trackerName.Focus()
 		case "enter":
 			if m.confirmChoice == 0 {
 				m.stage = "tracker-edit"
 				m.trackerField = 0
-				m.message = "Connection consent canceled. No tracker or connection written."
+				m.message = "Connection consent canceled. Back to identity editing — values kept, nothing written."
 				return m, m.trackerName.Focus()
 			}
 			cmd := m.setupCommand("tracker-apply", map[string]any{"plan": m.trackerPlan, "approve": inputValue(m.trackerPlan["id"])})
@@ -260,54 +318,225 @@ func (m model) updateSetup(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 func (m model) renderSetup() string {
-	progress := "Welcome → Source → Machine → Dependencies → Tracker → Done\n\n"
-	if m.width < 80 {
-		progress = "Setup · " + map[string]string{"dependencies": "4/6 Dependencies", "tracker-edit": "5/6 Tracker", "tracker-confirm": "5/6 Tracker", "setup-incomplete": "Incomplete"}[m.stage] + "\n\n"
-	}
 	if m.stage == "setup-incomplete" {
-		return progress + "Setup incomplete\n" + m.message + "\nNo successful setup claimed. Earlier confirmed steps are retained.\n\nr recheck dependencies · Enter/Esc quit"
+		return m.initShell("Dependencies", "Setup incomplete", "",
+			"No successful setup claimed. Earlier confirmed steps are retained.",
+			"", "r recheck dependencies · Enter/Esc quit", m.message)
 	}
 	if m.stage == "dependencies" {
-		var b strings.Builder
 		m.viewport.SetContent(safeTerminal(dependencyTable(m.dependencies, m.loading)))
 		m.viewport.SoftWrap = true
-		m.viewport.SetHeight(max(3, m.height-9))
-		body := progress + "Dependencies\n" + m.viewport.View() + "\n\n"
-		b.Reset()
-		b.WriteString(body)
+		m.viewport.SetHeight(m.depHeight())
+		hints := "r refresh · J/K scroll · Esc back · q quit"
 		if !m.dependencies.Ready {
-			b.WriteString("Enter Install · Space skip\nNative prompts; no password capture.\n")
+			hints = "Enter Install · Space skip\nNative prompts; no password capture.\n" + hints
 		} else {
-			b.WriteString("Enter continue · Space stop\n")
+			hints = "Enter continue · Space stop\n" + hints
 		}
-		b.WriteString("r refresh · J/K scroll table · q quit\n" + m.message)
-		return b.String()
+		return m.initShell("Dependencies", "Dependencies", "", m.viewport.View(), "",
+			hints, m.message)
 	}
 	if m.stage == "tracker-edit" {
-		return progress + "Tracker · local identity\nUse existing Git identity, or enter tracker-only fallback values. Git settings stay unchanged.\n" + m.trackerName.View() + "\n" + m.trackerEmail.View() + "\n\nTab next field · Ctrl+U clear · Enter review · Esc quit\n" + m.message
+		body := "Blank uses your Git identity when it is set.\nWithout Git identity, these tracker-only values are required.\nGit settings stay unchanged.\n\n" + m.trackerName.View() + "\n" + m.trackerEmail.View()
+		return m.initShell("Tracker", "Tracker · local identity", "Edit freely — nothing is written until you confirm.", body, "",
+			"Tab next field · Ctrl+U clear · Enter review · Esc back", m.message)
 	}
-	m.viewport.SetHeight(max(3, m.height-10))
-	m.viewport.SetContent(safeTerminal(m.trackerReview))
-	cancel, confirm := "> ", "  "
-	if m.confirmChoice == 1 {
-		cancel, confirm = "  ", "> "
-	}
+	m.viewport.SetHeight(m.trackerHeight())
+	m.viewport.SetContent(sectionedTrackerReview(m.trackerReview))
 	status := m.message
 	if m.loading {
 		status = "Verifying exact consented connection…"
 	}
-	return progress + "Tracker · review connection consent\n" + m.viewport.View() + "\n\n" + cancel + "Cancel\n" + confirm + "Confirm tracker and connection\n\nj/k choose · J/K scroll · Enter confirm · Esc cancel\n" + status
+	choices := []string{"Cancel", "Confirm tracker and connection"}
+	question := initTitle.Render("Create this tracker and record the connection?")
+	editable := ""
+	hints := "j/k choose · J/K scroll · e edit here · Enter confirm · Esc back"
+	if m.trackerEditing {
+		editable = "\n" + m.trackerName.View() + "\n" + m.trackerEmail.View() + "\n"
+		hints = "Tab switch field · Ctrl+U clear · J/K scroll · Enter re-review · Esc back"
+	}
+	return m.initShell("Tracker", "Tracker · review connection consent", "Verify the identity and paths below, then decide.",
+		m.viewport.View(), question+editable+"\n"+initChoiceList(choices, m.confirmChoice),
+		hints, status)
 }
+
+// sectionedTrackerReview groups the engine's review text into labeled
+// sections — connection facts, tracker file content, scope limits — without
+// changing any wording. Keys render bold with values plain; full lines stay
+// contiguous for assertions. Unknown lines pass through unstyled.
+func sectionedTrackerReview(review string) string {
+	var conn, file, scope []string
+	for _, line := range strings.Split(safeTerminal(review), "\n") {
+		trimmed := strings.TrimSpace(line)
+		if trimmed == "" {
+			continue
+		}
+		if kvKey(trimmed) != "" {
+			conn = append(conn, renderKVLine(trimmed))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Create ") || strings.HasPrefix(trimmed, "Compatible existing tracker") {
+			file = append(file, strong.Render(trimmed))
+			continue
+		}
+		if strings.HasPrefix(trimmed, "Persist ") {
+			scope = append(scope, trimmed)
+			continue
+		}
+		if tomlKey(trimmed) != "" || trimmed == "[data]" {
+			file = append(file, renderKVLineCustom(trimmed, " = "))
+			continue
+		}
+		file = append(file, trimmed)
+	}
+	var b strings.Builder
+	if len(conn) > 0 {
+		b.WriteString(initSectionHead.Render("Connection") + "\n")
+		b.WriteString(strings.Join(conn, "\n") + "\n")
+	}
+	if len(file) > 0 {
+		b.WriteString("\n" + initSectionHead.Render("Tracker file") + "\n")
+		b.WriteString(strings.Join(file, "\n") + "\n")
+	}
+	if len(scope) > 0 {
+		b.WriteString("\n" + initSectionHead.Render("Scope") + "\n")
+		b.WriteString(strings.Join(scope, "\n"))
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// kvKey matches "Machine:", "Source:", ... summary lines.
+func kvKey(line string) string {
+	if i := strings.Index(line, ":"); i > 0 {
+		key := strings.TrimSpace(line[:i])
+		for _, known := range []string{"Machine", "Source", "Origin", "HOME", "Tracker", "Connection"} {
+			if key == known {
+				return key
+			}
+		}
+	}
+	return ""
+}
+
+// tomlKey matches `key = "value"` lines, returning the key.
+func tomlKey(line string) string {
+	if i := strings.Index(line, "="); i > 0 {
+		key := strings.TrimSpace(line[:i])
+		if key != "" && !strings.ContainsAny(key, " \t\"") {
+			return key
+		}
+	}
+	return ""
+}
+
+func renderKVLine(line string) string {
+	i := strings.Index(line, ":")
+	return strong.Render(strings.TrimSpace(line[:i])+":") + " " + strings.TrimSpace(line[i+1:])
+}
+
+func renderKVLineCustom(line, sep string) string {
+	i := strings.Index(line, sep)
+	if i < 0 {
+		return strong.Render(line)
+	}
+	return strong.Render(strings.TrimSpace(line[:i])) + line[i:]
+}
+
+var (
+	initTableHead = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(AppTheme.Muted))
+	depTool       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(AppTheme.Accent))
+	depOK         = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(AppTheme.Success))
+	depAttention  = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(AppTheme.Status))
+)
+
+// depTable renders the PACKAGE/VERSION/STATUS summary with bubbles table.
+// Detail lines (exact command, link, notes) stay outside it, untruncated.
+func depTable(rows []DependencyRow) string {
+	toolW, versionW, statusW := 7, 7, 6
+	type cell struct {
+		tool, version, status string
+		ok                    bool
+		note                  string
+	}
+	cells := make([]cell, len(rows))
+	tableRows := make([]table.Row, len(rows))
+	for i, row := range rows {
+		toolW = max(toolW, lipgloss.Width(row.Tool))
+		version := row.Version
+		if version == "" {
+			version = "—"
+		}
+		versionW = max(versionW, lipgloss.Width(version))
+		short, note, ok := depStatus(row.Problem)
+		statusW = max(statusW, lipgloss.Width(short))
+		cells[i] = cell{row.Tool, version, short, ok, note}
+	}
+	for i, c := range cells {
+		status := depAttention.Render(c.status)
+		if c.ok {
+			status = depOK.Render(c.status)
+		}
+		version := initHint.Render(c.version)
+		if rows[i].Version != "" {
+			version = initBody.Render(c.version)
+		}
+		tableRows[i] = table.Row{depTool.Render(c.tool), version, status}
+	}
+	t := table.New(
+		table.WithColumns([]table.Column{
+			{Title: "PACKAGE", Width: toolW + 2},
+			{Title: "VERSION", Width: versionW + 2},
+			{Title: "STATUS", Width: statusW + 2},
+		}),
+		table.WithRows(tableRows),
+		table.WithFocused(false),
+		table.WithHeight(1+len(tableRows)),
+		table.WithWidth(toolW+versionW+statusW+6),
+		table.WithStyles(table.Styles{
+			Header:   initTableHead,
+			Cell:     lipgloss.NewStyle(),
+			Selected: lipgloss.NewStyle(),
+		}),
+	)
+	var b strings.Builder
+	b.WriteString(t.View() + "\n")
+	for i, row := range rows {
+		if row.Problem == "" {
+			continue
+		}
+		if row.Command != "" {
+			b.WriteString("  " + initBody.Render(row.Command) + "\n")
+		}
+		b.WriteString("  " + initHint.Render(row.Link) + "\n")
+		if cells[i].note != "" {
+			b.WriteString("  " + initHint.Render("note: "+cells[i].note) + "\n")
+		}
+	}
+	return strings.TrimSuffix(b.String(), "\n")
+}
+
+// depStatus fits the status column; long problems move to a note line so the
+// columns stay aligned.
+func depStatus(problem string) (short, note string, ok bool) {
+	if problem == "" {
+		return "✓ supported", "", true
+	}
+	if lipgloss.Width(problem)+2 <= 16 {
+		return "● " + problem, "", false
+	}
+	return "● see note", problem, false
+}
+
 func dependencyTable(d DependencyResult, loading bool) string {
 	var b strings.Builder
-	b.WriteString("Only Git and chezmoi are required. Existing installs are never overwritten.\n\nTool · Manager command · Official link\n")
+	b.WriteString("Only Git and chezmoi are required. Existing installs are never overwritten.\n")
 	if loading {
-		b.WriteString("Checking required tools…\n")
+		b.WriteString("\nChecking required tools…\n")
 	} else if d.Ready {
-		b.WriteString("Git and chezmoi verified. Nothing to install.\n")
+		b.WriteString("\nGit and chezmoi verified. Nothing to install.\n")
 	}
-	for _, row := range d.Rows {
-		fmt.Fprintf(&b, "%s · %s\n  %s\n  %s\n", row.Tool, row.Problem, row.Command, row.Link)
+	if len(d.Rows) > 0 {
+		b.WriteString("\n" + depTable(d.Rows) + "\n")
 	}
-	return b.String()
+	return strings.TrimSuffix(b.String(), "\n")
 }

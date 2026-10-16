@@ -207,13 +207,38 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 	if err := h.continueReplace(url); err != nil {
 		return err
 	}
+	// Scripted setup/tracker without the terminal: separate explicit operations,
+	// Git-only PATH and isolated HOME, no implicit adoption.
+	scripted := filepath.Join(dir, "home-scripted")
+	if err := os.Mkdir(scripted, 0700); err != nil {
+		return err
+	}
+	scriptedID := "macos_scripted"
+	if runtime.GOOS == "linux" {
+		scriptedID = "linux_scripted"
+	}
+	if _, err := h.invoke(scripted, "", "init", "--action", "new", "--url", url); err != nil {
+		return err
+	}
+	if err := h.tracker(scripted, scriptedID); err != nil {
+		return err
+	}
+	if _, err := os.Stat(filepath.Join(scripted, ".local/share/dot-config")); err != nil {
+		return fmt.Errorf("scripted setup missing source: %w", err)
+	}
+	if err := h.navigationKeyboard(home); err != nil {
+		return err
+	}
+	if err := h.largeBrowserKeyboard(home); err != nil {
+		return err
+	}
 	if err := h.trackKeyboard(home); err != nil {
 		return err
 	}
-	if err := h.openApp(home, "returning-user actions"); err != nil {
+	if err := h.openApp(home, "Tracked Files"); err != nil {
 		return err
 	}
-	if err := h.openApp(home, "returning-user actions", "init"); err != nil {
+	if err := h.openApp(home, "Tracked Files", "init"); err != nil {
 		return err
 	}
 	source := filepath.Join(home, ".local/share/dot-config")
@@ -388,6 +413,6 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 	if err != nil || !bytes.Equal(before, after) {
 		return fmt.Errorf("uninstall changed private approval")
 	}
-	fmt.Printf("PASS: real extracted %s full keyboard setup/Continue/Replace/Track/Adopt, Huh identity, manager/source interrupts, assignments/profile unions/local overrides/gates, machine JSON, byte/mode/stale/concurrent/recovery/offline safety, private install/update/recovery/uninstall\nFixtures retained at %s\n", distribution.Platform(), dir)
+	fmt.Printf("PASS: real extracted %s full keyboard setup/Continue/Replace/Track/Adopt, Tab/Shift+Tab/Settings/10,000-file browsing, Huh identity, manager/source interrupts, assignments/profile unions/local overrides/gates, machine JSON, byte/mode/stale/concurrent/recovery/offline safety, private install/update/recovery/uninstall\nFixtures retained at %s\n", distribution.Platform(), dir)
 	return nil
 }

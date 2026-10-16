@@ -96,11 +96,13 @@ func (m model) updateMachineForm(msg tea.Msg) (tea.Model, tea.Cmd) {
 
 func (m model) updateMachine(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
-	case "esc", "ctrl+c":
+	case "esc":
+		return m.startSource("detect", nil)
+	case "ctrl+c":
 		if m.setupCancel != nil {
 			m.setupCancel()
 		}
-		return m, tea.Quit
+		return m, tea.Interrupt
 	}
 	return m.updateMachineForm(key)
 }
@@ -114,5 +116,7 @@ func (m model) renderMachine() string {
 	if m.machineForm != nil {
 		form = m.machineForm.View()
 	}
-	return "Machine identity · " + m.machineOS + "\nEdit the suggested id; uniqueness is checked locally.\n" + form + "\n\nEnter save local identity · Ctrl+U clear · Esc quit without saving\n" + status
+	body := "Edit the suggested id; uniqueness is checked locally.\n\n" + form
+	return m.initShell("Machine", "Machine identity · "+m.machineOS, "", body, "",
+		"Enter save local identity · Ctrl+U clear · Esc back to source", status)
 }

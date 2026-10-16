@@ -129,8 +129,8 @@ func step(m tea.Model, k string) tea.Model {
 	return next
 }
 func atDone(m tea.Model) bool {
-	first, _, _ := strings.Cut(m.View().Content, "\n")
-	return strings.TrimSpace(first) == "Done"
+	content := m.View().Content
+	return strings.Contains(content, "Adoption scope unchanged")
 }
 func TestRealWelcomeSourceMachineDependenciesTrackerDoneJourney(t *testing.T) {
 	o := options(t)
@@ -204,7 +204,7 @@ func TestRealWelcomeSourceMachineDependenciesTrackerDoneJourney(t *testing.T) {
 		t.Fatal("setup changed Homebrew-owned chezmoi")
 	}
 	m = step(m, "enter")
-	if !strings.Contains(m.View().Content, "returning-user actions") {
+	if !(strings.Contains(m.View().Content, "What next?") || strings.Contains(m.View().Content, "Status & Diff")) {
 		t.Fatal("no returning menu: " + m.View().Content)
 	}
 }

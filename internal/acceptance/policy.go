@@ -2,6 +2,7 @@ package acceptance
 
 import (
 	"bytes"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
@@ -22,6 +23,8 @@ func (h harness) scope(home string) (native.Adoption, error) {
 	return a, err
 }
 
+func mustMarshal(v any) []byte { b, _ := json.Marshal(v); return b }
+
 func (h harness) policyCases(one, two string) error {
 	source := filepath.Join(two, ".local/share/dot-config")
 	manifestPath := filepath.Join(source, "manifest.json")
@@ -30,6 +33,7 @@ func (h harness) policyCases(one, two string) error {
 	if err != nil {
 		return err
 	}
+	m = native.Manifest{}
 	if err = native.Decode(b, &m); err != nil {
 		return err
 	}
@@ -119,6 +123,7 @@ func (h harness) policyCases(one, two string) error {
 	if err != nil {
 		return err
 	}
+	m = native.Manifest{}
 	if err = native.Decode(b, &m); err != nil {
 		return err
 	}
@@ -221,11 +226,34 @@ func (h harness) policyCases(one, two string) error {
 	if err = os.Chmod(filepath.Join(two, interrupted.BackupPath), interrupted.Before.Mode); err != nil {
 		return err
 	}
+	// The interrupted plan is now stale because its first action already ran.
+	// Use an otherwise current plan to prove recovery itself blocks Apply.
+	blockedPlan, err := h.plan(two, native.Request{Version: 1, Mode: "update", Profile: "gated"})
+	if err != nil {
+		return err
+	}
 	if err = write(filepath.Join(two, ".local/state/dot/recovery.json"), []byte(marshal(journal)), 0600); err != nil {
 		return err
 	}
-	if _, err = h.invoke(two, marshal(p), "intent", "apply", "--plan", "-", "--approve", p.ID, "--ack-unsafe", "--ack-desktop", "--ack-backup"); err == nil {
+	if _, err = h.invoke(two, marshal(blockedPlan), "intent", "apply", "--plan", "-", "--approve", blockedPlan.ID, "--ack-unsafe", "--ack-desktop", "--ack-backup"); err == nil {
 		return fmt.Errorf("pending recovery allowed apply")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "recover") && !strings.Contains(strings.ToLower(err.Error()), "interrupted") {
+		return fmt.Errorf("pending apply refused without recovery signal: %v", err)
+	}
+	// Pending recovery must also block remote operations, not just apply.
+	if _, err = h.invoke(two, "", "pull", "--yes"); err == nil {
+		return fmt.Errorf("pending recovery allowed pull")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "recover") && !strings.Contains(strings.ToLower(err.Error()), "interrupted") {
+		return fmt.Errorf("pending pull refused without recovery signal: %v", err)
+	}
+	if _, err = h.invoke(two, "", "push", "--yes"); err == nil {
+		return fmt.Errorf("pending recovery allowed push")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "recover") && !strings.Contains(strings.ToLower(err.Error()), "interrupted") {
+		return fmt.Errorf("pending push refused without recovery signal: %v", err)
+	}
+	live, _ = os.ReadFile(filepath.Join(two, "gated"))
+	if !bytes.Equal(live, interrupted.After.Data) {
+		return fmt.Errorf("blocked remote changed target during pending recovery")
 	}
 	if err = write(filepath.Join(two, "gated"), []byte("post-interruption human edit"), 0640); err != nil {
 		return err
@@ -287,7 +315,60 @@ func (h harness) policyCases(one, two string) error {
 	if _, err = h.plan(two, native.Request{Version: 1, Mode: "track", Profile: "alpha", Selections: []native.Selection{{Path: "unsafe-link", Entry: native.Entry{OS: []string{runtime.GOOS}, Portability: "managed-shared", Impact: "Safe"}}}}); err == nil {
 		return fmt.Errorf("symlink enrollment accepted")
 	}
+	_ = os.Remove(filepath.Join(two, "unsafe-link"))
+	// Conflicting destinations fail closed without widening scope.
+	m = native.Manifest{}
+	if err = native.Decode(goodManifest, &m); err != nil {
+		return err
+	}
+	colliding := m
+	if len(colliding.Entries) == 0 {
+		return fmt.Errorf("no entries for collision check")
+	}
+	var firstID string
+	var first native.Entry
+	for id, x := range colliding.Entries {
+		firstID, first = id, x
+		break
+	}
+	colliding.Entries["collide-destination"] = first
+	colliding.Profiles["collide"] = []string{"collide-destination", firstID}
+	if err = write(manifestPath, []byte(marshal(colliding)), 0600); err != nil {
+		return err
+	}
+	if _, err = h.invoke(two, "", "contract", "check"); err == nil {
+		return fmt.Errorf("destination collision accepted")
+	}
+	if err = write(manifestPath, goodManifest, 0600); err != nil {
+		return err
+	}
+	// Unknown request/plan/gate fields fail closed (strict Decode).
+	if _, err = h.invoke(two, `{"version":1,"mode":"adopt","profile":"alpha","entries":["all_a"],"unknown":true}`, "intent", "plan", "--request", "-"); err == nil {
+		return fmt.Errorf("unknown request field accepted")
+	}
+	known, err := h.plan(two, native.Request{Version: 1, Mode: "adopt", Profile: "alpha", Entries: []string{"all_a"}})
+	if err != nil {
+		return err
+	}
+	var planMap map[string]any
+	rawPlan, _ := json.Marshal(known)
+	if err = json.Unmarshal(rawPlan, &planMap); err != nil {
+		return err
+	}
+	planMap["unknown"] = true
+	if _, err = h.invoke(two, string(mustMarshal(planMap)), "intent", "preview", "--plan", "-"); err == nil {
+		return fmt.Errorf("unknown plan field accepted")
+	}
+	planMap = map[string]any{}
+	if err = json.Unmarshal(rawPlan, &planMap); err != nil {
+		return err
+	}
+	planMap["gates"] = map[string]any{"unsafe": false, "desktop": false, "backup": false, "unknown": true}
+	if _, err = h.invoke(two, string(mustMarshal(planMap)), "intent", "preview", "--plan", "-"); err == nil {
+		return fmt.Errorf("unknown gate field accepted")
+	}
 	// Unsupported helpers stay fail closed; never execute retired template runners.
+	m = native.Manifest{}
 	if err = native.Decode(goodManifest, &m); err != nil {
 		return err
 	}
@@ -307,6 +388,16 @@ func (h harness) policyCases(one, two string) error {
 	}
 	if err = write(manifestPath, goodManifest, 0600); err != nil {
 		return err
+	}
+	// Dirty checkout must refuse pull with a usable remote, before any offline test.
+	if _, err = h.invoke(two, "", "pull", "--yes"); err == nil {
+		return fmt.Errorf("dirty pull succeeded with usable remote")
+	} else if !strings.Contains(strings.ToLower(err.Error()), "dirty") && !strings.Contains(strings.ToLower(err.Error()), "untracked") {
+		return fmt.Errorf("dirty pull refused without dirty signal: %v", err)
+	}
+	live, _ = os.ReadFile(filepath.Join(two, "gated"))
+	if string(live) != "interrupted original" {
+		return fmt.Errorf("refused dirty pull changed target")
 	}
 	// Inspection cannot need remote access: make the transport unusable, then inspect.
 	if err = h.gitRun(two, "-C", source, "remote", "set-url", "origin", "https://offline.invalid/config.git"); err != nil {
@@ -344,6 +435,58 @@ func (h harness) policyCases(one, two string) error {
 	}
 	if _, err = os.Stat(filepath.Join(secretHome, ".local")); !os.IsNotExist(err) {
 		return fmt.Errorf("rejected URL wrote source/state")
+	}
+	// Stop tracking removes shared enrollment only, preserving content and the
+	// machine's existing exact approval for explicit later resolution.
+	beforeScope, err := h.scope(two)
+	if err != nil {
+		return err
+	}
+	beforeTarget, err := os.ReadFile(filepath.Join(two, "all_a"))
+	if err != nil {
+		return err
+	}
+	beforeSource, err := os.ReadFile(filepath.Join(source, "home/all_a"))
+	if err != nil {
+		return err
+	}
+	beforeMode, err := os.Stat(filepath.Join(two, "all_a"))
+	if err != nil {
+		return err
+	}
+	p, err = h.plan(two, native.Request{Version: 1, Mode: "untrack", Profile: "alpha", Entries: []string{"all_a"}})
+	if err != nil {
+		return err
+	}
+	if err = h.apply(two, p); err != nil {
+		return err
+	}
+	afterScope, err := h.scope(two)
+	if err != nil || marshal(beforeScope) != marshal(afterScope) {
+		return fmt.Errorf("untrack changed local approval: %v", err)
+	}
+	afterTarget, err := os.ReadFile(filepath.Join(two, "all_a"))
+	if err != nil || !bytes.Equal(beforeTarget, afterTarget) {
+		return fmt.Errorf("untrack changed target bytes: %v", err)
+	}
+	afterSource, err := os.ReadFile(filepath.Join(source, "home/all_a"))
+	if err != nil || !bytes.Equal(beforeSource, afterSource) {
+		return fmt.Errorf("untrack discarded source bytes: %v", err)
+	}
+	afterMode, err := os.Stat(filepath.Join(two, "all_a"))
+	if err != nil || beforeMode.Mode().Perm() != afterMode.Mode().Perm() {
+		return fmt.Errorf("untrack changed target mode: %v", err)
+	}
+	b, err = os.ReadFile(manifestPath)
+	if err != nil {
+		return err
+	}
+	m = native.Manifest{}
+	if err = native.Decode(b, &m); err != nil {
+		return err
+	}
+	if _, exists := m.Entries["all_a"]; exists {
+		return fmt.Errorf("untrack retained shared enrollment")
 	}
 	return nil
 }

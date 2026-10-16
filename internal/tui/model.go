@@ -49,6 +49,9 @@ type model struct {
 	returning                                   bool
 	returningChoice                             int
 	returningOperation                          string
+	dashboard                                   *DashboardData
+	dashboardErr                                error
+	dashboardLoading                            bool
 	packageView                                 bool
 	packages                                    PackageResult
 	packageStage, packageManager, packageReview string
@@ -62,6 +65,7 @@ type model struct {
 	profiles                         []Profile
 	machines                         []string
 	inventoryReady                   bool
+	inventoryErr                     error
 	presetPending                    bool
 	visible                          []int
 	cursor                           int
@@ -116,8 +120,27 @@ type model struct {
 	trackerReview                    string
 	trackerName, trackerEmail        textinput.Model
 	trackerField                     int
+	trackerEditing                   bool
 	setupContext                     context.Context
 	setupCancel                      context.CancelFunc
+	activeTab                        int
+	syncChoice                       int
+	tabGeneration                    uint64
+	settingsArmed                    bool
+	settingsSearch                   textinput.Model
+	settingsReady                    bool
+	settingsFocus                    int
+	settingsAdvanced                 bool
+	settingsCheckState               string
+	help                             bool
+	helpOffset                       int
+	tabCursors                       [7]int
+	listOffsets                      [7]int
+	invCache                         map[string]Inventory
+	dirLoaded                        map[string]bool
+	dirPending                       map[string]bool
+	previewCancel                    context.CancelFunc
+	previewLoading                   bool
 }
 
 type inventoryMsg struct {
@@ -185,13 +208,22 @@ func NewInitModelContext(ctx context.Context, engine Engine) tea.Model {
 	return model{engine: engine, setupContext: ctx, setupCancel: cancel, initMode: true, stage: "welcome", basket: map[string]map[string]any{}, metadataEdits: map[string]map[string]any{}, mode: "track", profile: "default", search: input, templateInput: templateEditor, hidden: true, viewport: viewport.New(viewport.WithWidth(76), viewport.WithHeight(15)), previewViewport: viewport.New(viewport.WithWidth(50), viewport.WithHeight(14)), width: 80, height: 24, message: "Nothing selected. Browsing is not authorization."}
 }
 func (m model) Init() tea.Cmd {
-	if m.stage == "setup" || m.initMode || m.returning {
+	if m.stage == "setup" || m.initMode {
 		return nil
+	}
+	if m.returning {
+		return m.dashboardCommand()
 	}
 	return m.loadInventory
 }
 func (m model) loadInventory() tea.Msg {
-	value, err := m.engine.InventoryMode(m.setupCtx(), m.mode)
+	var value Inventory
+	var err error
+	if e, ok := m.engine.(BrowserEngine); ok {
+		value, err = e.BrowserInventory(m.setupCtx(), m.mode)
+	} else {
+		value, err = m.engine.InventoryMode(m.setupCtx(), m.mode)
+	}
 	return inventoryMsg{m.inventoryGeneration, m.mode, value, err}
 }
 
@@ -210,9 +242,16 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case directoryMsg:
+		return m.directoryResult(value)
+	case previewRequestMsg:
+		return m.startPreview(value)
 	case setupMsg:
 		return m.setupResult(value)
 	case returningMsg:
+		if !value.remote && value.generation != m.tabGeneration {
+			return m, nil
+		}
 		m.loading = false
 		m.err = value.err
 		if value.remote {
@@ -222,19 +261,65 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			if value.err != nil {
 				m.message = value.err.Error()
 			}
+			if cmd := m.dashboardCommand(); cmd != nil {
+				m.dashboardLoading = true
+				m.dashboardErr = nil
+				return m, cmd
+			}
 		} else {
 			m.stage = "returning-inspect"
+			m.resizeTextViewport()
 			m.viewport.SetContent(safeTerminal(value.text))
 			m.viewport.GotoTop()
 		}
 		return m, nil
+	case dashboardMsg:
+		if value.generation != m.tabGeneration {
+			return m, nil
+		}
+		m.dashboardLoading = false
+		m.dashboardErr = value.err
+		if value.err == nil {
+			m.dashboard = value.data
+			if value.data != nil && value.data.Machine.ID != "" {
+				m.currentMachine = value.data.Machine
+			}
+			if m.stage == "returning-home" && m.activeTab == TabStatus {
+				return m, m.statusHighlight()
+			}
+		} else {
+			m.dashboard = nil
+		}
+		return m, nil
+	case settingsDepsMsg:
+		return m.settingsResultDeps(value)
+	case settingsCheckMsg:
+		return m.settingsResultCheck(value)
 	case machineMsg:
 		return m.machineResult(value)
 	case sourceMsg:
+		if m.returning && m.currentTab() == TabSettings && m.stage == "returning-settings" {
+			return m.settingsSourceResult(value)
+		}
 		return m.sourceResult(value)
 	case tea.PasteMsg:
+		if m.stage == "returning-settings" && m.settingsSearch.Focused() {
+			var cmd tea.Cmd
+			m.settingsSearch, cmd = m.settingsSearch.Update(value)
+			m.refreshTabViewport()
+			m.viewport.GotoTop()
+			return m, cmd
+		}
 		if m.initMode && m.stage == "tracker-edit" && !m.loading {
 			return m.updateTrackerInput(value)
+		}
+		if m.initMode && m.stage == "tracker-confirm" && m.trackerEditing && !m.loading {
+			return m.updateTrackerInput(value)
+		}
+		if m.stage == "returning-settings" && m.settingsSearch.Focused() {
+			var cmd tea.Cmd
+			m.settingsSearch, cmd = m.settingsSearch.Update(msg)
+			return m, cmd
 		}
 		if m.initMode && m.stage == "machine" && !m.loading {
 			return m.updateMachineForm(value)
@@ -302,13 +387,19 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 		m.loading = false
 		m.err = value.err
+		m.inventoryErr = value.err
 		m.inventoryReady = value.err == nil
 		if value.err == nil {
 			m.currentOS = value.value.OS
 			m.currentMachine = value.value.Machine
 			m.entries = value.value.Entries
+			m.dirLoaded, m.dirPending = map[string]bool{}, map[string]bool{}
 			m.profiles = value.value.Profiles
 			m.machines = value.value.Machines
+			if m.invCache == nil {
+				m.invCache = map[string]Inventory{}
+			}
+			m.invCache[value.mode] = value.value
 			m.filter()
 			if m.presetPending {
 				m.openPresets()
@@ -343,9 +434,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if value.generation != m.previewGeneration {
 			return m, nil
 		}
+		m.previewLoading = false
 		m.err = value.err
 		if value.err == nil {
 			m.highlight = value.result
+			m.resizePreview()
 			m.previewViewport.SetContent(m.renderHighlight())
 			m.previewViewport.GotoTop()
 		} else {
@@ -390,10 +483,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.selected = &reviewed
 			m.planFresh = true
 			m.stage = "review"
+			m.message = "Review the exact plan. Nothing applied."
+			m.refreshReviewViewport()
+			m.viewport.GotoTop()
 		}
 	case applyMsg:
 		m.loading = false
 		m.err = value.err
+		m.invCache = nil
+		m.cancelPreview()
 		if value.err == nil {
 			m.stage = "done"
 			m.message = "Applied reviewed plan."
@@ -405,6 +503,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		}
 	case tea.WindowSizeMsg:
 		m.width, m.height = value.Width, value.Height
+		if m.settingsReady {
+			m.settingsSearch.SetWidth(max(1, value.Width-7))
+		}
 		if m.machineForm != nil {
 			m.machineForm.WithWidth(max(20, value.Width-8))
 		}
@@ -413,31 +514,43 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if m.initMode {
 			switch m.stage {
 			case "dependencies":
-				m.viewport.SetHeight(max(3, value.Height-9))
+				m.viewport.SetHeight(m.depHeight())
 			case "tracker-confirm":
-				m.viewport.SetHeight(max(3, value.Height-10))
+				m.viewport.SetHeight(m.trackerHeight())
 			case "source-confirm":
-				m.viewport.SetHeight(max(3, value.Height-7))
+				m.viewport.SetHeight(m.sourceConfirmHeight())
 			}
 		}
 		m.viewport.SoftWrap = true
-		previewWidth := value.Width - value.Width/3 - value.Width/4
-		previewHeight := max(4, value.Height-10)
-		if value.Width < 100 {
-			previewWidth = value.Width - 4
-			previewHeight = max(3, min(6, value.Height/3))
+		m.resizePreview()
+		m.resizeTextViewport()
+		if m.stage == "review" {
+			m.refreshReviewViewport()
 		}
-		previewOffset := m.previewViewport.YOffset()
-		m.previewViewport.SetWidth(max(20, previewWidth))
-		m.previewViewport.SetHeight(previewHeight)
-		m.previewViewport.SoftWrap = true
-		if m.highlight.Status != "" {
-			m.previewViewport.SetContent(m.renderHighlight())
-			m.previewViewport.SetYOffset(previewOffset)
-		}
+
 		m.templateInput.SetWidth(max(20, value.Width-8))
 		m.templateInput.SetHeight(max(4, value.Height-10))
+		if m.returning {
+			m.templateInput.SetHeight(max(3, m.workspaceHeight()-6))
+		}
 	case tea.KeyPressMsg:
+		if m.help {
+			switch value.String() {
+			case "esc", "?":
+				m.help = false
+			case "j", "J", "down":
+				m.helpOffset = min(15, m.helpOffset+1)
+			case "k", "K", "up":
+				m.helpOffset = max(0, m.helpOffset-1)
+			case "q", "ctrl+c":
+				return m, tea.Quit
+			}
+			return m, nil
+		}
+		if value.String() == "?" && !m.searching && !m.initMode && m.stage != "metadata" && m.stage != "template" && m.stage != "logical" && !m.packageView && !(m.stage == "returning-settings" && m.settingsSearch.Focused()) {
+			m.help, m.helpOffset = true, 0
+			return m, nil
+		}
 		// Bubbles/Huh system-clipboard shortcuts invoke platform helpers. Dot
 		// instead accepts the terminal's bracketed PasteMsg, keeping runtime
 		// dependencies confined to Git/chezmoi and explicitly approved managers.
@@ -451,11 +564,21 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, tea.Interrupt
 		}
-		if m.returning && strings.HasPrefix(m.stage, "returning-") {
-			return m.updateReturning(value)
+		if m.returning {
+			if next, cmd, ok := m.returningTabKey(value); ok {
+				return next, cmd
+			}
+			if strings.HasPrefix(m.stage, "returning-") {
+				return m.updateReturning(value)
+			}
 		}
 		if m.returning && (m.stage == "done" && value.String() == "enter" || m.stage == "" && !m.searching && value.String() == "esc") {
 			m.resetReturning()
+			if cmd := m.dashboardCommand(); cmd != nil {
+				m.dashboardLoading = true
+				m.dashboardErr = nil
+				return m, cmd
+			}
 			return m, nil
 		}
 		if m.packageView {
@@ -552,6 +675,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					}
 					sort.Strings(m.selectedProfiles)
 					m.stage = ""
+					m.invalidatePlan()
 					m.message = fmt.Sprintf("Composed profiles %s (%d exact entries); Space deselects locally; no apply consent.", strings.Join(m.selectedProfiles, " + "), len(m.basket))
 				}
 			}
@@ -578,6 +702,7 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				}
 				m.logicalRequest = request
 				m.basket = map[string]map[string]any{}
+				m.invalidatePlan()
 				m.generation++
 				m.stage = ""
 				m.message = "Logical metadata request prepared; p reviews exact source/scope changes. No consent given."
@@ -634,18 +759,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.generation++
 			cmd := m.highlightCurrent()
 			return m, cmd
+		case "pgdown", "pgup", "home", "end":
+			m.pageFiles(value.String())
+			return m, m.highlightCurrent()
 		case "h", "left":
+			m.collapseDirectory()
+			return m, m.highlightCurrent()
+		case "l", "right", "enter":
 			if i := m.current(); i >= 0 && m.entries[i].Kind == "directory" {
-				m.entries[i].Open = false
-				m.filter()
-				cmd := m.highlightCurrent()
-				return m, cmd
-			}
-		case "l", "right":
-			if i := m.current(); i >= 0 && m.entries[i].Kind == "directory" {
-				m.entries[i].Open = true
-				m.filter()
-				cmd := m.highlightCurrent()
+				cmd := m.expandDirectory(i)
 				return m, cmd
 			}
 		case " ", "space":
@@ -686,9 +808,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 					m.openPresets()
 				}
 			}
-		case "tab":
+		case "m", "tab":
 			return m.retargetCurrent()
 		case "shift+tab":
+			m.cancelPreview()
+			m.dirPending = map[string]bool{}
 			m.selectedProfiles = nil
 			m.adoptTouched = false
 			m.logicalRequest = nil
@@ -697,8 +821,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.mode = "track"
 			}
+			if m.returning {
+				if m.mode == "track" {
+					m.activeTab = TabTrack
+				} else {
+					m.activeTab = TabAdopt
+				}
+			}
 			m.basket = map[string]map[string]any{}
 			m.metadataEdits = map[string]map[string]any{}
+			m.invalidatePlan()
 			m.generation++
 			m.inventoryGeneration++
 			m.inventoryReady, m.presetPending = false, false
@@ -707,6 +839,8 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.loading = true
 			return m, m.loadInventory
 		case "u":
+			m.cancelPreview()
+			m.dirPending = map[string]bool{}
 			m.selectedProfiles = nil
 			m.adoptTouched = false
 			m.logicalRequest = nil
@@ -715,8 +849,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			} else {
 				m.mode = "untrack"
 			}
+			if m.returning {
+				if m.mode == "untrack" {
+					m.activeTab = TabUntrack
+				} else {
+					m.activeTab = TabTrack
+				}
+			}
 			m.basket = map[string]map[string]any{}
 			m.metadataEdits = map[string]map[string]any{}
+			m.invalidatePlan()
 			m.generation++
 			m.inventoryGeneration++
 			m.inventoryReady, m.presetPending = false, false
@@ -730,8 +872,10 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			cmd := m.highlightCurrent()
 			return m, cmd
 		case "J":
+			m.resizePreview()
 			m.previewViewport.ScrollDown(1)
 		case "K":
+			m.resizePreview()
 			m.previewViewport.ScrollUp(1)
 		case "/":
 			m.searching = true
@@ -740,6 +884,15 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		case "p":
 			cmd := m.plan()
 			return m, cmd
+		case "r":
+			m.cancelPreview()
+			m.generation++
+			m.inventoryGeneration++
+			m.inventoryReady, m.presetPending = false, false
+			m.invCache = nil
+			m.loading = true
+			m.message = ""
+			return m, m.loadInventory
 		case "esc":
 			m.search.SetValue("")
 			m.filter()
@@ -749,6 +902,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m.updateMachineForm(msg)
 	}
 	if m.initMode && m.stage == "tracker-edit" && !m.loading {
+		return m.updateTrackerInput(msg)
+	}
+	if m.initMode && m.stage == "tracker-confirm" && m.trackerEditing && !m.loading {
 		return m.updateTrackerInput(msg)
 	}
 	if m.initMode && m.stage == "source-url" && !m.loading {
@@ -772,7 +928,7 @@ func (m *model) updateSearch(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.searching = false
 		m.search.Blur()
 		m.filter()
-		cmd := m.highlightCurrent()
+		cmd := m.searchAllFolders()
 		return m, cmd
 	}
 	var cmd tea.Cmd
@@ -790,9 +946,12 @@ func (m *model) current() int {
 }
 
 func (m *model) highlightCurrent() tea.Cmd {
+	m.keepFileCursorVisible()
 	i := m.current()
 	if i < 0 {
+		m.cancelPreview()
 		m.highlight = HighlightResult{}
+		m.highlightPath = ""
 		return nil
 	}
 	entry := m.entries[i]
@@ -814,12 +973,18 @@ func (m *model) highlightCurrent() tea.Cmd {
 		}
 		request = map[string]any{"version": 1, "mode": "track", "profile": m.profile, "selections": []map[string]any{selection}}
 	}
-	m.previewGeneration++
-	generation := m.previewGeneration
-	return func() tea.Msg {
-		result, err := m.engine.Highlight(m.setupCtx(), m.mode, entry.Path, request)
-		return highlightMsg{generation, result, err}
+	if entry.Kind == "directory" {
+		m.cancelPreview()
+		m.highlightPath = entry.Path
+		m.highlight = HighlightResult{Status: "directory", Summary: "Enter / l expands this folder · Space snapshots exact eligible files."}
+		m.previewViewport.SetContent(m.renderHighlight())
+		m.previewViewport.GotoTop()
+		return nil
 	}
+	if m.stage != "review" {
+		request = nil
+	}
+	return m.queuePreview(m.mode, entry.Path, request)
 }
 
 func (m *model) filter() {
@@ -920,6 +1085,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 					m.basket[child.Path] = item
 				}
 			}
+			m.invalidatePlan()
 			m.generation++
 			return nil
 		}
@@ -932,6 +1098,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 		m.generation++
 		generation := m.generation
 		m.loading = true
+		m.invalidatePlan()
 		return func() tea.Msg {
 			result, err := m.engine.Snapshot(m.setupCtx(), entry.Path)
 			return snapshotMsg{generation, entry.Path, result, err}
@@ -947,6 +1114,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 			m.adoptTouched = true
 		}
 		delete(m.basket, entry.Path)
+		m.invalidatePlan()
 		m.generation++
 		return nil
 	}
@@ -960,6 +1128,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 			item[k] = v
 		}
 		m.basket[entry.Path] = item
+		m.invalidatePlan()
 		m.generation++
 		return nil
 	}
@@ -972,6 +1141,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 		return nil
 	}
 	m.basket[entry.Path] = metadata
+	m.invalidatePlan()
 	m.generation++
 	return nil
 }
@@ -1349,6 +1519,7 @@ func (m model) updateMetadata(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.basket[m.editPath] = value
 		}
 		m.stage = ""
+		m.invalidatePlan()
 		m.generation++
 		m.message = "Exact selection metadata saved; preview is still required."
 	case "backspace":
@@ -1451,8 +1622,8 @@ func (m model) updateConfirm(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	return m, nil
 }
 
-var muted = lipgloss.NewStyle().Foreground(lipgloss.Color("8"))
-var strong = lipgloss.NewStyle().Bold(true)
+var muted = lipgloss.NewStyle().Foreground(lipgloss.Color(AppTheme.Muted))
+var strong = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color(AppTheme.Text))
 var ansiCSI = regexp.MustCompile("\\x1b\\[[0-?]*[ -/]*[@-~]")
 
 func safeTerminal(value string) string {
@@ -1501,18 +1672,16 @@ func fitHeight(value string, height int) string {
 	return strings.Join(lines[:height], "\n")
 }
 
-var modalBoxStyle = lipgloss.NewStyle().
-	Border(lipgloss.RoundedBorder()).
-	BorderForeground(lipgloss.Color("63")).
-	Padding(0, 1)
+// overlayStyle is the compact fallback for legacy inline flows and very small
+// setup terminals. Workspaces and regular setup screens own bounded panels.
+var overlayStyle = lipgloss.NewStyle().Padding(0, 2)
 
 func (m model) renderOverlay(body string) string {
 	w := m.width
 	if w < 1 {
 		w = 80
 	}
-	boxWidth := min(max(40, w-4), 84)
-	return modalBoxStyle.Width(boxWidth).Render(body)
+	return overlayStyle.Width(w).Render(body)
 }
 
 func (m model) View() tea.View {
@@ -1520,7 +1689,13 @@ func (m model) View() tea.View {
 	if height < 1 {
 		height = 24
 	}
-	content := sanitizeTerminalView(m.render())
+	var content string
+	if m.help {
+		content = m.renderKeyHelp()
+	} else {
+		content = m.render()
+	}
+	content = sanitizeTerminalView(content)
 	v := tea.NewView(fitHeight(content, height))
 	v.AltScreen = true
 	return v
@@ -1531,6 +1706,9 @@ func (m model) render() string {
 		return m.renderSetup()
 	}
 	if m.returning && strings.HasPrefix(m.stage, "returning-") {
+		if m.hasStatusWorkspace() || m.stage == "returning-sync" || m.stage == "returning-settings" || m.stage == "returning-inspect" || m.stage == "returning-remote-confirm" {
+			return m.renderReturning()
+		}
 		return m.renderOverlay(m.renderReturning())
 	}
 	if m.initMode && m.stage == "machine" {
@@ -1549,21 +1727,21 @@ func (m model) render() string {
 		m.height = 24
 	}
 	if m.stage == "review" && m.selected != nil {
-		return m.renderOverlay(m.renderReview())
+		return m.returningChrome(m.renderReview())
 	}
 	if m.stage == "metadata" {
-		return m.renderOverlay(m.renderMetadata())
+		return m.returningChrome(m.renderMetadata())
 	}
 	if m.stage == "template" {
-		return m.renderOverlay("EDIT SECRET-FREE TEMPLATE\n" + m.templateInput.View() + "\n\nCtrl+S save · Esc cancel")
+		return m.returningChrome("EDIT SECRET-FREE TEMPLATE\n" + m.templateInput.View() + "\n\nCtrl+S save · Esc cancel")
 	}
 	if m.stage == "logical" {
-		return m.renderOverlay("LOGICAL FILE METADATA · Dotfiles\nCommon → explicit machine → OS; per-OS destinations.\n" + m.templateInput.View() + "\n\nCtrl+S prepare request · Esc cancel · no writes until exact review/approval\n" + safeTerminal(m.message))
+		return m.returningChrome("LOGICAL FILE METADATA · Dotfiles\nCommon → explicit machine → OS; per-OS destinations.\n" + m.templateInput.View() + "\n\nCtrl+S prepare request · Esc cancel · no writes until exact review/approval\n" + safeTerminal(m.message))
 	}
 	if m.stage == "confirm" {
 		choices := []string{"Cancel", "Apply exact reviewed plan"}
 		selected := m.confirmChoice
-		return m.renderOverlay(fmt.Sprintf("FINAL CONFIRMATION · %s\n\nUnsafe %t · Desktop %t · Backup replacement %t\n\n%s %s\n%s %s\n\nj/k choose · Enter confirm · Esc cancel", m.selected.Direction, m.unsafeAck, m.desktopAck, m.backupAck, map[bool]string{true: ">", false: " "}[selected == 0], choices[0], map[bool]string{true: ">", false: " "}[selected == 1], choices[1]))
+		return m.returningChrome(fmt.Sprintf("FINAL CONFIRMATION · %s\nPlan ID: %v\n\nUnsafe %t · Desktop %t · Backup replacement %t\n\n%s %s\n%s %s\n\nj/k choose · Enter confirm · Esc cancel", m.selected.Direction, m.selected.Plan["id"], m.unsafeAck, m.desktopAck, m.backupAck, map[bool]string{true: ">", false: " "}[selected == 0], choices[0], map[bool]string{true: ">", false: " "}[selected == 1], choices[1]))
 	}
 	if m.stage == "setup" {
 		choices := []string{"Finish without further adoption", "Track: HOME → repository", "Adopt: repository → HOME"}
@@ -1590,350 +1768,119 @@ func (m model) render() string {
 			fmt.Fprintf(&b, "%s%s · %d entries\n", mark, p.Name, len(p.Entries))
 		}
 		b.WriteString("\nj/k move · Enter select · Esc cancel")
-		return m.renderOverlay(b.String())
+		return m.returningChrome(b.String())
 	}
 	if m.stage == "welcome" && m.initMode {
 		message := m.message
+		if message == "Nothing selected. Browsing is not authorization." {
+			// That default belongs to the file browser's selection basket;
+			// on welcome nothing can be selected yet, so show no status.
+			message = ""
+		}
 		if m.loading {
 			message = "Checking source…"
 		}
-		return "Welcome to dot\nWelcome → Source → Machine → Dependencies → Tracker → Done\nConnect your repository and this machine. Adoption stays a separate decision.\n\ndot init --check is offline/read-only. Entering setup changes nothing.\nPackage-manager prompts run natively only after Install consent.\n\nEnter continue · q quit\n" + message
+		body := "• Track — version exact files from HOME into your repository.\n• Adopt — apply repository files to this machine, only the scope you select.\n• Machine — a local id so shared files know where they belong.\n• Dependencies — Git and chezmoi only, installed with your Enter consent.\n• Tracker — a local record of this connection; never commits or pushes.\n\nThis wizard only connects repository and machine; adoption stays a separate decision.\n\ndot init --check is offline/read-only. Entering setup changes nothing."
+		return m.initShell("Welcome", "Welcome to dot", "What dot does", body, "", "Enter continue · q quit", message)
 	}
 	if m.stage == "done" {
 		if m.initMode {
-			return "Done\n" + m.message + "\nAdoption scope unchanged · empty scope is not whole-machine parity\n\nEnter open returning menu · q quit"
+			machine := "Machine identity saved locally."
+			if m.currentMachine.ID != "" {
+				machine = "Machine " + safeTerminal(m.currentMachine.ID) + " (" + safeTerminal(m.currentMachine.OS) + ") — identity saved locally."
+			}
+			body := "✓ Source connected — repository checked, contract valid.\n✓ " + machine + "\n✓ Dependencies verified — Git and chezmoi ready.\n✓ Tracker connected — local record, nothing pushed.\n\nAdoption scope unchanged — no files adopted, no Git settings changed."
+			return m.initShell("Done", "Done", "Setup complete — summary", body, "", "Enter open returning menu · q quit", m.message)
 		}
 		if m.rounds {
 			return "Applied reviewed plan.\nEnter next optional round · q quit"
 		}
-		return "Applied reviewed plan.\n" + muted.Render("q quit")
+		return m.browserChrome("Applied reviewed plan.\n" + muted.Render("q quit"))
 	}
-	leftWidth := m.width / 3
-	if leftWidth < 24 {
-		leftWidth = m.width - 2
-	}
-	header := strong.Render("DOTS-CLI · Dotfiles  |  Packages (P)") + "\n" + muted.Render("Track: HOME → REPOSITORY     Adopt: REPOSITORY → TARGET")
-	if m.currentMachine.ID != "" {
-		header += "\nMachine: " + safeTerminal(m.currentMachine.ID) + " · " + safeTerminal(m.currentMachine.OS)
-	}
-	if m.rounds {
-		header += "\n" + muted.Render("Optional rounds · Finish without selection")
-	}
-	footer := fmt.Sprintf("%d selected · %s · H hidden %t · / search · Space select · e metadata · M logical metadata · u stop tracking · p preview · Tab machines · Shift+Tab direction · s profiles · q quit", len(m.basket), m.mode, m.hidden)
-	if m.width < 100 {
-		footer = fmt.Sprintf("%d selected · %s · Space select · Tab machines · p preview\nShift+Tab direction · s profiles · H hidden · J/K scroll · q quit", len(m.basket), m.mode)
-	}
-	if m.searching {
-		footer = fmt.Sprintf("%d selected · Search %s · Enter apply filter · Esc cancel", len(m.basket), m.search.View())
-	}
-	message := m.message
-	if m.err != nil {
-		message = m.err.Error()
-	}
-	if message != "" {
-		footer += "\n" + message
-	}
-	preview := m.previewCard()
-	if m.width < 100 {
-		m.previewViewport.SetHeight(max(3, min(6, m.height/3)))
-		preview = m.previewCard()
-	}
-	detailLines := m.compactDetail()
-	var tree strings.Builder
-	modeLabel := strings.ToUpper(m.mode)
-	if m.mode == "untrack" {
-		modeLabel = "STOP TRACKING"
-	}
-	fmt.Fprintf(&tree, "%s\n%s\n", strong.Render("Dotfiles · "+modeLabel), muted.Render("j/k move  h/l folders  Space select"))
-	rowLimit := m.height - 8
-	if m.width >= 100 {
-		headerLines := lipgloss.Height(header)
-		footerLines := lipgloss.Height(muted.Render(footer))
-		paneH := max(6, m.height-headerLines-footerLines-1)
-		rowLimit = max(1, paneH-4)
-	} else {
-		// Reserve the actual wrapped header/detail/preview/footer height before
-		// computing scroll origin; never truncate navigable entries afterwards.
-		style := lipgloss.NewStyle().Width(max(1, m.width))
-		occupied := lipgloss.Height(style.Render(header)) + lipgloss.Height(style.Render(strings.Join(detailLines, "\n"))) + lipgloss.Height(style.Render(preview)) + lipgloss.Height(style.Render(footer))
-		rowLimit = max(1, m.height-occupied-2) // two tree heading rows
-	}
-	start := max(0, m.cursor-max(1, rowLimit)+1)
-	for row, index := range m.visible[start:] {
-		if row >= rowLimit {
-			break
-		}
-		e := m.entries[index]
-		mark := "[ ]"
-		if _, ok := m.basket[e.Path]; ok {
-			mark = "[x]"
-		}
-		if e.Kind == "directory" {
-			count, selected := 0, 0
-			prefix := e.Path + "/"
-			for _, child := range m.entries {
-				selectable := child.Status == "eligible" || m.mode == "track" && child.Status == "managed" || m.mode == "track" && child.Status == "restricted" && boundedGitConfig(child.Metadata) || m.mode == "adopt" && adoptFolderFile(child)
-				if child.Kind == "file" && selectable && strings.HasPrefix(child.Path, prefix) {
-					count++
-					if _, ok := m.basket[child.Path]; ok {
-						selected++
-					}
-				}
-			}
-			mark = "[ ]"
-			if count > 0 && selected == count {
-				mark = "[x]"
-			} else if selected > 0 {
-				mark = "[-]"
-			}
-		}
-		cursor := " "
-		if start+row == m.cursor {
-			cursor = ">"
-		}
-		label := e.Path
-		if e.Kind == "directory" {
-			if e.Open {
-				label += "/"
-			} else {
-				label += " …"
-			}
-		}
-		fmt.Fprintf(&tree, "%s%s %s  %s\n", cursor, mark, safeTerminal(label), muted.Render(safeTerminal(e.Status)))
-	}
-	if len(m.visible) == 0 {
-		reason := "No entry"
-		if len(m.entries) == 0 {
-			reason = "Empty repository"
-		} else if strings.TrimSpace(m.search.Value()) != "" {
-			reason = fmt.Sprintf("No search matches for %q", m.search.Value())
-		} else if !m.hidden {
-			reason = "Hidden results (press H to show)"
-		}
-		fmt.Fprintf(&tree, "  %s\n", muted.Render(reason))
-	}
-	var detail strings.Builder
-	if i := m.current(); i >= 0 {
-		e := m.entries[i]
-		fmt.Fprintf(&detail, "%s\n%s\n\nStatus: %s\nKind: %s\n", strong.Render("SELECTED"), safeTerminal(e.Path), safeTerminal(e.Status), safeTerminal(e.Kind))
-		if e.TargetStatus != "" {
-			fmt.Fprintf(&detail, "Target file: %s\n", safeTerminal(e.TargetStatus))
-		}
-		if e.OSStatus != "" {
-			fmt.Fprintf(&detail, "OS applicability: %s\n", safeTerminal(e.OSStatus))
-		}
-		fmt.Fprintf(&detail, "Approved scope: %t\n", e.Approved)
-		if _, ok := e.Metadata["machines"]; !ok {
-			detail.WriteString("Machines: all\n")
-		}
-		if e.Destination != "" {
-			fmt.Fprintf(&detail, "Destination: %s\n", safeTerminal(e.Destination))
-		}
-		for _, key := range []string{"portability", "impact", "os"} {
-			if value, ok := e.Metadata[key]; ok {
-				fmt.Fprintf(&detail, "%s: %s\n", key, safeTerminal(fmt.Sprint(value)))
-			}
-		}
-		keys := make([]string, 0, len(e.Metadata))
-		for key := range e.Metadata {
-			if key != "portability" && key != "impact" && key != "os" && key != "destination" {
-				keys = append(keys, key)
-			}
-		}
-		sort.Strings(keys)
-		for _, key := range keys {
-			value := e.Metadata[key]
-			fmt.Fprintf(&detail, "%s: %s\n", safeTerminal(key), safeTerminal(fmt.Sprint(value)))
-		}
-	} else {
-		reason := "No entry"
-		if len(m.entries) == 0 {
-			reason = "Empty repository"
-		} else if strings.TrimSpace(m.search.Value()) != "" {
-			reason = fmt.Sprintf("No search matches for %q", m.search.Value())
-		} else if !m.hidden {
-			reason = "Hidden results (press H to show)"
-		}
-		fmt.Fprintf(&detail, "%s\n%s", strong.Render("SELECTED"), reason)
-	}
-	content := tree.String() + "\n" + strings.Repeat("─", max(0, leftWidth-2)) + "\n" + detail.String()
-	if m.width >= 100 {
-		w1 := max(32, m.width*36/100)
-		w2 := max(26, m.width*26/100)
-		w3 := max(24, m.width-w1-w2)
-		headerLines := lipgloss.Height(header)
-		footerLines := lipgloss.Height(muted.Render(footer))
-		paneHeight := max(6, m.height-headerLines-footerLines-1)
-
-		treeBox := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("39")).
-			Padding(0, 1).
-			Width(w1).
-			Height(paneHeight).
-			Render(tree.String())
-
-		detailBox := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("63")).
-			Padding(0, 1).
-			Width(w2).
-			Height(paneHeight).
-			Render(detail.String())
-
-		previewBox := lipgloss.NewStyle().
-			Border(lipgloss.RoundedBorder()).
-			BorderForeground(lipgloss.Color("75")).
-			Padding(0, 1).
-			Width(w3).
-			Height(paneHeight).
-			Render(preview)
-
-		panes := lipgloss.JoinHorizontal(lipgloss.Top, treeBox, detailBox, previewBox)
-		return header + "\n" + panes + "\n" + muted.Render(footer)
-	}
-	if m.width < 100 {
-		// On narrow terminals prioritize navigable entries, target status, and the
-		// live preview; the complete metadata remains available in the wide layout.
-		rows := strings.Split(tree.String(), "\n")
-		rows = rows[:len(rows)-1] // omit the trailing empty tree line
-		return header + "\n" + strings.Join(rows, "\n") + "\n" + strings.Join(detailLines, "\n") + "\n" + preview + "\n" + muted.Render(footer)
-	}
-	return header + "\n" + lipgloss.NewStyle().Width(m.width).Render(content+"\n\n"+preview) + "\n" + muted.Render(footer)
+	return m.renderFileWorkspace()
 }
 
-func (m model) compactDetail() []string {
-	lines := []string{}
-	if i := m.current(); i >= 0 {
-		e := m.entries[i]
-		lines = append(lines, safeTerminal(e.Path), "Status: "+safeTerminal(e.Status))
-		values := e.Metadata
-		if selected, ok := m.basket[e.Path]; ok {
-			values = selected
+func (m model) emptyReason() (string, string) {
+	if len(m.entries) == 0 {
+		if m.inventoryErr != nil {
+			return "Couldn't list files", "Fix the error below, then press r to rescan."
 		}
-		machines := "all"
-		if assignment, ok := values["machines"].(map[string]any); ok {
-			machines = strings.Join(metadataList(assignment["include"]), ",")
-			if excluded := metadataList(assignment["exclude"]); len(excluded) > 0 {
-				machines += " except " + strings.Join(excluded, ",")
-			}
-		}
-		lines = append(lines, "Machines: "+safeTerminal(machines))
-		if e.TargetStatus != "" {
-			lines = append(lines, "Target file: "+safeTerminal(e.TargetStatus))
-		}
-		if m.mode == "adopt" {
-			lines = append(lines, fmt.Sprintf("Scope: %t · OS: %s", e.Approved, safeTerminal(e.OSStatus)))
-		} else if e.OSStatus != "" {
-			lines = append(lines, "OS: "+safeTerminal(e.OSStatus))
-		}
-		portability, impact := inputValue(e.Metadata["portability"]), inputValue(e.Metadata["impact"])
-		if portability != "" || impact != "" {
-			lines = append(lines, "Portability: "+safeTerminal(portability)+" · Impact: "+safeTerminal(impact))
-		}
-	} else {
-		reason := "No entry"
-		if len(m.entries) == 0 {
-			reason = "Empty repository"
-		} else if strings.TrimSpace(m.search.Value()) != "" {
-			reason = fmt.Sprintf("No search matches for %q", m.search.Value())
-		} else if !m.hidden {
-			reason = "Hidden results (press H to show)"
-		}
-		lines = append(lines, reason)
+		return "Empty repository", m.emptyGuidance()
 	}
-	return lines
+	if strings.TrimSpace(m.search.Value()) != "" {
+		return fmt.Sprintf("No search matches for %q", m.search.Value()), ""
+	}
+	if !m.hidden {
+		return "Hidden results (press H to show)", ""
+	}
+	return "No entry", ""
 }
 
-func (m model) previewCard() string {
-	if m.highlight.Status == "" {
-		return "PREVIEW\nSelect an entry to inspect the shared-engine preview."
+// emptyGuidance tells a user with no entries what to do next, per mode.
+// Wording stays inside established product truth: track versions HOME files,
+// adopt applies repository files, rescanning is a read-only reload.
+func (m model) emptyGuidance() string {
+	switch m.mode {
+	case "adopt":
+		return "Nothing to import yet.\nTrack files first, or connect a repository that has some."
+	case "untrack":
+		return "Nothing to stop tracking."
+	default:
+		return "No files to version yet.\nCreate files in HOME, then press r to rescan."
 	}
-	return m.previewViewport.View()
 }
 
 func (m model) renderHighlight() string {
-	var b strings.Builder
 	direction := "HOME → REPOSITORY"
-	if m.mode == "adopt" {
+	if m.mode == "adopt" || m.returning && m.currentTab() == TabStatus {
 		direction = "REPOSITORY → TARGET"
 	}
 	if m.highlight.Direction != "" {
-		direction = strings.ToUpper(m.highlight.Direction)
+		direction = strings.ToUpper(safeTerminal(m.highlight.Direction))
 	}
-	if m.width < 100 {
-		fmt.Fprintf(&b, "PREVIEW · %s\n%s · %s\n", direction, safeTerminal(m.highlight.Status), safeTerminal(m.highlight.Summary))
-		changed := []string{}
+	lines := []string{"PREVIEW · " + direction, safeTerminal(m.highlight.Status) + " · " + safeTerminal(m.highlight.Summary)}
+	if m.highlight.Text != "" {
+		lines = append(lines, safeTerminal(m.highlight.Text))
+	} else {
 		for _, diff := range m.highlight.Diffs {
 			if diff.Path != m.highlightPath {
 				continue
 			}
-			fmt.Fprintf(&b, "%s\n%s\n", safeTerminal(diff.Path), safeTerminal(diff.Summary))
-			var changes []string
-			for _, line := range strings.Split(safeTerminal(diff.Text), "\n") {
-				line = strings.TrimSpace(line)
-				if strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---") || strings.HasPrefix(line, "@@") {
-					continue
-				}
-				if strings.HasPrefix(line, "+") {
-					changes = append(changes, line)
-				} else if strings.HasPrefix(line, "-") {
-					changes = append(changes, line)
-				}
+			if diff.Summary != "" {
+				lines = append(lines, safeTerminal(diff.Summary))
 			}
-			changed = append(changed, changes...)
-		}
-		if len(changed) > 0 {
-			for _, line := range changed {
-				fmt.Fprintln(&b, line)
-			}
-		} else if m.highlight.Text != "" {
-			b.WriteString(safeTerminal(m.highlight.Text))
-		}
-		return strings.TrimSpace(b.String())
-	}
-	fmt.Fprintf(&b, "PREVIEW · %s\n%s · %s\n", direction, safeTerminal(m.highlight.Status), safeTerminal(m.highlight.Summary))
-	if m.highlight.Text != "" {
-		b.WriteString(safeTerminal(m.highlight.Text))
-		b.WriteString("\n\nJ/K scroll preview")
-		return b.String()
-	}
-	found := false
-	for _, diff := range m.highlight.Diffs {
-		if diff.Path != m.highlightPath {
-			continue
-		}
-		found = true
-		fmt.Fprintf(&b, "\n%s\n%s\n", safeTerminal(diff.Path), safeTerminal(diff.Summary))
-		for _, line := range strings.Split(safeTerminal(diff.Text), "\n") {
-			trimmed := strings.TrimSpace(line)
-			if strings.HasPrefix(trimmed, "+++") || strings.HasPrefix(trimmed, "---") || strings.HasPrefix(trimmed, "@@") {
-				continue
-			}
-			if strings.HasPrefix(trimmed, "+") || strings.HasPrefix(trimmed, "-") {
-				fmt.Fprintln(&b, line)
+			if diff.Text != "" {
+				lines = append(lines, safeTerminal(diff.Text))
 			}
 		}
 	}
-	if !found && m.highlight.Text != "" {
-		b.WriteString(safeTerminal(m.highlight.Text))
+	text := strings.Join(lines, "\n")
+	var styled []string
+	for _, line := range strings.Split(text, "\n") {
+		color := AppTheme.Text
+		switch {
+		case strings.HasPrefix(line, "+++") || strings.HasPrefix(line, "---"):
+			color = AppTheme.Muted
+		case strings.HasPrefix(line, "+"):
+			color = AppTheme.Success
+		case strings.HasPrefix(line, "-"):
+			color = AppTheme.Danger
+		case strings.HasPrefix(line, "@@"):
+			color = AppTheme.Accent
+		}
+		styled = append(styled, lipgloss.NewStyle().Foreground(lipgloss.Color(color)).Render(line))
 	}
-	if !found && m.highlight.Status != "" && m.highlight.Text == "" {
-		b.WriteString("No safe text diff is available for this entry.")
-	}
-	b.WriteString("\n\nJ/K scroll preview")
-	return b.String()
+	return strings.Join(styled, "\n")
 }
 
-func (m model) renderReview() string {
+func (m model) reviewText() string {
 	r := m.selected
 	var b strings.Builder
-	fmt.Fprintf(&b, "REVIEW EXACT PLAN · %s\nPlan ID: %v\n", strings.ToUpper(safeTerminal(r.Direction)), r.Plan["id"])
 	if r.Review != "" {
 		b.WriteString(safeTerminal(r.Review) + "\n")
 	}
 	for _, d := range r.Diffs {
-		fmt.Fprintf(&b, "\n%s · %s · %s\n%s\n", safeTerminal(d.Path), d.Status, safeTerminal(d.Summary), safeTerminal(d.Text))
+		fmt.Fprintf(&b, "\n%s · %s · %s\n%s\n", safeTerminal(d.Path), safeTerminal(d.Status), safeTerminal(d.Summary), safeTerminal(d.Text))
 	}
 	for _, notice := range r.Notices {
 		fmt.Fprintf(&b, "\nNOTICE · %s\n", safeTerminal(notice))
@@ -1941,17 +1888,51 @@ func (m model) renderReview() string {
 	for _, summary := range r.Summary {
 		fmt.Fprintf(&b, "%s\n", safeTerminal(summary))
 	}
-	m.viewport.SetHeight(max(3, m.height-7))
-	m.viewport.SetContent(b.String())
-	footer := "Consent gates unavailable · apply disabled"
+	return b.String()
+}
+
+func (m *model) refreshReviewViewport() {
+	if m.selected == nil {
+		return
+	}
+	height := max(3, m.height-10)
+	if m.returning {
+		height = max(1, m.workspaceHeight()-8)
+	}
+	offset := m.viewport.YOffset()
+	m.viewport.SetWidth(max(1, m.width-4))
+	m.viewport.SetHeight(height)
+	m.viewport.SoftWrap = true
+	m.viewport.SetContent(m.reviewText())
+	m.viewport.SetYOffset(offset)
+}
+
+func (m model) renderReview() string {
+	r := m.selected
+	m.refreshReviewViewport()
+	header := fmt.Sprintf("REVIEW EXACT PLAN · %s\nPlan ID: %v\n", strings.ToUpper(safeTerminal(r.Direction)), r.Plan["id"])
+	gates := "Consent gates unavailable · apply disabled"
 	if r.GatesKnown {
-		footer = fmt.Sprintf("Unsafe required [%t] ack [%t] (u) · Desktop required [%t] ack [%t] (d) · Backup required [%t] ack [%t] (b)", r.Unsafe, m.unsafeAck, r.Desktop, m.desktopAck, r.Backup, m.backupAck)
+		rows := []string{}
+		for _, gate := range []struct {
+			key, label    string
+			required, ack bool
+		}{{"u", "Unsafe changes", r.Unsafe, m.unsafeAck}, {"d", "Desktop integrations", r.Desktop, m.desktopAck}, {"b", "Backup replacement", r.Backup, m.backupAck}} {
+			mark, required := " ", "not required"
+			if gate.ack {
+				mark = "x"
+			}
+			if gate.required {
+				required = "required"
+			}
+			rows = append(rows, fmt.Sprintf("[%s] [%s] %s · %s", gate.key, mark, gate.label, required))
+		}
+		gates = strings.Join(rows, "\n")
 	}
-	if m.message != "" {
-		footer += "\n" + safeTerminal(m.message)
+	if !m.returning && m.message != "" {
+		gates += "\n" + safeTerminal(m.message)
 	}
-	footer += "\nj/k scroll · p refresh exact plan · a continue · q cancel"
-	return m.viewport.View() + "\n" + footer
+	return header + m.viewport.View() + "\n" + gates + "\nj/k scroll · p refresh exact plan · a continue · q cancel"
 }
 
 func (m model) renderMetadata() string {
@@ -1960,18 +1941,29 @@ func (m model) renderMetadata() string {
 	currentVal := inputValue(m.editValue[currentField])
 
 	var b strings.Builder
-	fmt.Fprintf(&b, "EDIT %s METADATA · %s\n\n", strings.ToUpper(m.mode), m.editPath)
+	fmt.Fprintf(&b, "EDIT %s METADATA · %s\n\n", strings.ToUpper(m.mode), safeTerminal(m.editPath))
 
-	for i, f := range fields {
+	start, end := 0, len(fields)
+	if m.returning {
+		limit := max(3, min(6, m.workspaceHeight()-9))
+		start = max(0, min(m.editField-2, len(fields)-limit))
+		end = min(len(fields), start+limit)
+	}
+	for i := start; i < end; i++ {
+		f := fields[i]
 		cursor := "  "
 		if i == m.editField {
 			cursor = "> "
 		}
-		val := fmt.Sprint(m.editValue[f])
+		val := safeTerminal(fmt.Sprint(m.editValue[f]))
 		if val == "" || val == "<nil>" {
 			val = "(none)"
 		}
-		fmt.Fprintf(&b, "%s%-14s: %s\n", cursor, f, val)
+		line := fmt.Sprintf("%s%-14s: %s", cursor, f, val)
+		if m.returning {
+			line = cellLine(line, m.width-4)
+		}
+		b.WriteString(line + "\n")
 	}
 
 	b.WriteString("\n")
@@ -1994,6 +1986,9 @@ func (m model) renderMetadata() string {
 		fmt.Fprintf(&b, "Accepted choices: %s (Space/Left/Right to cycle)\n", strings.Join(choiceStrs, " · "))
 	}
 
+	if m.returning {
+		return b.String()
+	}
 	b.WriteString("\nTab/Shift+Tab switch field · Space/Left/Right cycle choices · Type edit · Ctrl+U clear · Enter save · Esc cancel")
 	if m.message != "" {
 		b.WriteString("\n" + safeTerminal(m.message))

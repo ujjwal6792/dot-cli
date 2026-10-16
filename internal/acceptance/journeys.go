@@ -11,6 +11,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/charmbracelet/x/ansi"
 	"github.com/ujjwal6792/dots-cli/internal/native"
 )
 
@@ -80,7 +81,7 @@ func (h harness) keyboardExit(home, label string, expectedExit int, steps []keyb
 				}
 				transcript.Write(b)
 				output.Write(b)
-				found = strings.Contains(output.String(), s.want)
+				found = strings.Contains(ansi.Strip(output.String()), s.want)
 			case <-ctx.Done():
 				_ = cmd.Wait()
 				master.Close()
@@ -129,8 +130,8 @@ func setupTail(id string) []keyboardStep {
 		{"\r", "Connection consent canceled"}, // Cancel is the default.
 		{"\r", "Confirm tracker and connection"},
 		{"j\r", "No files adopted"},
-		{"\r", "returning-user actions"},
-		{"\r", ""}, // Finish without changes is the default.
+		{"\r", "Tracked Files"},
+		{"q", ""},
 	}
 }
 
@@ -195,7 +196,7 @@ func (h harness) continueReplace(url string) error {
 		return err
 	}
 	// Continue really validates the existing source and allows edited identity.
-	steps := []keyboardStep{{"", "Welcome"}, {"\r", "Continue"}, {"\r", "Source connected and contract-checked"}, {"\x15macos_continue\r", "Nothing to install."}, {"\r", "tracker needs name and email"}, {"\x1b", ""}}
+	steps := []keyboardStep{{"", "Welcome"}, {"\r", "Continue"}, {"\r", "Source connected and contract-checked"}, {"\x15macos_continue\r", "Nothing to install."}, {"\r", "tracker needs name and email"}, {"\x1b", "Dependencies"}, {"q", ""}}
 	if err := h.keyboard(home, "keyboard-continue", steps, "init"); err != nil {
 		return err
 	}
@@ -232,7 +233,7 @@ func (h harness) trackKeyboard(home string) error {
 	if err := write(filepath.Join(home, "keyboard-prefs"), []byte("keyboard exact\x00\xff\n"), 0755); err != nil {
 		return err
 	}
-	steps := []keyboardStep{{"", "returning-user actions"}, {"j\r", "0 selected"}, {"/keyboard-prefs\r", "keyboard-prefs"}, {"M", "LOGICAL FILE METADATA"}, {"\x13", "Logical metadata request prepared"}, {"p", "a continue"}, {"a", "FINAL CONFIRMATION"}, {"\r", "Final confirmation canceled"}, {"a", "FINAL CONFIRMATION"}, {"j\r", "Applied reviewed plan."}, {"q", ""}}
+	steps := []keyboardStep{{"", "Tracked Files"}, {"2", "0 selected"}, {"/keyboard-prefs\r", "keyboard-prefs"}, {"M", "LOGICAL FILE METADATA"}, {"\x13", "Logical metadata request prepared"}, {"p", "a continue"}, {"a", "FINAL CONFIRMATION"}, {"\r", "Final confirmation canceled"}, {"a", "FINAL CONFIRMATION"}, {"j\r", "Applied reviewed plan."}, {"q", ""}}
 	if err := h.keyboard(home, "keyboard-track", steps); err != nil {
 		return err
 	}
@@ -244,7 +245,7 @@ func (h harness) trackKeyboard(home string) error {
 }
 
 func (h harness) adoptKeyboard(home string) error {
-	steps := []keyboardStep{{"", "returning-user actions"}, {"jj\r", "0 selected"}, {"/keyboard-prefs\r", "keyboard-prefs"}, {" ", "[x]"}, {"p", "a continue"}, {"a", "FINAL CONFIRMATION"}, {"\r", "Final confirmation canceled"}, {"a", "FINAL CONFIRMATION"}, {"j\r", "Applied reviewed plan."}, {"q", ""}}
+	steps := []keyboardStep{{"", "Tracked Files"}, {"3", "0 selected"}, {" ", "x] keyboard-prefs"}, {"p", "a continue"}, {"a", "FINAL CONFIRMATION"}, {"\r", "Final confirmation canceled"}, {"a", "FINAL CONFIRMATION"}, {"j\r", "Applied reviewed plan."}, {"q", ""}}
 	if err := h.keyboard(home, "keyboard-adopt", steps); err != nil {
 		return err
 	}
@@ -255,6 +256,69 @@ func (h harness) adoptKeyboard(home string) error {
 	st, err := os.Stat(filepath.Join(home, "keyboard-prefs"))
 	if err != nil || st.Mode().Perm() != 0755 {
 		return fmt.Errorf("keyboard Adopt executable mode mismatch")
+	}
+	return nil
+}
+
+// navigationKeyboard sends the bytes emitted by a terminal for Tab/Backtab.
+// Pane-specific text proves focus moved; every tab name is always in the header.
+func (h harness) navigationKeyboard(home string) error {
+	steps := []keyboardStep{{"", "Tracked Files"}}
+	for _, want := range []string{"TRACK", "ADOPT", "UNTRACK", "GIT SYNC · Explicit Gates", "Find a setting", "Tracked Files"} {
+		steps = append(steps, keyboardStep{"\t", want})
+	}
+	for _, want := range []string{"Find a setting", "GIT SYNC · Explicit Gates", "UNTRACK", "ADOPT", "TRACK", "Tracked Files"} {
+		steps = append(steps, keyboardStep{"\x1b[Z", want})
+	}
+	steps = append(steps,
+		keyboardStep{"6", "Find a setting"},
+		keyboardStep{"/q123456789", "No matching settings"}, // q is text, not quit, in the input.
+		keyboardStep{"\x1b", "Search sections"},
+		keyboardStep{"\x0e\r", "Dependencies re-verified"}, // Ctrl+N focuses Verify.
+		keyboardStep{"T", "Contract valid"},
+		keyboardStep{"q", ""},
+	)
+	return h.keyboard(home, "keyboard-navigation", steps)
+}
+
+func (h harness) largeBrowserKeyboard(home string) error {
+	root := filepath.Join(home, "zz-large-list")
+	if err := os.Mkdir(root, 0700); err != nil {
+		return err
+	}
+	defer os.RemoveAll(root)
+	nested := filepath.Join(root, "000-collapsed")
+	if err := os.Mkdir(nested, 0700); err != nil {
+		return err
+	}
+	for i := range 1000 {
+		if err := write(filepath.Join(root, fmt.Sprintf("entry-%04d", i)), []byte("fixture\n"), 0600); err != nil {
+			return err
+		}
+	}
+	for i := range 9000 {
+		if err := write(filepath.Join(nested, fmt.Sprintf("nested-%04d", i)), []byte("fixture\n"), 0600); err != nil {
+			return err
+		}
+	}
+	started := time.Now()
+	err := h.keyboard(home, "keyboard-large-list", []keyboardStep{
+		{"", "Tracked Files"}, {"2", "0 selected"},
+		{"\x1b[F", "zz-large-list"}, {"\r", "entry-0000"},
+		{"\x1b[F", "entry-0999"}, {"\x1b[H", ".config"}, {"q", ""},
+	})
+	if err != nil {
+		return err
+	}
+	if err := write(filepath.Join(h.dir, "large-browser-duration.txt"), []byte(time.Since(started).String()+"\n"), 0600); err != nil {
+		return err
+	}
+	a, err := h.scope(home)
+	if err != nil || len(a.Entries) != 0 {
+		return fmt.Errorf("large-list browsing changed approval: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local/share/dot-config/home/zz-large-list")); !os.IsNotExist(err) {
+		return fmt.Errorf("large-list browsing wrote source")
 	}
 	return nil
 }

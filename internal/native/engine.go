@@ -12,9 +12,15 @@ import (
 	"runtime"
 	"sort"
 	"strings"
+	"sync"
 )
 
-type Engine struct{ config Config }
+type Engine struct {
+	config   Config
+	rootMu   sync.Mutex
+	toplevel string
+	gitInfo  os.FileInfo
+}
 
 func New(c Config) (*Engine, error) {
 	if c.OS == "" {
@@ -49,23 +55,50 @@ func (e *Engine) Config() Config { return e.config }
 func (e *Engine) git(ctx context.Context, args ...string) ([]byte, error) {
 	cmd := exec.CommandContext(ctx, e.config.Git, append([]string{"-C", e.config.Source}, args...)...)
 	cmd.Env = append(os.Environ(), "HOME="+e.config.Home, "XDG_CONFIG_HOME="+filepath.Join(e.config.Home, ".config"), "GIT_TERMINAL_PROMPT=0")
-	b, err := cmd.CombinedOutput()
+	b, err := cmd.Output()
 	if err != nil {
 		return nil, fmt.Errorf("git %s failed: %w", args[0], err)
 	}
 	return b, nil
 }
+
+// checkGitRoot shares the expensive root lookup across read-only TUI commands.
+// Repository replacement/removal invalidates the cache. The lock also protects
+// the first lookup when dashboard, inventory and preview commands overlap.
+func (e *Engine) checkGitRoot(ctx context.Context) error {
+	e.rootMu.Lock()
+	defer e.rootMu.Unlock()
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	info, err := os.Stat(filepath.Join(e.config.Source, ".git"))
+	if err != nil {
+		return fmt.Errorf("source must be the Git checkout root: %w", err)
+	}
+	if e.gitInfo == nil || !os.SameFile(info, e.gitInfo) || info.ModTime() != e.gitInfo.ModTime() || info.Size() != e.gitInfo.Size() {
+		root, err := e.git(ctx, "rev-parse", "--show-toplevel")
+		if err != nil {
+			return err
+		}
+		e.toplevel = filepath.Clean(strings.TrimSpace(string(root)))
+		e.gitInfo = info
+	}
+	if e.toplevel != e.config.Source {
+		return fmt.Errorf("source must be the Git checkout root")
+	}
+	return nil
+}
+
 func (e *Engine) CheckContract(ctx context.Context) (Contract, error) {
 	var c Contract
+	if err := ctx.Err(); err != nil {
+		return c, err
+	}
 	if _, err := BoundedPath(e.config.Source, "dot-contract.json"); err != nil {
 		return c, err
 	}
-	root, err := e.git(ctx, "rev-parse", "--show-toplevel")
-	if err != nil {
+	if err := e.checkGitRoot(ctx); err != nil {
 		return c, err
-	}
-	if filepath.Clean(strings.TrimSpace(string(root))) != e.config.Source {
-		return c, fmt.Errorf("source must be the Git checkout root")
 	}
 	if err := readJSON(e.config.Source, "dot-contract.json", &c); err != nil {
 		return c, err

@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"io/fs"
+	"os"
 	"path/filepath"
 	"sort"
 	"strings"
@@ -27,7 +28,20 @@ func sensitive(path string) bool {
 	return strings.HasPrefix(path, ".local/state/") || strings.HasPrefix(path, ".config/chezmoi/")
 }
 func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, error) {
+	return e.inventoryMode(ctx, mode, false)
+}
+
+// BrowserInventory keeps the interactive Track browser shallow. Scripted
+// inventory and exact folder snapshots still use the complete inventory.
+func (e *Engine) BrowserInventory(ctx context.Context, mode string) (Inventory, error) {
+	return e.inventoryMode(ctx, mode, true)
+}
+
+func (e *Engine) inventoryMode(ctx context.Context, mode string, shallow bool) (Inventory, error) {
 	result := Inventory{OS: e.config.OS, Entries: []InventoryEntry{}, Profiles: []Profile{}, Machines: []string{}}
+	if err := ctx.Err(); err != nil {
+		return result, err
+	}
 	if !has([]string{"track", "adopt", "untrack"}, mode) {
 		return result, fmt.Errorf("invalid inventory mode")
 	}
@@ -49,6 +63,22 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 		machines[id] = true
 	}
 	byPath := map[string]InventoryEntry{}
+	place := func(item InventoryEntry, id string) {
+		if l, ok := m.Tracking[item.LogicalID]; ok {
+			b, _ := json.Marshal(l)
+			_ = json.Unmarshal(b, &item.Tracking)
+		}
+		if previous, exists := byPath[item.Destination]; exists {
+			if item.OSStatus == "supported" {
+				delete(byPath, item.Destination)
+				previous.Path += " [" + previous.ID + "]"
+				byPath[previous.Path] = previous
+			} else {
+				item.Path += " [" + id + "]"
+			}
+		}
+		byPath[item.Path] = item
+	}
 	for _, id := range sortedKeys(m.Entries) {
 		x := m.Entries[id]
 		x, err = customize(x, a.Customs[id])
@@ -75,10 +105,16 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 		if target.Exists {
 			status = "present"
 		}
+		md := metadata(x)
 		if applicable(x, a.Machine) {
 			desired, err := e.entryContent(ctx, x)
 			if err != nil {
-				return result, err
+				// One unreadable entry must not blank the whole browser:
+				// flag it and keep listing. Planning still fails closed
+				// when the flagged entry is selected.
+				md["error"] = err.Error()
+				place(InventoryEntry{Path: x.Destination, ID: id, Kind: "file", Status: "managed", Destination: x.Destination, Metadata: md, LogicalID: x.LogicalID, OSStatus: osStatus, TargetStatus: "error", InScope: approved, Approved: approved}, id)
+				continue
 			}
 			status = "changed"
 			if !target.Exists {
@@ -87,25 +123,14 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 				status = "unchanged"
 			}
 		}
-		item := InventoryEntry{Path: x.Destination, ID: id, Kind: "file", Status: "managed", Destination: x.Destination, Metadata: metadata(x), LogicalID: x.LogicalID, OSStatus: osStatus, TargetStatus: status, InScope: approved, Approved: approved}
-		if l, ok := m.Tracking[x.LogicalID]; ok {
-			b, _ := json.Marshal(l)
-			_ = json.Unmarshal(b, &item.Tracking)
-		}
-		if previous, exists := byPath[x.Destination]; exists {
-			if item.OSStatus == "supported" {
-				delete(byPath, x.Destination)
-				previous.Path += " [" + previous.ID + "]"
-				byPath[previous.Path] = previous
-			} else {
-				item.Path += " [" + id + "]"
-			}
-		}
-		byPath[item.Path] = item
+		place(InventoryEntry{Path: x.Destination, ID: id, Kind: "file", Status: "managed", Destination: x.Destination, Metadata: md, LogicalID: x.LogicalID, OSStatus: osStatus, TargetStatus: status, InScope: approved, Approved: approved}, id)
 	}
 	if mode == "track" {
 		err = filepath.WalkDir(e.config.Home, func(path string, d fs.DirEntry, err error) error {
 			if err != nil {
+				return err
+			}
+			if err := ctx.Err(); err != nil {
 				return err
 			}
 			if path == e.config.Home {
@@ -117,6 +142,14 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 					return filepath.SkipDir
 				}
 				return nil
+			}
+			// Never-dot caches/build outputs: walking them is pure syscall
+			// cost with no Track value. Top-level names only; a user file
+			// that happens to share one of these exact names at a deeper
+			// level is still listed because only its parent dir is skipped
+			// when the parent itself is the cache root.
+			if excludedBrowserDirectory(filepath.Base(path), d.IsDir()) {
+				return filepath.SkipDir
 			}
 			if _, exists := byPath[rel]; exists {
 				return nil
@@ -132,6 +165,9 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 				status = "restricted"
 			}
 			byPath[rel] = InventoryEntry{Path: rel, Kind: kind, Status: status, Metadata: map[string]any{"destination": rel, "machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}}
+			if shallow && d.IsDir() {
+				return filepath.SkipDir
+			}
 			return nil
 		})
 		if err != nil {
@@ -160,6 +196,47 @@ func (e *Engine) InventoryMode(ctx context.Context, mode string) (Inventory, err
 		result.Profiles = append(result.Profiles, Profile{Name: name, Entries: ids})
 	}
 	return result, nil
+}
+
+// BrowseDirectory reads only the immediate children of an expanded HOME folder.
+// No content is read and symlink/private-state boundaries match inventory.
+func (e *Engine) BrowseDirectory(ctx context.Context, folder string) ([]InventoryEntry, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	if err := e.targetPath(folder); err != nil {
+		return nil, err
+	}
+	path, err := BoundedPath(e.config.Home, folder)
+	if err != nil {
+		return nil, err
+	}
+	children, err := os.ReadDir(path)
+	if err != nil {
+		return nil, err
+	}
+	entries := make([]InventoryEntry, 0, len(children))
+	for _, child := range children {
+		if err := ctx.Err(); err != nil {
+			return nil, err
+		}
+		rel := filepath.Join(folder, child.Name())
+		if e.targetPath(rel) != nil || excludedBrowserDirectory(child.Name(), child.IsDir()) {
+			continue
+		}
+		kind, status := "file", "eligible"
+		if child.IsDir() {
+			kind = "directory"
+		} else if !child.Type().IsRegular() {
+			status = "restricted"
+		}
+		entries = append(entries, InventoryEntry{Path: rel, Kind: kind, Status: status, Metadata: map[string]any{"destination": rel, "machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}})
+	}
+	return entries, nil
+}
+
+func excludedBrowserDirectory(name string, directory bool) bool {
+	return directory && has([]string{"node_modules", "__pycache__", ".venv", "target", ".next", ".git"}, name)
 }
 func (e *Engine) Status(ctx context.Context) (Inventory, error) { return e.InventoryMode(ctx, "adopt") }
 func (e *Engine) ScopeShow(ctx context.Context) (Adoption, error) {
@@ -250,35 +327,84 @@ type HighlightResult struct {
 }
 
 func (e *Engine) Highlight(ctx context.Context, mode, path string, r *Request) (HighlightResult, error) {
-	inv, err := e.InventoryMode(ctx, mode)
-	if err != nil {
-		return HighlightResult{}, err
+	// Fast path: single-entry diff without a full inventory rescan. The old
+	// implementation called InventoryMode (full manifest scan + HOME walk in
+	// track mode) plus Diff/Plan (second full scan) per cursor move, so
+	// browsing a 300-entry checkout spawned repeated `git rev-parse`
+	// processes and thousands of Lstat/read syscalls. This path reads only
+	// the manifest, adoption, and the two files for `path`.
+	out := HighlightResult{Status: "unknown", Summary: "Browsing is not authorization", Direction: "home → repository", Diffs: []Diff{}}
+	if err := ctx.Err(); err != nil {
+		return out, err
 	}
-	var entry InventoryEntry
-	found := false
-	for _, x := range inv.Entries {
-		if x.Path == path {
-			entry = x
-			found = true
-			break
-		}
-	}
-	if !found {
-		return HighlightResult{}, fmt.Errorf("unknown inventory path")
-	}
-	out := HighlightResult{Status: entry.Status, Summary: "Browsing is not authorization", Direction: "home → repository", Diffs: []Diff{}}
 	if mode == "adopt" {
 		out.Direction = "repository → target"
-		diffs, err := e.Diff(ctx)
+	}
+	if err := relative(path); err != nil {
+		return out, err
+	}
+	_, m, err := e.manifest(ctx)
+	if err != nil {
+		return out, err
+	}
+	a, err := e.LoadAdoption()
+	if err != nil {
+		return out, err
+	}
+	m, err = resolve(m, a.Machine)
+	if err != nil {
+		return out, err
+	}
+	// Adopt/status/diff view: managed entry by destination.
+	for _, id := range sortedKeys(m.Entries) {
+		x := m.Entries[id]
+		if x.Destination != path {
+			continue
+		}
+		if _, ok := a.Entries[id]; ok {
+			out.Status = "managed"
+		} else if applicable(x, a.Machine) {
+			out.Status = "eligible"
+		} else {
+			out.Status = "restricted"
+		}
+		if !applicable(x, a.Machine) {
+			return out, nil
+		}
+		x, err = customize(x, a.Customs[id])
 		if err != nil {
 			return out, err
 		}
-		for _, d := range diffs {
-			if d.Path == path {
-				out.Diffs = append(out.Diffs, d)
+		p := Plan{Direction: out.Direction, Actions: []Action{}}
+		if has(x.Integrations, "git-config") {
+			err = e.addGitAction(ctx, &p, x)
+		} else {
+			s, readErr := e.entryContent(ctx, x)
+			if readErr != nil {
+				return out, readErr
 			}
+			err = e.addAction(&p, "home", x.Destination, s)
 		}
-	} else if r != nil {
+		if err != nil {
+			return out, err
+		}
+		out.Diffs = PlanDiffs(p)
+		return out, nil
+	}
+	// Track view: untracked HOME path. No content diff; report eligibility
+	// without walking the whole HOME tree.
+	target, err := readFile(e.config.Home, path)
+	if err != nil {
+		return out, err
+	}
+	if !target.Exists {
+		return out, fmt.Errorf("unknown inventory path")
+	}
+	out.Status = "eligible"
+	if mode == "adopt" {
+		return out, nil
+	}
+	if r != nil {
 		p, err := e.Plan(ctx, *r)
 		if err != nil {
 			return out, err
