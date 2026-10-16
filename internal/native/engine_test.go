@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 
 	"github.com/ujjwal6792/dots-cli/internal/native"
@@ -784,5 +785,85 @@ func TestPlanDiffGeneratesContextualLineHunks(t *testing.T) {
 	// Line 1 and Line 10 should NOT be in the 3-line context hunk (hunk is lines 2..8)
 	if strings.Contains(diffText, "line 1\n") || strings.Contains(diffText, "line 10\n") {
 		t.Fatalf("diff contains out-of-context lines; expected only lines 2-8 in hunk:\n%s", diffText)
+	}
+}
+
+func TestBrokenTemplateFlagsEntryWithoutBlankingInventory(t *testing.T) {
+	e, c := fixture(t)
+	var m native.Manifest
+	b, _ := os.ReadFile(filepath.Join(c.Source, "manifest.json"))
+	_ = native.Decode(b, &m)
+	m.Entries["tpl"] = native.Entry{Source: "home/tpl", Destination: "tpl", OS: []string{"linux"}, Portability: "managed-templated", Impact: "Safe", Template: "hello {{joinPath \"a\" \"b\"}}"}
+	writeJSON(t, filepath.Join(c.Source, "manifest.json"), m)
+	write(t, filepath.Join(c.Source, "home/tpl"), "x\n", 0600)
+	write(t, filepath.Join(c.Home, "notes"), "local\n", 0600)
+	inv, err := e.InventoryMode(context.Background(), "track")
+	if err != nil {
+		t.Fatalf("one bad template blanked the inventory: %v", err)
+	}
+	byPath := map[string]native.InventoryEntry{}
+	for _, en := range inv.Entries {
+		byPath[en.Path] = en
+	}
+	flagged, ok := byPath["tpl"]
+	if !ok || flagged.TargetStatus != "error" {
+		t.Fatalf("broken entry not flagged: %+v", byPath)
+	}
+	if msg, _ := flagged.Metadata["error"].(string); !strings.Contains(msg, "joinPath") {
+		t.Fatalf("flagged entry hides the cause: %+v", flagged.Metadata)
+	}
+	if byPath["notes"].Status != "eligible" || byPath["prefs"].Status != "managed" {
+		t.Fatalf("healthy entries lost: %+v", byPath)
+	}
+	if _, err := e.Plan(context.Background(), native.Request{Version: 1, Mode: "adopt", Profile: "base", Entries: []string{"tpl"}}); err == nil {
+		t.Fatal("flagged entry planned without error")
+	}
+}
+
+func TestGitWarningsDoNotCorruptContractOutput(t *testing.T) {
+	_, c := fixture(t)
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrapper := filepath.Join(filepath.Dir(c.Source), "git-with-warning")
+	write(t, wrapper, "#!/bin/sh\nprintf 'fixture Git warning\\n' >&2\nexec '"+strings.ReplaceAll(realGit, "'", "'\\''")+"' \"$@\"\n", 0700)
+	c.Git = wrapper
+	e, err := native.New(c)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err = e.CheckContract(context.Background()); err != nil {
+		t.Fatalf("Git stderr corrupted stdout: %v", err)
+	}
+}
+
+func TestConcurrentContractChecks(t *testing.T) {
+	e, _ := fixture(t)
+	var workers sync.WaitGroup
+	errs := make(chan error, 16)
+	for range 16 {
+		workers.Add(1)
+		go func() { defer workers.Done(); _, err := e.CheckContract(context.Background()); errs <- err }()
+	}
+	workers.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+func TestContractCacheRejectsRemovedRepository(t *testing.T) {
+	e, c := fixture(t)
+	if _, err := e.CheckContract(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Rename(filepath.Join(c.Source, ".git"), filepath.Join(filepath.Dir(c.Source), "old-git")); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := e.CheckContract(context.Background()); err == nil {
+		t.Fatal("cached root accepted a removed repository")
 	}
 }

@@ -10,11 +10,11 @@ import (
 func (m model) retargetCurrent() (tea.Model, tea.Cmd) {
 	i := m.current()
 	if m.mode != "track" {
-		m.message = "Shared assignments require Track (Shift+Tab); Space deselects locally at Adopt."
+		m.message = "Shared assignments require Track (2); Space deselects locally at Adopt."
 		return m, nil
 	}
 	if i < 0 || m.entries[i].Kind != "file" {
-		m.message = "Tab retargets one exact file, not a folder."
+		m.message = "m retargets one exact file, not a folder."
 		return m, nil
 	}
 	entry := m.entries[i]
@@ -38,7 +38,10 @@ func (m model) retargetCurrent() (tea.Model, tea.Cmd) {
 			selection["machines"] = assigned
 		}
 	}
-	choices := append([]string{"all"}, m.machines...)
+	choices := []string{"all"}
+	if id := entryMachineScope(m); id != "" && id != "all" {
+		choices = append(choices, id)
+	}
 	current := "all"
 	if assigned, ok := selection["machines"].(map[string]any); ok {
 		members := metadataList(assigned["include"])
@@ -59,7 +62,20 @@ func (m model) retargetCurrent() (tea.Model, tea.Cmd) {
 	m.entries[i].Metadata["machines"] = selection["machines"]
 	m.logicalRequest = nil
 	m.generation++
-	m.planFresh = false
-	m.message = fmt.Sprintf("Machines: %s · Track preview/approval required; nothing written.", choices[next])
+	m.invalidatePlan()
+	m.message = fmt.Sprintf("Assignment: %s · Track preview/approval required; nothing written.", assignmentLabel(choices[next]))
 	return m, m.highlightCurrent()
+}
+
+// entryMachineScope constrains retargeting to All machines ↔ this machine
+// only. Broader scopes never cycle here; shared changes need a reviewed
+// Track plan.
+func entryMachineScope(m model) string {
+	if m.currentMachine.ID != "" {
+		return m.currentMachine.ID
+	}
+	if len(m.machines) == 1 {
+		return m.machines[0]
+	}
+	return ""
 }

@@ -206,6 +206,11 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.sourceChoice = 0
 			return m, nil
 		}
+		if key.String() == "esc" && (m.stage == "source-existing" || m.stage == "source-choice") {
+			m.stage = "welcome"
+			m.message = ""
+			return m, nil
+		}
 		return m, tea.Quit
 	case "j", "down":
 		maxChoice := 1
@@ -223,6 +228,11 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 			m.initMode = false
 			m.returning = true
 			m.resetReturning()
+			if cmd := m.dashboardCommand(); cmd != nil {
+				m.dashboardLoading = true
+				m.dashboardErr = nil
+				return m, cmd
+			}
 			return m, nil
 		case "source-existing":
 			if m.sourceChoice == 0 {
@@ -267,102 +277,85 @@ func (m model) updateInit(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 }
 
 func (m model) renderSource() string {
-	var title string
-	var choices []string
 	switch m.stage {
 	case "source-existing":
-		title = "Source · existing checkout\nContinue checks the Git root and contract; Replace preserves all files."
-		choices = []string{"Continue", "Replace with timestamped backup"}
+		choices := []string{"Continue", "Replace with timestamped backup"}
+		return m.initShell("Source", "Source · existing checkout", "",
+			"Continue checks the Git root and contract.\nReplace moves the whole checkout, as-is, to a timestamped backup beside it.\nNothing is deleted; the exact path is shown next for confirmation.",
+			initChoiceList(choices, m.sourceChoice),
+			"j/k move · Enter select · Esc back · Ctrl+C quit", m.message)
 	case "source-recovery":
 		entry, actual, supported, summary := parseContractError(m.sourceError)
-		title = "Source · Contract Compatibility Recovery\n" +
-			"The repository's dot-contract or manifest does not satisfy compatibility requirements.\n" +
-			"Invalid applies remain blocked; metadata is never silently rewritten.\n"
+		var body strings.Builder
+		body.WriteString("The repository's dot-contract or manifest does not satisfy compatibility requirements.\nInvalid applies remain blocked; metadata is never silently rewritten.")
 		if entry != "" {
-			title += fmt.Sprintf("\n  Entry:            %s", entry)
+			fmt.Fprintf(&body, "\n\n  Entry:            %s", entry)
 		}
 		if actual != "" {
-			title += fmt.Sprintf("\n  Actual value:     %s", actual)
+			fmt.Fprintf(&body, "\n  Actual value:     %s", actual)
 		}
 		if supported != "" {
-			title += fmt.Sprintf("\n  Supported values: %s", supported)
+			fmt.Fprintf(&body, "\n  Supported values: %s", supported)
 		}
 		if summary != "" && summary != m.sourceError {
-			title += fmt.Sprintf("\n  Issue:            %s", summary)
+			fmt.Fprintf(&body, "\n  Issue:            %s", summary)
 		}
-		title += "\n\nSelect an actionable recovery option:"
-		choices = []string{
+		body.WriteString("\n\nSelect an actionable recovery option:")
+		choices := []string{
 			"Diagnostics: view contract details & full error",
 			"Retry: re-check contract and repository",
 			"Change source: connect a different repository",
 			"Replace: backup existing checkout and re-initialize",
 		}
+		return m.initShell("Source", "Source · Contract Compatibility Recovery", "",
+			body.String(),
+			initChoiceList(choices, m.sourceChoice),
+			"j/k choose recovery action · Enter select · Esc back · Ctrl+C quit", m.message)
 	case "source-diagnostics":
 		entry, actual, supported, _ := parseContractError(m.sourceError)
 		var b strings.Builder
-		b.WriteString("Source · Contract Diagnostics & Repair Guidance\n\n")
-		b.WriteString("Error Message:\n  " + m.sourceError + "\n\n")
+		b.WriteString("Error:\n  " + m.sourceError + "\n")
 		if entry != "" {
-			fmt.Fprintf(&b, "Affected Entry:   %s\n", entry)
+			fmt.Fprintf(&b, "\nEntry: %s", entry)
 		}
 		if actual != "" {
-			fmt.Fprintf(&b, "Invalid Value:    %s\n", actual)
+			fmt.Fprintf(&b, "\nValue: %s", actual)
 		}
-		fmt.Fprintf(&b, "Supported Values: %s\n\n", supported)
-		b.WriteString("Contract Specification Rules:\n")
-		b.WriteString("  • Portability:  managed-shared (all machines), managed-local (per-machine),\n")
-		b.WriteString("                  managed-templated (per-machine values), managed-os-only (single OS)\n")
-		b.WriteString("  • Supported OS: linux, darwin (managed-os-only requires exactly 1 OS)\n")
-		b.WriteString("  • Impact:       Safe (reversible), Unsafe (may overwrite/remove)\n")
-		b.WriteString("  • Integrations: git-config, gemini-skills, claude-skills, desktop\n")
-		b.WriteString("  • Git Keys:     user.name, user.email (requires managed-templated)\n\n")
-		b.WriteString("Safety Policy:\n")
-		b.WriteString("  • Invalid applies remain strictly blocked to prevent configuration corruption.\n")
-		b.WriteString("  • Metadata is preserved intact and will never be silently modified.\n\n")
-		b.WriteString("Enter / Esc return to recovery choices · Ctrl+C quit")
-		return b.String()
+		fmt.Fprintf(&b, "\nSupported: %s", supported)
+		b.WriteString("\n\nInvalid applies remain strictly blocked to prevent corruption.\nMetadata is preserved intact and never silently modified.")
+		b.WriteString("\n\nRules: managed-shared / managed-local / managed-templated / managed-os-only; OS linux, darwin; Impact Safe, Unsafe.")
+		return m.initShell("Source", "Source · Contract Diagnostics & Repair Guidance", "",
+			b.String(), "",
+			"Enter / Esc return to recovery choices · Ctrl+C quit", m.message)
 	case "source-choice":
-		title = "Source · connect your own repository"
-		choices = []string{"Existing user: clone your repository", "New user: local git init + remote add origin"}
+		choices := []string{"Existing user: clone your repository", "New user: local git init + remote add origin"}
+		return m.initShell("Source", "Source · connect your own repository", "Clone brings history · New starts versioning here", "",
+			initChoiceList(choices, m.sourceChoice),
+			"j/k move · Enter select · Esc back · Ctrl+C quit", m.message)
 	case "source-confirm":
-		title = backupReview(m.sourceBackup)
-		choices = []string{"Cancel", "Confirm backup and replace"}
+		m.viewport.SetContent(safeTerminal(backupReview(m.sourceBackup)))
+		m.viewport.SetHeight(m.sourceConfirmHeight())
+		m.viewport.SoftWrap = true
+		choices := []string{"Cancel", "Confirm backup and replace"}
+		body := m.viewport.View()
+		return m.initShell("Source", "Source · confirm backup", "",
+			body, initChoiceList(choices, m.sourceChoice),
+			"j/k choose · J/K scroll backup path · Enter confirm · Esc back", m.message)
 	case "source-url":
-		title = "Source · paste a credential-free HTTPS or SSH repository URL\nInput hidden to avoid displaying credentials: " + strings.Repeat("•", min(40, len(m.sourceInput.Value())))
+		var body strings.Builder
+		body.WriteString("Source · paste a credential-free HTTPS or SSH repository URL\nInput hidden to avoid displaying credentials: " + strings.Repeat("•", min(40, len(m.sourceInput.Value()))))
 		if m.sourceAction == "new" {
-			title += "\nCreate the empty repository on your platform yourself.\nOnly local git init and remote add; no hosting API, commit or push."
+			body.WriteString("\n\nCreate the empty repository on your platform yourself.\nOnly local git init and remote add; no hosting API, commit or push.")
 		} else {
-			title += "\nNative Git/SSH authentication follows terminal handoff. Dot never reads passwords."
+			body.WriteString("\n\nNative Git/SSH authentication follows terminal handoff. Dot never reads passwords.")
 		}
 		if m.loading {
-			title += "\nWorking…"
+			body.WriteString("\n\nWorking…")
 		}
-		return title + "\n\nEnter connect · Esc back · Ctrl+C quit\n" + m.message
+		return m.initShell("Source", "Source · repository URL", "", body.String(), "",
+			"Enter connect · Esc back · Ctrl+C quit", m.message)
 	}
-	if m.stage == "source-confirm" {
-		m.viewport.SetContent(safeTerminal(title))
-		m.viewport.SetHeight(max(3, m.height-7))
-		m.viewport.SoftWrap = true
-		title = m.viewport.View()
-	}
-	for i, choice := range choices {
-		mark := "  "
-		if i == m.sourceChoice {
-			mark = "> "
-		}
-		title += fmt.Sprintf("\n%s%s", mark, choice)
-	}
-	if m.loading {
-		title += "\nWorking…"
-	}
-	controls := "j/k move · Enter select · Esc cancel · Ctrl+C quit"
-	if m.stage == "source-confirm" {
-		controls = "j/k choose · J/K scroll backup path · Enter confirm · Esc cancel"
-	}
-	if m.stage == "source-recovery" {
-		controls = "j/k choose recovery action · Enter select · Esc back · Ctrl+C quit"
-	}
-	return title + "\n\n" + controls + "\n" + m.message
+	return m.initShell("Source", "Source", "", "", "", "j/k move · Enter select · Esc cancel · Ctrl+C quit", m.message)
 }
 
 func parseContractError(errStr string) (entry string, actual string, supported string, summary string) {

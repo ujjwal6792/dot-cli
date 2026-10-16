@@ -5,6 +5,8 @@ import (
 	"context"
 	"fmt"
 	"os/exec"
+	"path/filepath"
+	"strings"
 	"syscall"
 	"time"
 )
@@ -12,6 +14,10 @@ import (
 // openApp talks directly to a native pseudoterminal. No script(1), shell or
 // model mock launches the app; a rendered page and normal quit are required.
 func (h harness) openApp(home, want string, args ...string) error {
+	label := "open-" + sanitizeOpenLabel(want+"-"+strings.Join(args, "-"))
+	if label == "open--" {
+		label = "open-app"
+	}
 	ctx, cancel := context.WithTimeout(h.ctx, 15*time.Second)
 	defer cancel()
 	master, slave, err := openPTY()
@@ -60,6 +66,7 @@ func (h harness) openApp(home, want string, args ...string) error {
 		_ = c.Wait()
 		master.Close()
 		b := <-transcript
+		_ = write(filepath.Join(h.dir, label+".terminal"), b, 0600)
 		return fmt.Errorf("packaged app %v never rendered %q: %s", args, want, b)
 	}
 	if _, err := master.Write([]byte("q")); err != nil {
@@ -70,8 +77,28 @@ func (h harness) openApp(home, want string, args ...string) error {
 	err = c.Wait()
 	master.Close()
 	b := <-transcript
+	_ = write(filepath.Join(h.dir, label+".terminal"), b, 0600)
 	if err != nil {
 		return fmt.Errorf("packaged app %v quit failed: %w: %s", args, err, b)
 	}
 	return nil
+}
+
+func sanitizeOpenLabel(s string) string {
+	var b strings.Builder
+	for _, r := range strings.ToLower(s) {
+		if (r >= 'a' && r <= 'z') || (r >= '0' && r <= '9') {
+			b.WriteRune(r)
+		} else {
+			b.WriteRune('-')
+		}
+	}
+	out := strings.Trim(b.String(), "-")
+	for strings.Contains(out, "--") {
+		out = strings.ReplaceAll(out, "--", "-")
+	}
+	if out == "" {
+		return "app"
+	}
+	return out
 }

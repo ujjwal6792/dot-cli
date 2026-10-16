@@ -85,6 +85,7 @@ func (e *Engine) dependencies(ctx context.Context) (tui.DependencyResult, depend
 		p.Paths[tool.name] = resolved
 		if err == nil {
 			if distribution.CheckTool(ctx, resolved, tool.name) == nil {
+				out.Rows = append(out.Rows, tui.DependencyRow{Tool: tool.name, Link: tool.link, Version: distribution.ToolVersion(ctx, resolved, tool.name)})
 				continue
 			}
 			out.Rows = append(out.Rows, tui.DependencyRow{Tool: tool.name, Link: tool.link, Problem: "existing executable is incompatible; repair manually (never overwritten)"})

@@ -9,18 +9,23 @@ import (
 )
 
 func TestPublicTabRetargetsExactTrackEntryWithoutApplying(t *testing.T) {
-	e := &fixtureEngine{inventory: Inventory{Machines: []string{"local_machine", "other_machine"}, Entries: []Entry{{Path: "prefs", Kind: "file", Status: "eligible", Metadata: map[string]any{"destination": "prefs", "os": []string{"darwin"}, "portability": "managed-shared", "impact": "Safe"}}}}}
+	e := &fixtureEngine{inventory: Inventory{Machine: Machine{ID: "local_machine", OS: "darwin"}, Machines: []string{"local_machine", "other_machine"}, Entries: []Entry{{Path: "prefs", Kind: "file", Status: "eligible", Metadata: map[string]any{"destination": "prefs", "os": []string{"darwin"}, "portability": "managed-shared", "impact": "Safe"}}}}}
 	m := boot(t, e, false, "track")
 	m = send(m, " ")
 	tab := tea.KeyPressMsg(tea.Key{Code: tea.KeyTab})
-	for _, want := range []string{"local_machine", "other_machine", "all"} {
+	// Retargeting cycles All machines ↔ this machine only; broader scopes
+	// never cycle here and labels stay human, never raw JSON/OS names.
+	for _, step := range []struct {
+		label string
+		want  string
+	}{{"local_machine only", "local_machine"}, {"All machines", "all"}, {"local_machine only", "local_machine"}} {
 		m, _ = m.Update(tab)
-		if !strings.Contains(m.View().Content, "Machines: "+want) {
+		if !strings.Contains(m.View().Content, "Assignment: "+step.label) {
 			t.Fatalf("assignment is not visible: %s", m.View().Content)
 		}
 		m = sendAndRun(m, "p")
 		selections := e.request["selections"].([]map[string]any)
-		if !reflect.DeepEqual(selections[0]["machines"], map[string]any{"include": []string{want}, "exclude": []string{}}) {
+		if !reflect.DeepEqual(selections[0]["machines"], map[string]any{"include": []string{step.want}, "exclude": []string{}}) {
 			t.Fatalf("wrong exact-plan assignment: %#v", e.request)
 		}
 		m = send(m, "esc")
@@ -67,9 +72,12 @@ func TestPublicAdoptCanReviewDeselectingEveryFile(t *testing.T) {
 }
 
 func TestPublicTabRetargetsLogicalFileThroughTrack(t *testing.T) {
-	e := &fixtureEngine{inventory: Inventory{Machines: []string{"local_machine", "other_machine"}, Entries: []Entry{{Path: "prefs", ID: "logical@darwin", LogicalID: "logical", Kind: "file", Status: "managed", Metadata: map[string]any{"machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}, Tracking: map[string]any{"destinations": map[string]string{"darwin": "prefs"}, "sources": map[string]string{"darwin": "home/prefs"}, "common": map[string]any{}, "machine": map[string]any{}, "os_metadata": map[string]any{}, "machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}}}}}
+	e := &fixtureEngine{inventory: Inventory{Machine: Machine{ID: "local_machine", OS: "darwin"}, Machines: []string{"local_machine", "other_machine"}, Entries: []Entry{{Path: "prefs", ID: "logical@darwin", LogicalID: "logical", Kind: "file", Status: "managed", Metadata: map[string]any{"machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}, Tracking: map[string]any{"destinations": map[string]string{"darwin": "prefs"}, "sources": map[string]string{"darwin": "home/prefs"}, "common": map[string]any{}, "machine": map[string]any{}, "os_metadata": map[string]any{}, "machines": map[string]any{"include": []string{"all"}, "exclude": []string{}}}}}}}
 	m := boot(t, e, false, "track")
 	m, _ = m.Update(tea.KeyPressMsg(tea.Key{Code: tea.KeyTab}))
+	if !strings.Contains(m.(model).message, "Assignment: local_machine only") {
+		t.Fatalf("retarget did not use the human machine-only label: %q", m.(model).message)
+	}
 	m = sendAndRun(m, "p")
 	if e.plans != 1 {
 		t.Fatal("logical Tab did not prepare a Track plan")
