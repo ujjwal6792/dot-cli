@@ -1493,7 +1493,9 @@ impl App {
         };
         let mut spans = vec![Span::styled(
             prefix.clone(),
-            Style::default().fg(UNTRACKED_TEXT),
+            Style::default()
+                .fg(Color::Rgb(196, 167, 231))
+                .add_modifier(Modifier::BOLD),
         )];
         let mut x =
             r.x.saturating_add(1)

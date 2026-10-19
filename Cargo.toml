@@ -1,6 +1,6 @@
 [package]
 name = "dot-cli"
-version = "0.2.0-dev.1"
+version = "0.2.0"
 edition = "2024"
 rust-version = "1.88"
 description = "A Ratatui workspace for chezmoi, Git, and machine configuration"
