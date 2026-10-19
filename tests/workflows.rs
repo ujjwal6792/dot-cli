@@ -467,3 +467,44 @@ fn source_lock_serializes_different_local_state_roots() {
     drop(held);
     assert!(operations::Lock::acquire(&other).is_ok());
 }
+
+#[test]
+fn symlinked_binary_uses_its_bundled_chezmoi() {
+    use std::os::unix::{fs::PermissionsExt, fs::symlink};
+    let f = Fixture::new();
+    let base = f._dir.path();
+    let bundle = base.join("releases/current-version");
+    fs::create_dir_all(bundle.join("libexec")).unwrap();
+    fs::copy(env!("CARGO_BIN_EXE_dot"), bundle.join("dot")).unwrap();
+    let private = bundle.join("libexec/chezmoi");
+    fs::write(
+        &private,
+        "#!/bin/sh\necho 'chezmoi version v2.73.1, bundled fixture'\n",
+    )
+    .unwrap();
+    fs::set_permissions(&private, fs::Permissions::from_mode(0o755)).unwrap();
+    symlink(&bundle, base.join("current")).unwrap();
+    fs::create_dir(base.join("bin")).unwrap();
+    symlink(base.join("current/dot"), base.join("bin/dot")).unwrap();
+    let result = std::process::Command::new(base.join("bin/dot"))
+        .arg("--config")
+        .arg(&f.config)
+        .arg("health")
+        .output()
+        .unwrap();
+    assert!(
+        result.status.success(),
+        "{}",
+        String::from_utf8_lossy(&result.stderr)
+    );
+    let output = String::from_utf8(result.stdout).unwrap();
+    let config: serde_json::Value =
+        serde_json::from_str(&output[output.find('{').unwrap()..]).unwrap();
+    assert_eq!(
+        Path::new(config["chezmoi"].as_str().unwrap())
+            .canonicalize()
+            .unwrap(),
+        private.canonicalize().unwrap()
+    );
+    assert!(output.contains("bundled fixture"));
+}

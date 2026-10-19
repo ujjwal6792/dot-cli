@@ -15,6 +15,17 @@ The web-oriented design detector excludes Go and supplies no assurance here.
 
 ## Correctness defects
 
+### BUG-11 — Symlinked installation misses bundled chezmoi (Rust regression)
+
+- Trigger: invoke an extracted bundle through a separate `~/.local/bin/dot`
+  symlink. On macOS, the executable path can retain that symlink location.
+- Cause: dependency lookup used the unresolved executable parent, so it fell back
+  to system chezmoi instead of the bundle's private binary.
+- Fix: canonicalize the executable before locating `libexec/chezmoi`.
+- Evidence: the installed-bundle check caught the fallback and rolled back before
+  cleanup. A native symlink/version-directory integration test failed before the
+  fix and passes afterward. Released in v0.2.1.
+
 ### BUG-10 — Startup file list stays empty until Left (Rust regression)
 
 - Trigger: launch with existing HOME files and an unavailable source/failed native

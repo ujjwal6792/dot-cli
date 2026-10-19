@@ -152,6 +152,7 @@ fn entry() -> Result<()> {
         c.chezmoi_config = Some(v);
     }
     if let Ok(exe) = std::env::current_exe()
+        && let Ok(exe) = exe.canonicalize()
         && let Some(parent) = exe.parent()
     {
         let private = parent.join("libexec/chezmoi");
