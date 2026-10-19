@@ -1,3 +1,5 @@
+> Historical Go baseline. The Rust rewrite supersedes this implementation; see [Rust spec](rust-rewrite-spec.md) and [current verification](rust-acceptance.md).
+
 # Native whole-spec acceptance (#19)
 
 Local gate date: **2026-10-14**, Darwin ARM64, Go **1.27.2**. Application source

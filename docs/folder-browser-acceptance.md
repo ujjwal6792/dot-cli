@@ -1,3 +1,5 @@
+> Historical Go baseline. The Rust rewrite supersedes this implementation; see [Rust spec](rust-rewrite-spec.md) and [current verification](rust-acceptance.md).
+
 # Folder browser verification — 2026-10-19
 
 Status and the returning-user file tabs now browse immediate HOME-relative

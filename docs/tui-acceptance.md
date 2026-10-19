@@ -1,3 +1,5 @@
+> Historical Go baseline. The Rust rewrite supersedes this implementation; see [Rust spec](rust-rewrite-spec.md) and [current verification](rust-acceptance.md).
+
 # Terminal workspace acceptance — 2026-10-16
 
 The extracted darwin-arm64 release passed the packaged end-to-end gate, including

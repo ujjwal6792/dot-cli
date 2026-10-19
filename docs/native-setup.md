@@ -1,3 +1,5 @@
+> Historical Go baseline. The Rust rewrite supersedes this implementation; see [Rust spec](rust-rewrite-spec.md) and [current verification](rust-acceptance.md).
+
 # Native setup
 
 `internal/setup` owns first-run effects and embeds `*tui.NativeEngine`. It reuses

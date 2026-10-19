@@ -1,3 +1,5 @@
+> Historical Go baseline. The Rust rewrite supersedes this implementation; see [Rust spec](rust-rewrite-spec.md) and [current verification](rust-acceptance.md).
+
 # Machine assignments and local adoption
 
 This is the shared native engine's assignment/local-adoption contract, verified

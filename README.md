@@ -1,168 +1,198 @@
-# dots-cli
+# dot
 
-One Go CLI for setting up and managing a user's private dotfiles repository.
-The target runtime dependencies are **Git and chezmoi**. Go dependencies are
-compiled into `dot`; users do not need Go, Python, Bash, gum, or GitHub CLI to
-run the application. Native package managers are invoked only for explicitly
-requested dependency installation.
+A Rust + Ratatui workspace for **chezmoi, Git and machine configuration**.
+Chezmoi imports, renders, compares and applies files. Dot presents those operations
+in a persistent workspace with exact reviews, Git staging/commit/push, local
+activity, recovery and optional machine synchronization.
 
-## Install a native release
+The Go application has been replaced. The accepted design and original defects
+remain in [the design walkthroughs](docs/tui-redesign-walkthroughs.md) and
+[bug register](docs/tui-redesign-bugs.md). See [the Rust spec](docs/rust-rewrite-spec.md)
+for implementation contracts and [verification](docs/rust-acceptance.md) for evidence.
 
-Choose the archive for `darwin-arm64`, `linux-amd64` or `linux-arm64` and obtain
-its SHA256 from the trusted release publisher. Verify the downloaded archive
-before extracting it into a new directory. Keep the whole bundle together:
-`dot`, `libexec/chezmoi`, `licenses/chezmoi.txt`, `release.json`.
+## Build and run
 
-```sh
-./extracted/dot install --root "$HOME/.local/share/dot-cli" \
-  --archive /absolute/path/to/release.tar.gz --sha256 TRUSTED_SHA256 --yes
-export PATH="$HOME/.local/share/dot-cli/bin:$PATH"
-dot --health
-dot
-```
-
-System Git is required; chezmoi **v2.73.1** is privately bundled and verified.
-Homebrew-owned tools are never overwritten. Manager-owned dot installations must
-use their own manager. Linux amd64's bundled chezmoi requires glibc; musl and a
-minimum glibc version are not established. Linux runtime acceptance was explicitly
-waived by the owner; see [acceptance evidence](docs/native-acceptance.md).
-These local acceptance builds are not published releases.
-
-## First run and another machine
-
-Bare `dot` and `dot init` open one Bubble Tea app:
-**Welcome → Source → Machine → Dependencies → Tracker → Done**.
-
-- Paste your credential-free HTTPS/SSH repository URL to clone, or choose New
-  user to initialize locally and add origin. Create the remote on your platform
-  yourself; dot does not create, commit or push it.
-- The default checkout is `~/.local/share/dot-config`. Existing source offers
-  Continue or Replace. Replace defaults to Cancel and needs a second confirmation
-  naming a timestamped backup; the complete old checkout is preserved, never deleted.
-- Edit the suggested machine id in the embedded Huh form. Identity and exact
-  adoption remain local. Existing identity is immutable; the machine catalog
-  controls locally known collisions.
-- Dependencies show missing tools, exact brew/pacman commands and official links.
-  Enter authorizes native installation; Space leaves setup incomplete. Native
-  authentication runs outside the raw terminal; dot never captures passwords.
-- Review Tracker's paths and bounded identity values. Cancel is the default;
-  confirmation creates/connects local tracker state without replacing `.gitconfig`.
-  Done rechecks readiness and enrolls no files.
-
-On machine 2, clone the same repository, choose a distinct identity, inspect Diff,
-then explicitly select what to Adopt. Pull is separately confirmed, clean and
-fast-forward-only; it never adopts. Push sends existing commits, never creates one.
-
-`dot init --check` is offline and read-only: `old-user` means a valid Git root and
-contract, not that all setup steps are complete. Invalid existing data fails clearly.
-Use `--home`, `--source`, `--config`, `--state-dir` for isolated paths; options follow
-the verb. Defaults and precedence are in [native setup](docs/native-setup.md).
-
-## Review configuration
-
-Returning users open Status & Diff in a six-tab workspace. Track imports exact
-HOME files into the repository; Adopt writes exact repository entries to this machine. Nothing is
-preselected. Space selects, `e` edits metadata, `M` opens logical-file metadata,
-Tab/Shift+Tab cycles tabs 1–6, `m` retargets machines in Track, `s` composes Adopt
-profiles, `p` previews, and `a` enters Cancel-default final confirmation.
-Status and Track browse folders under `~` one level at a time, with one row per
-item and a narrow status/diff preview on the left. Folders appear when any of
-their descendants are tracked, so `.agents` and a partially tracked `.config`
-remain compact. `l`/Right/Enter opens a folder; `h`/Left returns to its parent.
-In Status (Tab 1), Space expands the preview to the full workspace; Space or Esc
-collapses it while preserving the selected path and filter.
-Folder names turn yellow when tracked descendants have changes. Footer
-keybindings fill the available width and wrap between complete bindings.
-Mouse and touchpad taps can switch tabs and focus rows. Double-click folders to
-open them; click checkboxes to select files or open tracking options. Scrolling
-follows the pane under the pointer, including diff and child previews. Form
-values, Settings buttons, and footer key hints are clickable. Consent choices
-only move focus; click the Enter hint to activate the explicit confirmation.
-Track shows tracked and untracked HOME items together. Untracked files and
-folders are grey; Space opens their tracking options. Saving a folder's options
-freezes its exact eligible descendants for plan review. `f` optionally filters
-to tracked paths only. Tracking forms use the full workspace and show all fields
-when terminal height permits. `/` filters loaded paths as you type; Enter searches all
-HOME folders. PgUp/PgDn and Home/End
-navigate large lists, `J`/`K` scroll the diff, and `?` opens the complete keymap.
-Selecting a folder in tracked mode selects only its exact tracked descendants;
-all-HOME folder selection snapshots exact eligible files recursively. Cursor previews
-are debounced and cancelled when superseded; browsing never authorizes a write.
-Settings groups connection details, paths, tools and source maintenance into
-bordered sections. `/` searches settings; Ctrl+N/Ctrl+P focuses visible actions
-and Enter activates them. `A` expands advanced command details. Machine identity
-and paths are displayed read-only; verification never installs or applies files.
-Use your terminal's paste/copy shortcut; dot accepts bracketed paste and does
-not launch system clipboard helpers for Ctrl+V/Ctrl+Shift+C.
-Unsafe (`u`), desktop (`d`) and applicable backup replacement (`b`) gates are
-independent. Every changed input requires a fresh plan.
-
-[Machine assignments](docs/machine-assignments.md) default to `all`; exclusions
-win. Local deselections/customs survive profile changes without changing shared
-entries. Profile selection freezes a union of exact ids; Update never enrolls
-future additions. Directory selection likewise freezes current files.
-
-For agents and scripts:
+Install Rust, system Git and chezmoi **v2.73.1**, then:
 
 ```sh
-dot status --format json
-dot diff --format json
-dot scope show --format json
-dot intent plan --request request.json > plan.json
-dot intent preview --plan plan.json
-dot intent apply --plan plan.json --approve EXACT_PLAN_ID
+cargo build --locked --release
+./target/release/dot --help
+./target/release/dot init --repo git@github.com:YOUR_NAME/dotfiles.git
+./target/release/dot
 ```
 
-Supply required `--ack-unsafe`, `--ack-desktop`, `--ack-backup` separately only
-after reviewing the actual plan. Inspection is offline. Unsupported helpers/private
-executable templates fail closed; the retired runtime is not a fallback.
-Use `dot recovery` and `dot recover --approve EXACT_PLAN_ID` for interrupted
-configuration work; conflicting human edits are preserved/refused.
+For an existing ordinary chezmoi source, use `dot init --source /absolute/source`.
+Without `--repo`, init connects the existing source or initializes a new Git
+repository. It creates local dot configuration and a small agent skill at
+`~/.agents/skills/dot/SKILL.md`; it does not apply HOME files. Existing skill
+customizations are preserved, with conflicting updates written separately.
 
-Help works before setup: `dot --help` and `dot COMMAND --help`. See
-[native distribution](docs/native-distribution.md) for the full retained/retired
-verb inventory and verified archive update/uninstall/recovery commands.
+When the TUI cannot find its source, its setup screen offers `i` to initialize a
+local source, `c` to clone a repository, and `o` to connect an existing checkout.
+These actions are clickable. Esc/Enter returns to browsing without setup; q exits.
 
-## Releases
+Global overrides: `--config`, `--home`, `--source`, `--state-dir`,
+`--chezmoi-config`. Use separate absolute paths for isolated environments.
+The optional dot config defaults to `~/.config/dot/config.toml`; state and private
+backups default to `~/.local/state/dot`. XDG configuration/data/state variables
+are respected. Source defaults to `~/.local/share/chezmoi`; use `--source` for an
+existing custom checkout. The config path is a **dot** TOML file; use
+`--chezmoi-config` for native chezmoi configuration.
 
-GitHub Actions runs only when a version tag such as `v1.2.3` is pushed. It builds
-`darwin-arm64`, `linux-amd64`, and `linux-arm64` archives, generates `SHA256SUMS`,
-and creates a GitHub release. Tags such as `v1.2.3-rc.1` create prereleases.
-Each archive contains `dot`, private pinned chezmoi v2.73.1, its license and
-verified release metadata. System Git remains an external dependency.
+## Workspace
 
-There are no pull-request or branch-push checks. Agents run tests, vet, and builds
-locally before pushing. Release tags publish the tagged code, including its
-current implementation status.
+Persistent Status, Files, Git and Machines panels share a large details area and
+compact activity log. `.agents/` and `.config/` appear as folders, not hundreds of
+flattened paths. All includes grey untracked entries; Managed and Changed narrow
+the view. Yellow folders have changed descendants. HOME matching source does not
+mean the source is committed or published.
 
-## Develop and verify
+| Input | Action |
+|---|---|
+| `1`–`4`, `0`, Tab | Focus panels/details |
+| arrows or `j/k`, `h/l` | Navigate rows/folders |
+| Space in Files | Select files/folders |
+| `c`, `a`, `r` in Files | Capture, apply, restore |
+| `e` in Files | Edit native source; Ctrl+S reviews changes |
+| Space in Git, `v` | Stage/unstage; multi-select Git paths |
+| `c` in Git, `P`, `L`, `F` | Commit, push, pull, fetch |
+| `/`, `f` | Search; All/Managed/Changed |
+| `[`, `]`, `z` | Previous/next tab in the focused section; expand focused panel |
+| `:`, `?`, Esc | All actions, help, back/cancel |
+
+Mouse clicks focus rows/panels; checkboxes select, double-click opens folders,
+and scrolling follows the pane. Action menus support double-click activation.
+Review buttons are clickable. Terminal-delivered touchpad events use the same
+paths. Narrow terminals show the focused pane and retain Actions/Help.
+
+Each section shows its tabs in the border: Status (Overview/Paths), Files
+(All/Managed/Changed), Git (Changes/Commits), Machines (Local/Reports), Details
+(Diff/Source/Rules/Activity), and Activity (Recent/All). Click a tab or use `[`/`]`
+in that section. Each section keeps its own active tab; Tab still changes focus.
+
+Esc/Enter dismisses an error; `q` exits an error/help screen and Ctrl+C exits from
+any screen unless a write operation is still running. Inspection does not block
+exit. Failed inspection pauses automatic retries; use `R` or connect a source
+through Actions to retry explicitly.
+
+Actions include local policy controls, service setup, package-manager handoff,
+source switching, activity/recovery and shared setting editing. Expensive chezmoi
+and Git calls run off the terminal event loop. Text input owns character shortcuts.
+
+## Directional file and Git workflow
+
+Capture is **HOME → source**. Apply/restore is **rendered source → HOME**.
+Restore explicitly overwrites local differences, with a file backup. Stop tracking
+removes shared source but keeps HOME. Enable/disable only changes this machine's
+automatic-update selection; restoring one file preserves the rest of that set.
+
+Stage, commit and push are separate. Commit shows the actual Git index, including
+externally staged work. Pull is clean and fast-forward-only. Resolve divergence,
+rebase and advanced history operations through Git/Lazygit, then refresh dot.
+
+For scripts and agents, inspection and plans emit JSON:
 
 ```sh
-go test ./...
-go vet ./...
-go build -o dot ./cmd/dot
-go run ./cmd/dot --help
+dot status
+dot diff .config/ghostty/config
+dot plan capture .config/ghostty/config
+# Review the returned paths, direction, diff and id:
+dot execute PLAN_ID --approve PLAN_ID
+dot plan stage dot_config/ghostty/config
+dot plan commit -m 'Update terminal settings'
+dot plan push
 ```
 
-Development builds require system Git and chezmoi v2.73.1. Release builds have
-no checkout fallback. `cmd/dot-release` cross-builds/verifies archives;
-`cmd/dot-accept` executes an extracted artifact outside the checkout with Git-only
-PATH and isolated HOME. [Durable acceptance evidence](docs/native-acceptance.md)
-records exact commands, hashes, keyboard transcripts and waived execution gates.
-[Spec #10](https://github.com/ujjwal6792/dots-cli/issues/10) subsumes #7/#8/#9;
-the [ADRs](docs/adr/) record the native architecture decisions.
+Execute each reviewed plan separately. Changes to source, reviewed HOME paths,
+local rules or Git state invalidate old plans. Empty selections never mean all.
+`DOT_ACTOR` and `DOT_INTENT` provide optional non-secret activity labels. Unknown
+external changes have no invented attribution. Local activity retention defaults
+to 30 days; raw config values and command output are excluded from activity records.
+Native commands have a 120-second timeout; `DOT_COMMAND_TIMEOUT` can extend it
+(up to one hour). Timed-out operations need partial-result inspection.
+Native chezmoi templates/hooks may execute during inspection; the TUI is not a
+sandbox for untrusted repository code.
 
-## Product boundaries
+## Shared settings
 
-- One Bubble Tea app for setup and subsequent use; scriptable verbs call the
-  same in-process engine.
-- User-owned private repository, connected with system Git. Users create their
-  remote repository themselves.
-- Track and Adopt are separate, exact reviewed operations. Navigation never
-  authorizes changes. Unsafe and desktop effects require separate confirmation.
-- Machine identity and local adoption state remain local; shared assignments
-  change only through an approved Track plan.
-- Brew and pacman are the initial dependency-install integrations. AUR helpers,
-  apt integration, Windows, and legacy group-scope migration are outside #10.
-- Private configuration, credentials, inventories and recovery backups are not
-  shipped in public releases.
+`dot setting` stores optional settings in ordinary `.chezmoidata.json` and a native
+chezmoi helper. Shared → OS → hostname overrides are resolved **by chezmoi**:
+
+```sh
+dot setting ghostty.font-size 16                # review the generated plan
+dot setting ghostty.font-size 18 --scope machine
+# Execute each exact plan after review, or use --yes for an explicitly intended edit.
+```
+
+Bind the setting explicitly in the corresponding native `.tmpl` source:
+
+```gotemplate
+font-size = {{ template "dot-setting" (dict "root" . "key" "ghostty.font-size") }}
+```
+
+Machine scope uses chezmoi's hostname, independently of dot's display label.
+`--scope os` uses chezmoi's OS. `--remove --scope machine` removes the override to
+inherit again. Values are literal strings; templates own format-specific quoting.
+Arbitrary existing templates remain editable source, with no promise of automatic
+inverse mapping from a rendered HOME edit. Capture refuses to flatten templates.
+
+## Optional synchronization and reports
+
+Enable exact files through the workspace or `dot plan enable PATH...`, then opt in:
+
+```sh
+dot settings sync true --yes
+dot sync
+dot service --install --start
+```
+
+The local launchd/systemd user service checks every five minutes while awake,
+backs off offline and pauses on dirty files/conflicts. Strict mode is conservative:
+it holds dynamic/special sources, hooks, templates, externals, additions, removals
+and other unproven behavior for review. Explicit per-machine
+`dot settings trusted true --yes` permits native unattended repository behavior;
+repository code can then have broader effects. This policy cannot be enabled by
+changing the shared source. Only enabled destinations are passed to apply.
+
+`dot settings reporting true --yes` separately enables automatic **report-only**
+commits/pushes to `dot-reports/INSTALLATION_ID` branches. Reports contain revision,
+time, outcome and counts. They do not touch the configuration branch or index, and
+have the same visibility as the repository. `dot reports --fetch` refreshes cached
+summaries; the Machines view always describes last reported state. Automatic
+publication skips unchanged summaries until an hourly heartbeat. Upload failures
+are distinct from local apply results. Detailed activity stays local by default.
+
+## Recovery and migration
+
+`dot recovery` lists private operation backups. `dot recovery ID --yes` restores
+supported file operations only when the state still matches their recorded result.
+Interrupted operations keep backup files for manual inspection; arbitrary script
+side effects are not reversible. Backups and plan contents may contain private
+config values and remain under the private local state directory.
+
+`dot migrate OLD_SOURCE NEW_SOURCE` previews conversion of an old dot catalog.
+Add `--yes` to archive originals and convert supported plain entries into a **new**
+chezmoi source. Ambiguous mappings, OS/machine constraints, custom templates and
+partial `.gitconfig` semantics are held for explicit translation. Live HOME remains
+unchanged. `dot source /existing/new/repository --yes` archives the old source and
+switches connection, clearing local automatic scope/trust. It keeps the original
+checkout and HOME files.
+
+## Distribution and verification
+
+Release tags build native macOS ARM64, Linux x86-64 and Linux ARM64 bundles.
+Each includes `dot`, verified private `libexec/chezmoi` v2.73.1, its license and
+release metadata. Keep the whole bundle together and verify its SHA256SUMS before
+installing. Add the extracted directory to PATH or symlink its `dot` executable.
+System Git remains external. The retired Go install/update command protocol is
+not used; replace a verified bundle to upgrade, retaining local configuration/state.
+
+```sh
+cargo fmt --check
+cargo clippy --locked --all-targets -- -D warnings
+cargo test --locked
+```
+
+Integration tests exercise real chezmoi and local Git remotes with isolated HOME,
+source, config and state. Current local evidence is macOS; native Linux execution
+belongs to the release matrix and is not implied by a cross-build.

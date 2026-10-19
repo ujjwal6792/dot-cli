@@ -1,34 +1,24 @@
-# Native dot context
+# Dot workspace
 
-## Domain language
+Rust + Ratatui replace the retired Go application. Chezmoi owns source naming,
+rendering, diffing, importing and applying; system Git owns repository behavior.
+Read [the Rust specification](docs/rust-rewrite-spec.md) for module boundaries,
+operation semantics and acceptance coverage. [The interview](docs/tui-redesign-discovery.md)
+and [walkthroughs](docs/tui-redesign-walkthroughs.md) record accepted product choices.
 
-[Machine](GLOSSARY.md#language) is the target-local identity, owned by adoption v3
-(`machine: {id, os}`). Suggested ids use `macos_user` on Darwin; applicability OS
-remains `darwin` or `linux`. Identity is immutable once saved.
+`src/backend.rs` adapts chezmoi. `src/operations.rs` owns exact reviews, locks,
+backups and execution; CLI and TUI both use it. `src/sync.rs` owns local scheduling
+and optional report branches. `src/settings.rs` writes native chezmoi data and
+helper templates; it does not interpret arbitrary configuration languages.
 
-[Machine-assignment](GLOSSARY.md#language) is shared eligibility, not local
-authorization: `machines: {include: ["all"], exclude: []}`. Include is nonempty,
-exclusions win, and local deselections/customs belong to adoption, not the manifest.
-Named profiles compose a union at reviewed Adopt time; Update uses exact prior scope.
+Keep HOME drift, source changes, actual Git staging, outgoing commits and dated
+machine reports distinct. Empty selections never mean all files. A selected-file
+restore never replaces unrelated local enablement. Optional metadata must not
+become an alternate file engine. Strict automation is a supported subset, not a
+sandbox for repository code. Detailed activity stays local by default.
 
-## Boundaries
-
-`cmd/dot` is the sole Go application. `internal/setup` and `internal/native` own
-effects; `internal/tui` is their view adapter. Bubble Tea v2, Bubbles, Lipgloss and
-the embedded Huh machine form are compiled libraries, not separate prompt apps.
-Git uses system/user configuration; release chezmoi is privately pinned and verified.
-Private executable templates/helpers remain unsupported and fail closed.
-
-When changing source/identity/tracker/dependencies, read [native setup](docs/native-setup.md).
-When changing policy/JSON/recovery, read [native engine](docs/native-engine.md) and
-[assignments](docs/machine-assignments.md). For package trust/ownership/promotion,
-read [distribution](docs/native-distribution.md). For readiness, rerun and record
-[artifact acceptance](docs/native-acceptance.md), not just model tests.
-
-## Decisions and scope
-
-Four [ADRs](docs/adr/) record the single app, pinned chezmoi/system Git, retired
-personal/work tags and assignment schema. Spec #10 subsumes #7/#8/#9; issue
-closure remains the reviewer's responsibility. Only the existing v-tag publisher
-is automated. Linux runtime execution is owner-waived; never describe cross-build
-verification as a Linux runtime pass. No privileged host manager acceptance.
+Run `cargo fmt --check`, `cargo clippy --locked --all-targets -- -D warnings`,
+and `cargo test --locked` with Git and chezmoi v2.73.1 available. Integration tests
+use isolated HOME/source/config/state and local Git remotes. Builds do not prove
+Linux runtime behavior; the release matrix runs native tests on each platform.
+Historical Go acceptance documents describe the pre-rewrite baseline only.

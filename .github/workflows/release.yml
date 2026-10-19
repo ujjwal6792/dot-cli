@@ -1,40 +1,86 @@
 name: Release
-
 on:
   push:
-    tags:
-      - 'v*'
-
+    tags: ['v*']
 permissions:
-  contents: write
-
+  contents: read
 concurrency:
   group: release-${{ github.ref }}
   cancel-in-progress: false
-
 jobs:
-  release:
-    runs-on: ubuntu-latest
-    env:
-      RELEASE_TAG: ${{ github.ref_name }}
-      CGO_ENABLED: '0'
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: macos-14
+            platform: darwin-arm64
+          - runner: ubuntu-24.04
+            platform: linux-amd64
+          - runner: ubuntu-24.04-arm
+            platform: linux-arm64
+    runs-on: ${{ matrix.runner }}
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-go@v7
+      - uses: dtolnay/rust-toolchain@1.93.1
         with:
-          go-version-file: go.mod
-          cache-dependency-path: go.sum
-      - name: Build release archives
-        run: go run ./cmd/dot-release build --version "${RELEASE_TAG#v}" --out dist
-      - name: Create GitHub release
+          components: rustfmt, clippy
+      - name: Install pinned chezmoi for integration tests
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: |
+          python3 - <<'PY'
+          import hashlib, io, os, pathlib, sys, tarfile, urllib.request
+          sys.path.insert(0, 'scripts')
+          from package import PINS, VERSION
+          platform = os.environ['PLATFORM']
+          name = f'chezmoi_{VERSION}_{platform.replace("-", "_")}.tar.gz'
+          data = urllib.request.urlopen(f'https://github.com/twpayne/chezmoi/releases/download/v{VERSION}/{name}', timeout=90).read()
+          assert hashlib.sha256(data).hexdigest() == PINS[platform][0]
+          pathlib.Path('chezmoi-upstream.tar.gz').write_bytes(data)
+          with tarfile.open(fileobj=io.BytesIO(data)) as t:
+              binary = t.extractfile('chezmoi').read()
+          assert hashlib.sha256(binary).hexdigest() == PINS[platform][1]
+          path = pathlib.Path(os.environ['RUNNER_TEMP']) / 'dot-test-bin'
+          path.mkdir()
+          (path / 'chezmoi').write_bytes(binary)
+          (path / 'chezmoi').chmod(0o755)
+          with open(os.environ['GITHUB_PATH'], 'a') as f:
+              f.write(str(path) + '\n')
+          PY
+      - run: cargo fmt --check
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+      - run: cargo build --locked --release
+      - run: python3 scripts/pty-smoke.py target/release/dot
+      - run: python3 scripts/pty-missing-source.py target/release/dot
+      - name: Package verified bundle
+        env:
+          RELEASE_TAG: ${{ github.ref_name }}
+          PLATFORM: ${{ matrix.platform }}
+        run: python3 scripts/package.py --version "${RELEASE_TAG#v}" --platform "$PLATFORM" --dependency chezmoi-upstream.tar.gz
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dot-${{ matrix.platform }}
+          path: dist/*
+  publish:
+    needs: build
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: dot-*
+          path: dist
+          merge-multiple: true
+      - name: Publish tag artifacts
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
-        shell: bash
+          RELEASE_TAG: ${{ github.ref_name }}
         run: |
+          cat dist/*.sha256 > dist/SHA256SUMS
           flags=()
-          if [[ "${RELEASE_TAG%%+*}" == *-* ]]; then
-            flags+=(--prerelease)
-          fi
-          gh release create "$RELEASE_TAG" dist/* \
-            --verify-tag --title "$RELEASE_TAG" --generate-notes "${flags[@]}"
+          if [[ "$RELEASE_TAG" == *-* ]]; then flags+=(--prerelease); fi
+          gh release create "$RELEASE_TAG" dist/*.tar.gz dist/SHA256SUMS --verify-tag --title "$RELEASE_TAG" --generate-notes "${flags[@]}"

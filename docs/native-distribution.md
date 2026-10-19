@@ -1,3 +1,5 @@
+> Historical Go baseline. The Rust rewrite supersedes this implementation; see [Rust spec](rust-rewrite-spec.md) and [current verification](rust-acceptance.md).
+
 # Native CLI and distribution handoff (#18 → #19)
 
 The final integrated #19 gate and fresh artifact hashes are recorded in
