@@ -313,6 +313,9 @@ func (e *NativeEngine) DashboardStatus(ctx context.Context) (DashboardData, erro
 	for _, entry := range inv.Entries {
 		switch entry.Status {
 		case "managed":
+			if entry.OSStatus != "supported" {
+				continue
+			}
 			dest := entry.Destination
 			if dest == "" {
 				dest = entry.Path

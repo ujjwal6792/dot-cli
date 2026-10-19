@@ -25,6 +25,9 @@ type directoryMsg struct {
 // Explicit search builds a complete index once; opening Track never walks all
 // of HOME. Keystrokes filter the loaded tree while Enter searches all folders.
 func (m *model) searchAllFolders() tea.Cmd {
+	if m.trackedBrowser() {
+		return m.highlightCurrent()
+	}
 	if _, ok := m.engine.(BrowserEngine); !ok || m.mode != "track" || m.search.Value() == "" {
 		return m.highlightCurrent()
 	}
@@ -40,10 +43,21 @@ func (m *model) searchAllFolders() tea.Cmd {
 
 func (m *model) expandDirectory(index int) tea.Cmd {
 	path := m.entries[index].Path
+	if m.returning {
+		m.browserDirs[m.currentTab()] = path
+		m.cursor = 0
+		m.search.SetValue("")
+		m.searching = false
+		m.search.Blur()
+	}
 	m.entries[index].Open = true
 	m.filter()
+	return m.loadBrowserDirectory(path)
+}
+
+func (m *model) loadBrowserDirectory(path string) tea.Cmd {
 	e, ok := m.engine.(BrowserEngine)
-	if !ok || m.mode != "track" || m.dirLoaded[path] || m.dirPending[path] {
+	if !ok || m.mode != "track" || m.trackedBrowser() || m.dirLoaded[path] || m.dirPending[path] {
 		return m.highlightCurrent()
 	}
 	if m.dirPending == nil {
@@ -64,6 +78,9 @@ func (m model) directoryResult(msg directoryMsg) (tea.Model, tea.Cmd) {
 	}
 	delete(m.dirPending, msg.path)
 	if msg.err != nil {
+		if m.returning && m.browserDirs[m.currentTab()] == msg.path {
+			m.collapseDirectory()
+		}
 		m.message = fmt.Sprintf("Couldn't open %s: %s · l retries", msg.path, safeTerminal(msg.err.Error()))
 		return m, nil
 	}
@@ -158,6 +175,18 @@ func (m *model) pageFiles(key string) {
 }
 
 func (m *model) collapseDirectory() {
+	if m.returning {
+		path := m.browserDirs[m.currentTab()]
+		m.browserDirs[m.currentTab()] = parentPath(path)
+		m.filter()
+		for row, index := range m.visible {
+			if m.entries[index].Path == path {
+				m.cursor = row
+				break
+			}
+		}
+		return
+	}
 	i := m.current()
 	if i < 0 {
 		return

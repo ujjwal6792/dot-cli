@@ -232,6 +232,9 @@ func Run(ctx context.Context, archive, checksum, dir string) error {
 	if err := h.largeBrowserKeyboard(home); err != nil {
 		return err
 	}
+	if err := h.mouseJourney(home); err != nil {
+		return err
+	}
 	if err := h.trackKeyboard(home); err != nil {
 		return err
 	}

@@ -130,6 +130,7 @@ func TestReturningSelectionInvalidatesPlanAcks(t *testing.T) {
 	m := bootReturning(t, e)
 	m = sendAndRun(m, "2")
 	m = send(m, " ")
+	m = send(m, "enter") // Save the explicit tracking options before reviewing.
 	m = sendAndRun(m, "p")
 	m = send(m, "u")
 	if !m.(model).unsafeAck {

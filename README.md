@@ -65,12 +65,28 @@ HOME files into the repository; Adopt writes exact repository entries to this ma
 preselected. Space selects, `e` edits metadata, `M` opens logical-file metadata,
 Tab/Shift+Tab cycles tabs 1–6, `m` retargets machines in Track, `s` composes Adopt
 profiles, `p` previews, and `a` enters Cancel-default final confirmation.
-The workspace uses bounded inventory and diff panes with a persistent key footer.
-Track initially lists HOME's immediate children; `l`/Right/Enter loads a folder
-when expanded, and `h`/Left collapses it or returns to its parent. `/` filters the
-loaded tree as you type; Enter searches all HOME folders. PgUp/PgDn and Home/End
+Status and Track browse folders under `~` one level at a time, with one row per
+item and a narrow status/diff preview on the left. Folders appear when any of
+their descendants are tracked, so `.agents` and a partially tracked `.config`
+remain compact. `l`/Right/Enter opens a folder; `h`/Left returns to its parent.
+In Status (Tab 1), Space expands the preview to the full workspace; Space or Esc
+collapses it while preserving the selected path and filter.
+Folder names turn yellow when tracked descendants have changes. Footer
+keybindings fill the available width and wrap between complete bindings.
+Mouse and touchpad taps can switch tabs and focus rows. Double-click folders to
+open them; click checkboxes to select files or open tracking options. Scrolling
+follows the pane under the pointer, including diff and child previews. Form
+values, Settings buttons, and footer key hints are clickable. Consent choices
+only move focus; click the Enter hint to activate the explicit confirmation.
+Track shows tracked and untracked HOME items together. Untracked files and
+folders are grey; Space opens their tracking options. Saving a folder's options
+freezes its exact eligible descendants for plan review. `f` optionally filters
+to tracked paths only. Tracking forms use the full workspace and show all fields
+when terminal height permits. `/` filters loaded paths as you type; Enter searches all
+HOME folders. PgUp/PgDn and Home/End
 navigate large lists, `J`/`K` scroll the diff, and `?` opens the complete keymap.
-Folder selection still snapshots exact eligible files recursively. Cursor previews
+Selecting a folder in tracked mode selects only its exact tracked descendants;
+all-HOME folder selection snapshots exact eligible files recursively. Cursor previews
 are debounced and cancelled when superseded; browsing never authorizes a write.
 Settings groups connection details, paths, tools and source maintenance into
 bordered sections. `/` searches settings; Ctrl+N/Ctrl+P focuses visible actions

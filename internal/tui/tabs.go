@@ -104,7 +104,7 @@ func (m model) returningChrome(body string) string {
 // returning. Other sessions render exactly as before.
 func (m model) browserChrome(body string) string {
 	if m.returning {
-		return m.tabBarBlock() + "\n" + body
+		return m.workspaceFrame(panel("Completed", body, m.width, m.workspaceHeight(), true), false)
 	}
 	return body
 }
@@ -205,6 +205,12 @@ func (m model) switchTab(id int) (tea.Model, tea.Cmd) {
 	}
 	if m.activeTab >= TabTrack && m.activeTab <= TabUntrack {
 		m.tabCursors[m.activeTab] = m.cursor
+		if path := m.browserDirs[m.activeTab]; m.dirPending[path] {
+			// A cancelled lazy load must leave a reachable folder to retry,
+			// rather than an empty current directory with no selected child.
+			m.browserDirs[m.activeTab] = parentPath(path)
+			m.tabCursors[m.activeTab] = 0
+		}
 	}
 	m.cancelPreview()
 	m.dirPending = map[string]bool{}
@@ -533,21 +539,13 @@ func (m model) machineCard() string {
 	return fmt.Sprintf("Machine: %s [%s] · immutable", id, os)
 }
 
-// statusFiles returns dashboard files filtered by the search box. Nothing is
-// selected by this: filtering is browsing, not authorization.
+// statusFiles projects tracked files into immediate HOME-relative children.
+// An explicit search returns full-path matches across the tracked catalog.
 func (m model) statusFiles() []DashboardEntry {
 	if m.dashboard == nil {
 		return nil
 	}
-	q := strings.ToLower(m.search.Value())
-	out := make([]DashboardEntry, 0, len(m.dashboard.Managed))
-	for _, e := range m.dashboard.Managed {
-		if q != "" && !strings.Contains(strings.ToLower(e.Path+" "+e.Dest+" "+e.State), q) {
-			continue
-		}
-		out = append(out, e)
-	}
-	return out
+	return dashboardRows(m.dashboard.Managed, m.browserDirs[TabStatus], m.search.Value(), m.hidden)
 }
 
 func statusCursor(m *model) int {
@@ -566,14 +564,17 @@ func statusCursor(m *model) int {
 	return c
 }
 
-// renderStatusTab is Tab 1: filter + file list + machine card on the left,
-// detail + live diff on the right, with a fixed contextual keymap footer.
+// The browser leads; a narrow left column holds the selected file's preview.
 func (m model) renderStatusTab() string { return m.renderStatusWorkspace() }
 
 // updateStatusTab handles Tab 1 keys. Navigation never authorizes writes;
-// p/Enter only start read-only inspect commands.
+// Enter opens folders; p/Enter on a file refreshes its inline preview.
 func (m model) updateStatusTab(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 	switch key.String() {
+	case " ", "space":
+		m.statusExpanded = !m.statusExpanded
+		m.resizePreview()
+		return m, nil
 	case "pgdown", "pgup", "home", "end":
 		n := len(m.statusFiles())
 		m.tabCursors[TabStatus] = pagedCursor(statusCursor(&m), n, m.statusListLimit(), key.String())
@@ -602,28 +603,46 @@ func (m model) updateStatusTab(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.search.Focus()
 		return m, nil
 	case "esc":
+		if m.statusExpanded {
+			m.statusExpanded = false
+			m.resizePreview()
+			return m, nil
+		}
 		m.searching = false
 		m.search.Blur()
 		m.search.SetValue("")
 		m.tabCursors[TabStatus] = 0
 		m.message = "Filter cleared."
-		return m, nil
-	case "p", "enter":
-		op := "status"
-		if key.String() == "p" {
-			op = "diff"
+		return m, m.statusHighlight()
+	case "h", "left", "backspace":
+		path := m.browserDirs[TabStatus]
+		m.browserDirs[TabStatus] = parentPath(path)
+		m.search.SetValue("")
+		m.tabCursors[TabStatus] = 0
+		for i, e := range m.statusFiles() {
+			if e.Path == path {
+				m.tabCursors[TabStatus] = i
+				break
+			}
 		}
-		e, ok := m.engine.(ReturningEngine)
-		if !ok {
-			m.err = fmt.Errorf("returning-user inspection API unavailable")
-			return m, nil
+		return m, m.statusHighlight()
+	case "l", "right", "enter":
+		files := m.statusFiles()
+		if cur := statusCursor(&m); cur >= 0 && files[cur].Kind == "directory" {
+			m.browserDirs[TabStatus] = files[cur].Path
+			m.tabCursors[TabStatus] = 0
+			m.search.SetValue("")
 		}
-		m.returningOperation = op
-		m.loading = true
-		return m, func() tea.Msg {
-			text, err := e.Inspect(m.setupCtx(), op)
-			return returningMsg{generation: m.tabGeneration, text: text, err: err}
-		}
+		return m, m.statusHighlight()
+	case "p":
+		return m, m.statusHighlight()
+	case "H":
+		m.hidden = !m.hidden
+		m.tabCursors[TabStatus] = 0
+		return m, m.statusHighlight()
+	case "r":
+		m.dashboardLoading = true
+		return m, m.dashboardCommand()
 	}
 	return m, nil
 }
@@ -637,6 +656,13 @@ func (m *model) statusHighlight() tea.Cmd {
 	if cur < 0 || cur >= len(files) {
 		m.cancelPreview()
 		m.highlight = HighlightResult{}
+		return nil
+	}
+	if e := files[cur]; e.Kind == "directory" {
+		m.cancelPreview()
+		m.highlightPath = e.Path
+		m.highlight = HighlightResult{Status: "directory", Summary: folderSummary(e.Tracked, e.Changed, e.Missing)}
+		m.previewViewport.GotoTop()
 		return nil
 	}
 	return m.queuePreview("adopt", files[cur].Path, nil)

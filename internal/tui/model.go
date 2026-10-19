@@ -8,6 +8,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"time"
 
 	"charm.land/bubbles/v2/textarea"
 	"charm.land/bubbles/v2/textinput"
@@ -99,6 +100,7 @@ type model struct {
 	editPath                         string
 	editValue                        map[string]any
 	editOriginal                     map[string]any
+	editFolderSelection              bool
 	editTemplate                     bool
 	previewGeneration                uint64
 	highlight                        HighlightResult
@@ -141,6 +143,13 @@ type model struct {
 	dirPending                       map[string]bool
 	previewCancel                    context.CancelFunc
 	previewLoading                   bool
+	browserDirs                      [7]string
+	trackedOnly                      bool
+	statusExpanded                   bool
+	lastMousePath                    string
+	lastMouseTab                     int
+	lastMouseClick                   time.Time
+	childOffsets                     map[string]int
 }
 
 type inventoryMsg struct {
@@ -162,10 +171,12 @@ type previewMsg struct {
 }
 type applyMsg struct{ err error }
 type snapshotMsg struct {
-	generation uint64
-	folder     string
-	result     SnapshotResult
-	err        error
+	generation    uint64
+	folder        string
+	result        SnapshotResult
+	err           error
+	metadata      map[string]any
+	tabGeneration uint64
 }
 type highlightMsg struct {
 	generation uint64
@@ -242,6 +253,10 @@ func (m *model) openPresets() {
 
 func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch value := msg.(type) {
+	case tea.MouseClickMsg:
+		return m.mouseClick(value)
+	case tea.MouseWheelMsg:
+		return m.mouseWheel(value)
 	case directoryMsg:
 		return m.directoryResult(value)
 	case previewRequestMsg:
@@ -393,12 +408,16 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			m.currentOS = value.value.OS
 			m.currentMachine = value.value.Machine
 			m.entries = value.value.Entries
+			if m.returning {
+				m.entries = navigationParents(m.entries)
+			}
 			m.dirLoaded, m.dirPending = map[string]bool{}, map[string]bool{}
 			m.profiles = value.value.Profiles
 			m.machines = value.value.Machines
 			if m.invCache == nil {
 				m.invCache = map[string]Inventory{}
 			}
+			value.value.Entries = m.entries
 			m.invCache[value.mode] = value.value
 			m.filter()
 			if m.presetPending {
@@ -412,6 +431,9 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		if value.generation != m.generation {
 			return m, nil
 		}
+		if value.metadata != nil && (m.currentTab() != TabTrack || value.tabGeneration != m.tabGeneration) {
+			return m, nil
+		}
 		m.loading = false
 		m.err = value.err
 		if value.err == nil {
@@ -421,7 +443,11 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			for _, path := range value.result.Paths {
 				metadata := map[string]any{"path": path}
-				if entry, ok := byPath[path]; ok {
+				if value.metadata != nil {
+					metadata = cloneMetadata(value.metadata)
+					metadata["path"] = path
+					metadata["destination"] = inputValue(value.metadata["destination"]) + "/" + strings.TrimPrefix(path, value.folder+"/")
+				} else if entry, ok := byPath[path]; ok {
 					for k, v := range entry.Metadata {
 						metadata[k] = v
 					}
@@ -770,6 +796,20 @@ func (m model) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 				cmd := m.expandDirectory(i)
 				return m, cmd
 			}
+		case "f":
+			if m.returning && m.mode == "track" {
+				m.trackedOnly = !m.trackedOnly
+				m.cursor = 0
+				m.filter()
+				m.message = "Showing tracked paths · f browses all HOME files."
+				if !m.trackedBrowser() {
+					m.message = "Showing all HOME files · f returns to tracked paths."
+					if dir := m.browserDirs[m.currentTab()]; dir != "" {
+						return m, m.loadBrowserDirectory(dir)
+					}
+				}
+				return m, m.highlightCurrent()
+			}
 		case " ", "space":
 			cmd := m.toggleCurrent()
 			if cmd != nil {
@@ -988,6 +1028,13 @@ func (m *model) highlightCurrent() tea.Cmd {
 }
 
 func (m *model) filter() {
+	if m.returning {
+		m.visible = m.fileRows(m.browserDirs[m.currentTab()], m.search.Value())
+		if m.cursor >= len(m.visible) {
+			m.cursor = max(0, len(m.visible)-1)
+		}
+		return
+	}
 	m.visible = m.visible[:0]
 	byPath := make(map[string]Entry, len(m.entries))
 	for _, e := range m.entries {
@@ -1062,6 +1109,15 @@ func (m *model) toggleCurrent() tea.Cmd {
 	}
 	entry := m.entries[i]
 	if entry.Kind == "directory" {
+		if m.trackedBrowser() {
+			m.toggleTrackedFolder(entry.Path)
+			return nil
+		}
+		if m.returning && m.mode == "track" {
+			m.beginEdit(entry)
+			m.editFolderSelection = true
+			return nil
+		}
 		if m.mode == "adopt" {
 			m.adoptTouched = true
 			// Freeze the currently inventoried file IDs, not a recursive path or
@@ -1101,7 +1157,7 @@ func (m *model) toggleCurrent() tea.Cmd {
 		m.invalidatePlan()
 		return func() tea.Msg {
 			result, err := m.engine.Snapshot(m.setupCtx(), entry.Path)
-			return snapshotMsg{generation, entry.Path, result, err}
+			return snapshotMsg{generation: generation, folder: entry.Path, result: result, err: err}
 		}
 	}
 	selectable := entry.Status == "eligible" || m.mode == "track" && entry.Status == "managed" || m.mode == "track" && entry.Status == "restricted" && boundedGitConfig(entry.Metadata) || (m.mode == "adopt" || m.mode == "untrack") && entry.Status == "managed" && entry.ID != ""
@@ -1116,6 +1172,10 @@ func (m *model) toggleCurrent() tea.Cmd {
 		delete(m.basket, entry.Path)
 		m.invalidatePlan()
 		m.generation++
+		return nil
+	}
+	if m.returning && m.mode == "track" && !trackedFile(entry) {
+		m.beginEdit(entry)
 		return nil
 	}
 	if m.mode == "adopt" || m.mode == "untrack" {
@@ -1186,6 +1246,7 @@ func metadataList(v any) []string {
 }
 func (m *model) beginEdit(entry Entry) {
 	m.logicalRequest = nil
+	m.editFolderSelection = false
 	m.editPath = entry.Path
 	m.editValue = map[string]any{"path": entry.Path}
 	for k, v := range entry.Metadata {
@@ -1491,6 +1552,18 @@ func (m model) updateMetadata(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				value["template"] = template + "\n"
 			}
 		}
+		if m.editFolderSelection && m.mode == "track" {
+			folder, generation, tabGeneration := m.editPath, m.generation+1, m.tabGeneration
+			m.generation = generation
+			m.stage = ""
+			m.loading = true
+			m.invalidatePlan()
+			m.message = "Snapshotting exact files with these tracking options…"
+			return m, func() tea.Msg {
+				result, err := m.engine.Snapshot(m.setupCtx(), folder)
+				return snapshotMsg{generation: generation, folder: folder, result: result, err: err, metadata: value, tabGeneration: tabGeneration}
+			}
+		}
 		if m.mode == "adopt" {
 			changes := map[string]any{}
 			for _, name := range []string{"os", "impact", "removals", "tools", "warnings", "integrations", "requires", "notices", "git_keys"} {
@@ -1698,6 +1771,7 @@ func (m model) View() tea.View {
 	content = sanitizeTerminalView(content)
 	v := tea.NewView(fitHeight(content, height))
 	v.AltScreen = true
+	v.MouseMode = tea.MouseModeCellMotion
 	return v
 }
 
@@ -1945,7 +2019,7 @@ func (m model) renderMetadata() string {
 
 	start, end := 0, len(fields)
 	if m.returning {
-		limit := max(3, min(6, m.workspaceHeight()-9))
+		limit := max(3, min(len(fields), m.workspaceHeight()-9))
 		start = max(0, min(m.editField-2, len(fields)-limit))
 		end = min(len(fields), start+limit)
 	}

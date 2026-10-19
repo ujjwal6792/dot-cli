@@ -11,7 +11,6 @@ import (
 	"syscall"
 	"time"
 
-	"github.com/charmbracelet/x/ansi"
 	"github.com/ujjwal6792/dots-cli/internal/native"
 )
 
@@ -58,6 +57,7 @@ func (h harness) keyboardExit(home, label string, expectedExit int, steps []keyb
 		}
 	}()
 	var transcript bytes.Buffer
+	screen := newTerminalScreen(100, 32)
 	defer func() { _ = write(filepath.Join(h.dir, label+".terminal"), transcript.Bytes(), 0600) }()
 	for i, s := range steps {
 		if s.keys != "" {
@@ -70,7 +70,6 @@ func (h harness) keyboardExit(home, label string, expectedExit int, steps []keyb
 		if s.want == "" {
 			continue
 		}
-		var output bytes.Buffer
 		found := false
 		for !found {
 			select {
@@ -80,8 +79,8 @@ func (h harness) keyboardExit(home, label string, expectedExit int, steps []keyb
 					return fmt.Errorf("%s step %d exited before %q: %s", label, i, s.want, transcript.String())
 				}
 				transcript.Write(b)
-				output.Write(b)
-				found = strings.Contains(ansi.Strip(output.String()), s.want)
+				screen.write(b)
+				found = strings.Contains(screen.text(), s.want)
 			case <-ctx.Done():
 				_ = cmd.Wait()
 				master.Close()
@@ -233,7 +232,14 @@ func (h harness) trackKeyboard(home string) error {
 	if err := write(filepath.Join(home, "keyboard-prefs"), []byte("keyboard exact\x00\xff\n"), 0755); err != nil {
 		return err
 	}
-	steps := []keyboardStep{{"", "Tracked Files"}, {"2", "0 selected"}, {"/keyboard-prefs\r", "keyboard-prefs"}, {"M", "LOGICAL FILE METADATA"}, {"\x13", "Logical metadata request prepared"}, {"p", "a continue"}, {"a", "FINAL CONFIRMATION"}, {"\r", "Final confirmation canceled"}, {"a", "FINAL CONFIRMATION"}, {"j\r", "Applied reviewed plan."}, {"q", ""}}
+	steps := []keyboardStep{
+		{"", "Tracked Files"}, {"2", "0 selected"}, {"/keyboard-prefs\r", "keyboard-prefs"},
+		{" ", "EDIT TRACK METADATA"}, {"\x1b", "Search results"},
+		{" ", "EDIT TRACK METADATA"}, {"\t   \t \t \r", "Exact selection metadata saved"},
+		{"M", "LOGICAL FILE METADATA"}, {"\x13", "Logical metadata request prepared"},
+		{"p", "a continue"}, {"a", "FINAL CONFIRMATION"}, {"\r", "Final confirmation canceled"},
+		{"a", "FINAL CONFIRMATION"}, {"j\r", "Applied reviewed plan."}, {"q", ""},
+	}
 	if err := h.keyboard(home, "keyboard-track", steps); err != nil {
 		return err
 	}
@@ -263,7 +269,7 @@ func (h harness) adoptKeyboard(home string) error {
 // navigationKeyboard sends the bytes emitted by a terminal for Tab/Backtab.
 // Pane-specific text proves focus moved; every tab name is always in the header.
 func (h harness) navigationKeyboard(home string) error {
-	steps := []keyboardStep{{"", "Tracked Files"}}
+	steps := []keyboardStep{{"", "Tracked Files"}, {" ", "Status & diff · expanded"}, {" ", "Tracked Files"}}
 	for _, want := range []string{"TRACK", "ADOPT", "UNTRACK", "GIT SYNC · Explicit Gates", "Find a setting", "Tracked Files"} {
 		steps = append(steps, keyboardStep{"\t", want})
 	}
@@ -279,6 +285,51 @@ func (h harness) navigationKeyboard(home string) error {
 		keyboardStep{"q", ""},
 	)
 	return h.keyboard(home, "keyboard-navigation", steps)
+}
+
+func pointerPacket(x, y int) string {
+	return fmt.Sprintf("\x1b[<0;%d;%dM\x1b[<0;%d;%dm", x+1, y+1, x+1, y+1)
+}
+
+// Real SGR pointer packets exercise terminal decoding, not only model messages.
+// This journey is read-only: selecting an option is canceled before review.
+func (h harness) mouseJourney(home string) error {
+	path := filepath.Join(home, "pointer-prefs")
+	if err := write(path, []byte("pointer fixture\n"), 0600); err != nil {
+		return err
+	}
+	defer os.Remove(path)
+	steps := []keyboardStep{
+		{"", "Tracked Files"},
+		{pointerPacket(23, 1), "TRACK"},
+		{pointerPacket(30, 3), "/ filter"},
+		{"pointer-prefs", "Search results · pointer-prefs"},
+		{pointerPacket(29, 4), "EDIT TRACK METADATA"},
+		{pointerPacket(25, 6), "[darwin]"},
+		{pointerPacket(37, 30), "Search results"},
+		{pointerPacket(6, 1), "Read-only inspection"},
+		{pointerPacket(4, 2), "Status & diff · expanded"},
+		{pointerPacket(4, 2), "Search results"},
+		{"q", ""},
+	}
+	if err := h.keyboard(home, "mouse-workspace", steps); err != nil {
+		return err
+	}
+	transcript, err := os.ReadFile(filepath.Join(h.dir, "mouse-workspace.terminal"))
+	if err != nil {
+		return err
+	}
+	if !bytes.Contains(transcript, []byte("\x1b[?1002h")) || !bytes.Contains(transcript, []byte("\x1b[?1006h")) {
+		return fmt.Errorf("app did not request cell-motion and SGR mouse reporting")
+	}
+	a, err := h.scope(home)
+	if err != nil || len(a.Entries) != 0 {
+		return fmt.Errorf("pointer browsing changed adoption scope: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(home, ".local/share/dot-config/home/pointer-prefs")); !os.IsNotExist(err) {
+		return fmt.Errorf("pointer browsing wrote a source file")
+	}
+	return nil
 }
 
 func (h harness) largeBrowserKeyboard(home string) error {
@@ -304,8 +355,8 @@ func (h harness) largeBrowserKeyboard(home string) error {
 	started := time.Now()
 	err := h.keyboard(home, "keyboard-large-list", []keyboardStep{
 		{"", "Tracked Files"}, {"2", "0 selected"},
-		{"\x1b[F", "zz-large-list"}, {"\r", "entry-0000"},
-		{"\x1b[F", "entry-0999"}, {"\x1b[H", ".config"}, {"q", ""},
+		{"/zz-large-list\r", "zz-large-list"}, {"\r", "entry-0000"},
+		{"\x1b[F", "entry-0999"}, {"\x1b[H", "000-collapsed"}, {"h", ".config"}, {"q", ""},
 	})
 	if err != nil {
 		return err

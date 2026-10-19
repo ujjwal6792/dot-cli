@@ -105,14 +105,26 @@ func (m model) workspaceMessage() string {
 }
 
 func (m model) workspaceFooter(status bool) string {
-	keys := "q quit · Tab/Shift+Tab tabs · j/k move\n/ filter · J/K scroll · p diff · ? help"
+	keys := "Space expand preview · Tab/Shift+Tab tabs · j/k move · h/l folders\n/ search tracked · J/K preview · p refresh · H hidden · r rescan · q quit · ? help"
+	if status && m.statusExpanded {
+		keys = "Space / Esc collapse preview · J/K scroll · j/k files\nTab/Shift+Tab tabs · p refresh · q quit · ? help"
+	}
 	if !status {
-		keys = "q quit · Tab/Shift+Tab tabs · j/k move\nSpace select · m machines · p preview · ? help"
+		filter := ""
+		if m.returning && m.mode == "track" {
+			filter = "f tracked only · "
+			if m.trackedBrowser() {
+				filter = "f all HOME · "
+			}
+		}
+		keys = "q quit · Tab/Shift+Tab tabs · j/k move\nSpace track/select · " + filter + "h/l folders · p preview · ? help"
 		if m.width >= 110 {
-			keys = "Tab/Shift+Tab tabs · 1-6 jump · j/k move · h/l folders · Space select · p preview · q quit\n? help · / search · e edit · M logical · m machines · s profiles · H hidden · r rescan"
+			keys = "Tab/Shift+Tab tabs · 1-6 jump · j/k move · h/l folders · Space track/select · p preview · q quit\n? help · / search · " + filter + "e edit · M logical · m machines · s profiles · H hidden · r rescan"
 		}
 	}
 	switch m.stage {
+	case "done":
+		keys = "Enter return to Status · q quit"
 	case "review":
 		keys = "j/k scroll · p refresh plan · a continue · Esc cancel\nu unsafe · d desktop · b backup · q cancel · ? help"
 	case "confirm":
@@ -188,6 +200,9 @@ func visibleStart(cursor, count, limit, previous int) int {
 
 func (m model) fileListLimit() int {
 	h := m.workspaceHeight()
+	if m.returning {
+		return max(1, h-4)
+	}
 	if m.width < 72 {
 		return max(1, max(5, h/2)-4)
 	}
@@ -195,21 +210,7 @@ func (m model) fileListLimit() int {
 	return max(1, h-4-contextH)
 }
 
-func (m model) statusListLimit() int {
-	h := m.workspaceHeight()
-	if m.width < 72 {
-		return max(1, max(4, h/2)-4)
-	}
-	contextH := min(lipgloss.Height(m.machineContext(m.sidebarWidth()-4)), max(0, h-8))
-	return max(1, (h-4-contextH)/m.statusRowHeight())
-}
-
-func (m model) statusRowHeight() int {
-	if m.width >= 72 && m.height >= 22 {
-		return 2
-	}
-	return 1
-}
+func (m model) statusListLimit() int { return max(1, m.workspaceHeight()-4) }
 
 func (m *model) keepFileCursorVisible() {
 	id := m.currentTab()
@@ -275,7 +276,7 @@ func (m model) previewRegion(width, height int) string {
 	vp.SetWidth(max(1, width))
 	vp.SetHeight(max(1, height))
 	vp.SoftWrap = true
-	vp.SetContent(m.renderHighlight())
+	vp.SetContent(m.previewText())
 	vp.SetYOffset(offset)
 	return region(vp.View(), width, height)
 }
@@ -333,7 +334,7 @@ func assignmentDescription(metadata map[string]any) string {
 	return safeTerminal(label)
 }
 
-func (m model) renderFileWorkspace() string {
+func (m model) renderLegacyFileWorkspace() string {
 	h := m.workspaceHeight()
 	if m.width < 72 {
 		listH := max(5, h/2)
@@ -361,92 +362,25 @@ func (m model) renderFileWorkspace() string {
 	return m.workspaceFrame(lipgloss.JoinHorizontal(lipgloss.Top, left, right), false)
 }
 
-func (m model) renderStatusWorkspace() string {
-	h := m.workspaceHeight()
-	sideW := m.sidebarWidth()
-	if m.width < 72 {
-		sideW = m.width
+func (m model) renderStatusWorkspace() string { return m.renderBrowserWorkspace(true) }
+
+func (m model) renderFileWorkspace() string {
+	if m.returning {
+		return m.renderBrowserWorkspace(false)
 	}
-	listH := h - 2
-	context := m.machineContext(sideW - 4)
-	contextH := min(lipgloss.Height(context), max(0, listH-6))
-	if m.width < 72 {
-		listH = max(4, h/2) - 2
-		contextH = 0
-	}
-	files := m.statusFiles()
-	cur := statusCursor(&m)
-	rows := []string{m.filterLine()}
-	limit := max(1, (listH-contextH-2)/m.statusRowHeight())
-	start := visibleStart(cur, len(files), limit, m.listOffsets[TabStatus])
-	for i := start; i < min(len(files), start+limit); i++ {
-		prefix := "  "
-		if i == cur {
-			prefix = "> "
-		}
-		rows = append(rows, listRow(prefix+safeTerminal(files[i].Path), sideW-4, i == cur))
-		if m.statusRowHeight() == 2 {
-			meta := "  " + dashboardState(files[i].State)
-			if files[i].Portability != "" {
-				meta += " · " + safeTerminal(files[i].Portability)
-			}
-			rows = append(rows, listRow(meta, sideW-4, i == cur))
-		}
-	}
-	if len(files) == 0 {
-		empty := "Nothing tracked yet."
-		if m.search.Value() != "" {
-			empty = "No matches · Esc clears filter."
-		}
-		if m.dashboardLoading {
-			empty = "Loading status…"
-		}
-		rows = append(rows, empty)
-	}
-	rows = append(rows, fmt.Sprintf("%d / %d files", max(0, cur+1), len(files)))
-	left := region(strings.Join(rows, "\n"), sideW-4, listH-contextH)
-	if contextH > 0 {
-		left += "\n" + region(context, sideW-4, contextH)
-	}
-	leftH := h
-	if m.width < 72 {
-		leftH = listH + 2
-	}
-	left = panel("Tracked Files", left, sideW, leftH, true)
-	mainW, mainH := m.width-sideW, h
-	if m.width < 72 {
-		mainW, mainH = m.width, h-leftH
-	}
-	info := "Track files to version HOME files into the repository, or Adopt files to bring the repository here."
-	if cur >= 0 {
-		e := files[cur]
-		meta := ""
-		if e.Portability != "" {
-			meta = e.Portability
-		}
-		if e.Impact != "" {
-			meta += " · " + e.Impact
-		}
-		if e.Assignment != "" {
-			meta += " · " + e.Assignment
-		}
-		info = safeTerminal(e.Path) + "\nTarget: " + safeTerminal(e.Dest) + " · " + dashboardState(e.State) + "\n" + safeTerminal(meta)
-	}
-	infoH := min(3, max(0, mainH-5))
-	diff := m.previewRegion(mainW-4, mainH-infoH-3)
-	if m.width >= 72 {
-		diffH := max(1, mainH-infoH-2)
-		diff = panel("Unified diff · J/K", m.previewRegion(mainW-8, diffH-2), mainW-4, diffH, false)
-	}
-	right := panel("Status & Diff Inspector", region(info, mainW-4, infoH)+"\n"+diff, mainW, mainH, false)
-	body := lipgloss.JoinHorizontal(lipgloss.Top, left, right)
-	if m.width < 72 {
-		body = left + "\n" + right
-	}
-	return m.workspaceFrame(body, true)
+	return m.renderLegacyFileWorkspace()
 }
 
 func (m *model) resizePreview() {
+	if m.returning {
+		offset := m.previewViewport.YOffset()
+		m.previewViewport.SetWidth(max(1, m.browserPreviewWidth()-4))
+		m.previewViewport.SetHeight(max(1, m.workspaceHeight()-2-m.browserInfoHeight()-1))
+		m.previewViewport.SoftWrap = true
+		m.previewViewport.SetContent(m.previewText())
+		m.previewViewport.SetYOffset(offset)
+		return
+	}
 	h := m.workspaceHeight()
 	w := m.width - m.sidebarWidth() - 8
 	previewH := h - min(6, max(2, h-6)) - 4
@@ -502,8 +436,8 @@ func (m *model) resizeTextViewport() {
 
 func (m model) renderKeyHelp() string {
 	lines := []string{
-		"Navigation", "Tab/Shift+Tab Next / previous tab (wraps 1–6)", "1–6          Jump to a tab", "j/k, ↑/↓     Move through files", "PgUp/PgDn    Move one page", "Home/End     First / last file", "h/←          Collapse folder / move to parent", "l/→, Enter   Expand folder", "/            Filter; Enter searches all HOME folders in Track", "J/K          Scroll diff", "",
-		"Selection and review", "Space        Select exact file / snapshot folder", "e            Edit metadata", "M            Edit logical file metadata", "m            Retarget Track assignment", "Ctrl+N/P     Focus next / previous Settings control", "s            Compose Adopt profiles", "p            Review exact plan (Status: read-only diff)", "a            Continue to Cancel-default confirmation", "u/d/b        Separate required review acknowledgments", "",
+		"Navigation", "Tab/Shift+Tab Next / previous tab (wraps 1–6)", "1–6          Jump to a tab", "j/k, ↑/↓     Move through files", "PgUp/PgDn    Move one page", "Home/End     First / last file", "h/←          Collapse folder / move to parent", "l/→, Enter   Open folder", "f            Track: all HOME files / tracked only", "/            Search paths; all HOME Enter searches unloaded folders", "J/K          Scroll diff", "",
+		"Selection and review", "Space        Status: expand/collapse preview; Track: options/select", "e            Edit metadata", "M            Edit logical file metadata", "m            Retarget Track assignment", "Ctrl+N/P     Focus next / previous Settings control", "s            Compose Adopt profiles", "p            Review exact plan (Status: read-only diff)", "a            Continue to Cancel-default confirmation", "u/d/b        Separate required review acknowledgments", "",
 		"Other actions", "H            Toggle hidden files", "r            Rescan inventory", "P            Packages (Git Sync: explicit push)", "W            Settings", "Esc          Back / clear filter / cancel", "q            Quit", "", "Browsing never authorizes changes. Apply requires an exact reviewed plan.",
 	}
 	offset := min(m.helpOffset, max(0, len(lines)-(m.workspaceHeight()-2)))

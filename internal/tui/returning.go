@@ -23,6 +23,10 @@ type DashboardEntry struct {
 	Portability string
 	Impact      string
 	Assignment  string
+	Kind        string
+	Tracked     int
+	Changed     int
+	Missing     int
 }
 
 // DashboardData feeds the always-visible status table on returning-home.
@@ -164,7 +168,7 @@ func (m model) updateReturning(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				m.search.SetValue("")
 				m.tabCursors[TabStatus] = 0
 				m.message = "Filter cleared."
-				return m, nil
+				return m, m.statusHighlight()
 			case "enter":
 				m.searching = false
 				m.search.Blur()
@@ -173,7 +177,7 @@ func (m model) updateReturning(key tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 				var cmd tea.Cmd
 				m.search, cmd = m.search.Update(key)
 				m.tabCursors[TabStatus] = 0
-				return m, cmd
+				return m, tea.Batch(cmd, m.statusHighlight())
 			}
 		}
 		return m.updateStatusTab(key)
