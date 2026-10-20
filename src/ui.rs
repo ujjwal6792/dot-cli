@@ -2,6 +2,8 @@ use crate::{
     backend::{self, Filter, Row, Snapshot},
     config::{Config, atomic_write},
     git, migration,
+    onboarding::{self, SetupKind, SetupReport},
+    operation_screen::{self, View as OperationView},
     operations::{self, Action, Outcome, Plan},
     sync,
 };
@@ -23,6 +25,7 @@ use std::{
 };
 
 const UNTRACKED_TEXT: Color = Color::Rgb(160, 168, 180);
+const FOCUS_BORDER: Color = Color::Rgb(97, 218, 179);
 fn selection_style() -> Style {
     Style::default()
         .fg(Color::Rgb(248, 250, 252))
@@ -72,6 +75,10 @@ enum Control {
 #[derive(Clone, Debug)]
 enum Modal {
     Setup,
+    Welcome {
+        report: SetupReport,
+        scroll: u16,
+    },
     Confirm {
         command: Control,
         text: String,
@@ -83,7 +90,11 @@ enum Modal {
     },
     Review {
         plan: Plan,
-        scroll: u16,
+        view: OperationView,
+    },
+    Outcome {
+        outcome: Outcome,
+        view: OperationView,
     },
     Text {
         title: String,
@@ -93,8 +104,16 @@ enum Modal {
 }
 enum Work {
     ConfigMessage(Config, String),
+    Welcome(Config, SetupReport),
     Snapshot(Snapshot),
-    Preview { key: String, text: String },
+    Directory {
+        directory: String,
+        entries: BTreeSet<String>,
+    },
+    Preview {
+        key: String,
+        text: String,
+    },
     Plan(Plan),
     Applied(Config, Outcome),
     Message(String),
@@ -121,6 +140,8 @@ struct Areas {
     modal: Rect,
     footer: Vec<(Rect, KeyCode)>,
     setup: Vec<(Rect, KeyCode)>,
+    welcome_scroll_max: u16,
+    operation: operation_screen::Areas,
     tabs: Vec<(Rect, Pane, usize)>,
 }
 
@@ -236,10 +257,17 @@ impl App {
     }
     fn refresh(&mut self) {
         let c = self.config.clone();
+        let directory = self.directory.clone();
         self.launch_job(
             JobKind::Inspection,
             "Inspecting chezmoi and Git",
-            move || Ok(Work::Snapshot(backend::snapshot(&c)?)),
+            move || {
+                let mut snapshot = backend::snapshot(&c)?;
+                if !directory.is_empty() {
+                    backend::inspect_directory(&c, &mut snapshot, &directory)?;
+                }
+                Ok(Work::Snapshot(snapshot))
+            },
         );
     }
     fn rebuild(&mut self) {
@@ -284,13 +312,27 @@ impl App {
                     self.last_refresh = Instant::now();
                     self.notice = "Ready · HOME, source and Git state are separate".into();
                 }
+                Ok(Work::Directory { directory, entries }) => {
+                    self.snapshot
+                        .directory_entries
+                        .insert(directory.clone(), entries);
+                    if directory == self.directory {
+                        self.rebuild();
+                        self.preview_key.clear();
+                    }
+                }
                 Ok(Work::Preview { key, text }) => {
                     if key == self.current_key() {
                         self.detail = text;
                         self.scroll = 0;
                     }
                 }
-                Ok(Work::Plan(p)) => self.modal = Some(Modal::Review { plan: p, scroll: 0 }),
+                Ok(Work::Plan(p)) => {
+                    self.modal = Some(Modal::Review {
+                        plan: p,
+                        view: OperationView::default(),
+                    })
+                }
                 Ok(Work::Applied(c, r)) => {
                     self.config = c;
                     self.notice = format!(
@@ -300,10 +342,9 @@ impl App {
                         r.not_attempted.len(),
                         r.message
                     );
-                    self.modal = Some(Modal::Text {
-                        title: "Operation result".into(),
-                        text: serde_json::to_string_pretty(&r).unwrap_or_default(),
-                        scroll: 0,
+                    self.modal = Some(Modal::Outcome {
+                        outcome: r,
+                        view: OperationView::default(),
                     });
                     self.selected.clear();
                     self.git_selected.clear();
@@ -318,6 +359,12 @@ impl App {
                         text: t,
                         scroll: 0,
                     });
+                    self.refresh();
+                }
+                Ok(Work::Welcome(c, report)) => {
+                    self.config = c;
+                    self.directory.clear();
+                    self.modal = Some(Modal::Welcome { report, scroll: 0 });
                     self.refresh();
                 }
                 Ok(Work::Message(t)) => {
@@ -351,12 +398,37 @@ impl App {
         {
             self.refresh();
         }
+        if self.job.is_none()
+            && self.modal.is_none()
+            && !self.refresh_failed
+            && !self.snapshot.observed_at.is_empty()
+            && !self
+                .snapshot
+                .directory_entries
+                .contains_key(&self.directory)
+        {
+            let c = self.config.clone();
+            let mut snapshot = self.snapshot.clone();
+            let directory = self.directory.clone();
+            self.launch_job(
+                JobKind::Inspection,
+                "Checking folder ignore rules",
+                move || {
+                    backend::inspect_directory(&c, &mut snapshot, &directory)?;
+                    let entries = snapshot
+                        .directory_entries
+                        .remove(&directory)
+                        .unwrap_or_default();
+                    Ok(Work::Directory { directory, entries })
+                },
+            );
+        }
         if self.job.is_none() && self.modal.is_none() {
             let key = self.current_key();
             if key != self.preview_key {
                 self.preview_key = key.clone();
                 let c = self.config.clone();
-                let s = self.snapshot.clone();
+                let mut s = self.snapshot.clone();
                 let pane = self.context();
                 let tab = self.detail_tab;
                 let selected = self.rows.get(self.cursor).cloned();
@@ -367,9 +439,9 @@ impl App {
                     else if pane==Pane::Status{format!("Machine: {}\nHOME: {}\nSource: {}\nObserved: {}\n\nGit: {}\nUpstream: {}\n↑{} outgoing · ↓{} incoming (last fetched)\n{}\n\nHOME differences: {}\nSource changes: {}\nAutomatic sync: {}\nReports: {}",c.machine,c.home.display(),c.source.display(),s.observed_at,s.git.branch,s.git.upstream,s.git.ahead,s.git.behind,s.git.error.clone().unwrap_or_default(),s.changes.len(),s.git.files.len(),c.sync_enabled,c.reporting)}
                     else if pane==Pane::Activity{serde_json::to_string_pretty(&operations::history(&c)?)?}
                     else if pane==Pane::Git{if hist{s.git.commits.join("\n")}else if let Some(f)=gf{format!("Source ↔ Git · {}\n\nUNSTAGED\n{}\nSTAGED\n{}",f.path,git::diff(&c,std::slice::from_ref(&f.path),false)?,git::diff(&c,std::slice::from_ref(&f.path),true)?)}else{"No source changes. Commit history: press h in Git.".into()}}
-                    else if let Some(row)=selected{if row.directory{let rows=backend::rows(&c,&s,&row.path,Filter::All,"")?;format!("~/{} · {} managed descendants\n\n{}",row.path,row.children,rows.iter().map(|r|format!("{} {}{}",r.status,r.name,if r.directory{"/"}else{""})).collect::<Vec<_>>().join("\n"))}
+                    else if let Some(row)=selected{if row.directory{backend::inspect_directory(&c,&mut s,&row.path)?;let rows=backend::rows(&c,&s,&row.path,Filter::All,"")?;format!("~/{} · {} managed descendants\n\n{}",row.path,row.children,rows.iter().map(|r|format!("{} {}{}",r.status,r.name,if r.directory{"/"}else{""})).collect::<Vec<_>>().join("\n"))}
                         else if let Some(m)=s.managed.get(&row.path){match tab{1=>format!("SOURCE {}\n\n{}",m.source_relative,fs::read_to_string(&m.source_absolute).unwrap_or_else(|_|"Binary or unavailable source".into())),2=>format!("HOME: {}\nSource: {}\nAutomatic updates here: {}\nNative chezmoi source semantics apply.\n\nUse Edit source for templates and shared/OS/machine settings.",m.absolute,m.source_relative,c.enabled.contains(&row.path)),3=>serde_json::to_string_pretty(&operations::history(&c)?.into_iter().filter(|e|e.paths.contains(&row.path)).collect::<Vec<_>>())?,_=>{let d=backend::preview(&c,std::slice::from_ref(&row.path),false)?;format!("SOURCE → HOME · {}\n\n{}",row.path,if d.is_empty(){"HOME matches rendered source. Check Git for unpublished changes.".into()}else{d})}}}
-                        else{format!("UNTRACKED ~/{}\n\nSelect with Space, then Capture to add through chezmoi.\n\n{}",row.path,fs::read_to_string(c.home.join(&row.path)).unwrap_or_else(|_|"Binary or unavailable file".into()))}}
+                        else if crate::ignores::eligible(&c, std::slice::from_ref(&row.path))?.is_empty(){format!("IGNORED ~/{}\n\nCapture skips this file because of .chezmoiignore. Edit that file to change the rule.\n\nPress i to add an explicit ignore rule to both chezmoi and Git.",row.path)}else{format!("UNTRACKED ~/{}\n\nSelect with Space, then Capture to add through chezmoi.\n\n{}",row.path,fs::read_to_string(c.home.join(&row.path)).unwrap_or_else(|_|"Binary or unavailable file".into()))}}
                     else{"Select a file or source change.".into()};Ok(Work::Preview{key,text})
                 });
             }
@@ -397,7 +469,7 @@ impl App {
         )
     }
     fn paths(&self, action: Action) -> Vec<String> {
-        if action.files() {
+        if action.files() || (action == Action::Ignore && self.context() != Pane::Git) {
             if self.selected.is_empty() {
                 self.rows
                     .get(self.cursor)
@@ -425,11 +497,21 @@ impl App {
         let c = self.config.clone();
         let paths = if matches!(
             action,
-            Action::Commit | Action::Fetch | Action::Pull | Action::Push | Action::Setting
+            Action::Commit
+                | Action::Fetch
+                | Action::Pull
+                | Action::Push
+                | Action::Setting
+                | Action::IgnoreDefaults
         ) {
             vec![]
         } else {
             self.paths(action)
+        };
+        let payload = if action == Action::Ignore && self.context() == Pane::Git {
+            Some("source".into())
+        } else {
+            payload
         };
         self.modal = None;
         self.launch(action.label(), move || {
@@ -492,7 +574,10 @@ impl App {
         self.set_tab(self.pane, next);
     }
     fn move_cursor(&mut self, delta: isize) {
-        if self.pane == Pane::Git {
+        self.move_pane_cursor(self.pane, delta);
+    }
+    fn move_pane_cursor(&mut self, pane: Pane, delta: isize) {
+        if pane == Pane::Git {
             let n = if self.history_view {
                 self.snapshot.git.commits.len()
             } else {
@@ -503,14 +588,14 @@ impl App {
                 .saturating_add_signed(delta)
                 .min(n.saturating_sub(1));
             self.git_state.select(Some(self.git_cursor));
-        } else if self.pane == Pane::Files {
+        } else if pane == Pane::Files {
             self.cursor = self
                 .cursor
                 .saturating_add_signed(delta)
                 .min(self.rows.len().saturating_sub(1));
             self.file_state.select(Some(self.cursor));
         } else {
-            let scroll = match self.pane {
+            let scroll = match pane {
                 Pane::Status => &mut self.status_scroll,
                 Pane::Machines => &mut self.machines_scroll,
                 Pane::Activity => &mut self.activity_scroll,
@@ -577,7 +662,15 @@ impl App {
         }
         if self.modal.is_some() {
             if key.code == KeyCode::Char('q')
-                && matches!(self.modal, Some(Modal::Text { .. } | Modal::Setup))
+                && matches!(
+                    self.modal,
+                    Some(
+                        Modal::Text { .. }
+                            | Modal::Setup
+                            | Modal::Welcome { .. }
+                            | Modal::Outcome { .. }
+                    )
+                )
             {
                 return self.request_quit();
             }
@@ -664,8 +757,15 @@ impl App {
                 })
             }
             KeyCode::Char('c') if self.pane == Pane::Files => self.action(Action::Capture, None),
+            KeyCode::Char('i') if self.pane == Pane::Files => self.action(Action::Ignore, None),
+            KeyCode::Char('i') if self.pane == Pane::Git && !self.history_view => {
+                self.action(Action::Ignore, None)
+            }
             KeyCode::Char('a') if self.pane == Pane::Files => self.action(Action::Apply, None),
             KeyCode::Char('r') if self.pane == Pane::Files => self.action(Action::Restore, None),
+            KeyCode::Char('d') | KeyCode::Delete if self.pane == Pane::Files => {
+                self.action(Action::Forget, None)
+            }
             KeyCode::Char('d') if self.pane == Pane::Git && !self.history_view => {
                 self.action(Action::Discard, None)
             }
@@ -707,6 +807,29 @@ impl App {
     fn modal_key(&mut self, key: KeyEvent) {
         let modal = self.modal.take().unwrap();
         match modal {
+            Modal::Welcome { report, mut scroll } => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => {
+                        self.pane = Pane::Files;
+                        self.detail_owner = Pane::Files;
+                        return;
+                    }
+                    KeyCode::Char('d') => {
+                        self.modal = Some(Modal::Text {
+                            title: "Setup details".into(),
+                            text: report.message(&self.config.source),
+                            scroll: 0,
+                        });
+                        return;
+                    }
+                    KeyCode::Down | KeyCode::Char('j') => {
+                        scroll = scroll.saturating_add(1).min(self.areas.welcome_scroll_max)
+                    }
+                    KeyCode::Up | KeyCode::Char('k') => scroll = scroll.saturating_sub(1),
+                    _ => {}
+                }
+                self.modal = Some(Modal::Welcome { report, scroll });
+            }
             Modal::Setup => match key.code {
                 KeyCode::Char('i') => self.menu_action(26),
                 KeyCode::Char('c') => {
@@ -763,7 +886,8 @@ impl App {
                             let c = self.config.clone();
                             let p = self.config_path.clone();
                             self.launch("Initializing source", move || {
-                                Ok(Work::Message(initialize(&c, &p, Some(&text))?))
+                                let report = initialize(&c, &p, Some(&text))?;
+                                Ok(Work::Welcome(c, report))
                             });
                         }
                         Purpose::Commit => self.action(Action::Commit, Some(text)),
@@ -833,7 +957,7 @@ impl App {
                 text = chars.into_iter().collect();
                 self.modal = Some(Modal::Input { purpose, text });
             }
-            Modal::Review { plan, mut scroll } => match key.code {
+            Modal::Review { plan, mut view } => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 KeyCode::Char('y') => {
                     let mut c = self.config.clone();
@@ -844,15 +968,23 @@ impl App {
                     });
                 }
                 _ => {
-                    if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                        scroll = scroll.saturating_add(1);
-                    }
-                    if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
-                        scroll = scroll.saturating_sub(1);
-                    }
-                    self.modal = Some(Modal::Review { plan, scroll });
+                    view.key(key.code, self.areas.operation.max_scroll);
+                    self.modal = Some(Modal::Review { plan, view });
                 }
             },
+            Modal::Outcome { outcome, mut view } => {
+                match key.code {
+                    KeyCode::Enter | KeyCode::Esc => return,
+                    KeyCode::Char('g') => {
+                        self.pane = Pane::Git;
+                        self.detail_owner = Pane::Git;
+                        self.history_view = false;
+                        return;
+                    }
+                    _ => view.key(key.code, self.areas.operation.max_scroll),
+                }
+                self.modal = Some(Modal::Outcome { outcome, view });
+            }
             Modal::Text {
                 title,
                 text,
@@ -973,7 +1105,8 @@ impl App {
                 let c = self.config.clone();
                 let p = self.config_path.clone();
                 self.launch("Initializing local source", move || {
-                    Ok(Work::Message(initialize(&c, &p, None)?))
+                    let report = initialize(&c, &p, None)?;
+                    Ok(Work::Welcome(c, report))
                 });
             }
             27 => {
@@ -989,6 +1122,8 @@ impl App {
                     scroll: 0,
                 })
             }
+            32 => self.action(Action::Ignore, None),
+            33 => self.action(Action::IgnoreDefaults, None),
             29..=31 => {
                 self.modal = Some(Modal::Input {
                     purpose: Purpose::Setting(match i {
@@ -1047,8 +1182,19 @@ impl App {
                 let mut c = self.config.clone();
                 let p = self.config_path.clone();
                 self.launch("Archiving and switching source", move || {
+                    let first_setup = !c.source.exists();
                     let msg = switch_source(&mut c, &p, &target)?;
-                    Ok(Work::ConfigMessage(c, msg))
+                    if first_setup {
+                        Ok(Work::Welcome(
+                            c,
+                            SetupReport {
+                                kind: SetupKind::Existing,
+                                details: msg,
+                            },
+                        ))
+                    } else {
+                        Ok(Work::ConfigMessage(c, msg))
+                    }
                 });
             }
             Control::Recover(id) => {
@@ -1078,7 +1224,20 @@ impl App {
                     self.modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
                 }
                 MouseEventKind::Down(event::MouseButton::Left) => {
-                    if matches!(self.modal, Some(Modal::Setup)) {
+                    if matches!(
+                        self.modal,
+                        Some(Modal::Review { .. } | Modal::Outcome { .. })
+                    ) {
+                        if let Some((_, code)) = self
+                            .areas
+                            .operation
+                            .controls
+                            .iter()
+                            .find(|(r, _)| r.contains(pos))
+                        {
+                            self.key(KeyEvent::new(*code, KeyModifiers::NONE));
+                        }
+                    } else if matches!(self.modal, Some(Modal::Setup | Modal::Welcome { .. })) {
                         if let Some((_, code)) =
                             self.areas.setup.iter().find(|(r, _)| r.contains(pos))
                         {
@@ -1098,10 +1257,8 @@ impl App {
                                 self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                             }
                         }
-                    } else if matches!(
-                        self.modal,
-                        Some(Modal::Review { .. } | Modal::Confirm { .. })
-                    ) && mouse.row == self.areas.modal.bottom().saturating_sub(1)
+                    } else if matches!(self.modal, Some(Modal::Confirm { .. }))
+                        && mouse.row == self.areas.modal.bottom().saturating_sub(1)
                     {
                         self.modal_key(KeyEvent::new(
                             if mouse.column < self.areas.modal.x + 20 {
@@ -1158,14 +1315,14 @@ impl App {
             None
         };
         if let Some(pane) = pane {
-            self.pane = pane;
-            if pane != Pane::Details {
-                self.detail_owner = pane;
-            }
             match mouse.kind {
-                MouseEventKind::ScrollDown => self.move_cursor(3),
-                MouseEventKind::ScrollUp => self.move_cursor(-3),
+                MouseEventKind::ScrollDown => self.move_pane_cursor(pane, 3),
+                MouseEventKind::ScrollUp => self.move_pane_cursor(pane, -3),
                 MouseEventKind::Down(event::MouseButton::Left) => {
+                    self.pane = pane;
+                    if pane != Pane::Details {
+                        self.detail_owner = pane;
+                    }
                     if pane == Pane::Files && mouse.row >= self.areas.files.y + 2 {
                         let index = self.file_state.offset()
                             + (mouse.row - (self.areas.files.y + 2)) as usize;
@@ -1206,13 +1363,32 @@ impl App {
     }
     pub fn draw(&mut self, f: &mut Frame) {
         let area = f.area();
+        self.areas = Areas::default();
+        if let Some(Modal::Welcome { report, scroll }) = &self.modal {
+            let (button, max_scroll) =
+                onboarding::draw(f, area, &self.config.source, report, *scroll);
+            self.areas.modal = area;
+            self.areas.setup.push((button, KeyCode::Enter));
+            self.areas.welcome_scroll_max = max_scroll;
+            return;
+        }
+        match &self.modal {
+            Some(Modal::Review { plan, view }) => {
+                self.areas.operation = operation_screen::review(f, &self.config, plan, view);
+                return;
+            }
+            Some(Modal::Outcome { outcome, view }) => {
+                self.areas.operation = operation_screen::result(f, &self.config, outcome, view);
+                return;
+            }
+            _ => {}
+        }
         let outer = Layout::vertical([
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
-        self.areas = Areas::default();
         if area.width < 80 || area.height < 22 || self.expanded {
             match self.pane {
                 Pane::Status => self.draw_status(f, outer[0]),
@@ -1256,6 +1432,8 @@ impl App {
             vec![
                 ("Space Select", KeyCode::Char(' ')),
                 ("c Capture", KeyCode::Char('c')),
+                ("d Remove", KeyCode::Char('d')),
+                ("i Ignore", KeyCode::Char('i')),
                 ("a Apply", KeyCode::Char('a')),
                 ("r Restore", KeyCode::Char('r')),
                 ("f Filter", KeyCode::Char('f')),
@@ -1266,6 +1444,7 @@ impl App {
             vec![
                 ("Space Stage", KeyCode::Char(' ')),
                 ("c Commit", KeyCode::Char('c')),
+                ("i Ignore", KeyCode::Char('i')),
                 ("P Push", KeyCode::Char('P')),
                 ("L Pull", KeyCode::Char('L')),
                 (": Actions", KeyCode::Char(':')),
@@ -1280,13 +1459,19 @@ impl App {
                 ("? Help", KeyCode::Char('?')),
             ]
         };
-        bindings.splice(
-            0..0,
-            [
-                ("[ Prev", KeyCode::Char('[')),
-                ("] Next", KeyCode::Char(']')),
-            ],
-        );
+        let tabs = [
+            ("[ Prev", KeyCode::Char('[')),
+            ("] Next", KeyCode::Char(']')),
+        ];
+        if self.pane == Pane::Files {
+            // File actions take priority when the footer has limited space.
+            if area.width < 80 {
+                bindings.retain(|(_, code)| *code != KeyCode::Char(' '));
+            }
+            bindings.extend(tabs);
+        } else {
+            bindings.splice(0..0, tabs);
+        }
         for (label, code) in bindings {
             let width = (label.len() + 3) as u16;
             if matches!(code, KeyCode::Char(':') | KeyCode::Char('?')) {
@@ -1327,9 +1512,12 @@ impl App {
             self.areas.modal = outer[0];
             f.render_widget(Clear, outer[0]);
             match modal {
+                Modal::Welcome { .. } | Modal::Review { .. } | Modal::Outcome { .. } => {
+                    unreachable!("Dedicated screens are rendered before the workspace")
+                }
                 Modal::Setup => {
                     let block = Block::bordered()
-                        .title("Connect your dotfiles")
+                        .title("Welcome to dot · Save and reuse your app settings")
                         .title_bottom("[Enter / Esc Back · q / Ctrl+C Quit]");
                     let inner = block.inner(outer[0]);
                     f.render_widget(block, outer[0]);
@@ -1343,15 +1531,24 @@ impl App {
                     ])
                     .split(inner);
                     f.render_widget(Paragraph::new(format!(
-                        "Source does not exist: {}\nChoose a setup action below. HOME configs are not applied.\nInitialization also installs the dot agent skill.",
+                        "Choose where dot will keep copies of your settings.\nThe folder below hasn't been created yet:\n{}\nYour apps' current settings won't change during setup.",
                         self.config.source.display()
                     )).wrap(Wrap { trim: false }), areas[0]);
                     self.areas.setup.clear();
                     for (index, (label, code)) in [
-                        ("[i] Initialize a new local source", KeyCode::Char('i')),
-                        ("[c] Clone a repository", KeyCode::Char('c')),
-                        ("[o] Connect an existing checkout", KeyCode::Char('o')),
-                        ("[Esc] Browse HOME without setup", KeyCode::Esc),
+                        (
+                            "[i] Start fresh · Create a settings folder",
+                            KeyCode::Char('i'),
+                        ),
+                        (
+                            "[c] Download settings from a Git repository",
+                            KeyCode::Char('c'),
+                        ),
+                        (
+                            "[o] Use a settings folder already on this computer",
+                            KeyCode::Char('o'),
+                        ),
+                        ("[Esc] Explore my files without setup", KeyCode::Esc),
                     ]
                     .into_iter()
                     .enumerate()
@@ -1380,26 +1577,6 @@ impl App {
                         .highlight_style(selection_style())
                         .highlight_symbol("› ");
                     f.render_stateful_widget(list, outer[0], &mut self.menu_state);
-                }
-                Modal::Review { plan, scroll } => {
-                    let text = format!(
-                        "{}\n\nExact targets: {}\n{}\n\n{}\n\nApproval: {}\n[y] Execute this reviewed operation · [Esc] Cancel",
-                        plan.action.label(),
-                        plan.paths.len(),
-                        plan.paths.join("\n"),
-                        plan.preview,
-                        plan.id
-                    );
-                    f.render_widget(
-                        Paragraph::new(diff_text(&text))
-                            .block(
-                                Block::bordered()
-                                    .title("Review · y executes · Esc cancels")
-                                    .title_bottom("[y Execute]         [Esc Cancel]"),
-                            )
-                            .scroll((scroll, 0)),
-                        outer[0],
-                    );
                 }
                 Modal::Text {
                     title,
@@ -1466,11 +1643,18 @@ impl App {
         }
     }
     fn block(&self, title: String, pane: Pane) -> Block<'static> {
-        let block = Block::bordered().border_style(Style::default().fg(if self.pane == pane {
-            Color::Rgb(108, 118, 137)
-        } else {
-            Color::Rgb(73, 80, 94)
-        }));
+        let focused = self.pane == pane;
+        let block = Block::bordered()
+            .border_type(if focused {
+                BorderType::Double
+            } else {
+                BorderType::Plain
+            })
+            .border_style(if focused {
+                Style::default().fg(FOCUS_BORDER).bold()
+            } else {
+                Style::default().fg(Color::Rgb(73, 80, 94))
+            });
         if title.is_empty() {
             block
         } else {
@@ -1494,7 +1678,11 @@ impl App {
         let mut spans = vec![Span::styled(
             prefix.clone(),
             Style::default()
-                .fg(Color::Rgb(196, 167, 231))
+                .fg(if self.pane == pane {
+                    FOCUS_BORDER
+                } else {
+                    Color::Rgb(196, 167, 231)
+                })
                 .add_modifier(Modifier::BOLD),
         )];
         let mut x =
@@ -1508,7 +1696,7 @@ impl App {
             let style = if index == selected {
                 Style::default()
                     .fg(if self.pane == pane {
-                        Color::LightCyan
+                        FOCUS_BORDER
                     } else {
                         Color::Rgb(224, 229, 238)
                     })
@@ -1778,7 +1966,7 @@ const MENU: &[&str] = &[
     "Capture selected HOME changes → source",
     "Apply selected source → HOME",
     "Restore selected HOME from source",
-    "Stop tracking selected (shared source)",
+    "Remove saved copies from dot (keep original files)",
     "Enable selected for automatic updates here",
     "Disable selected automatic updates here",
     "Edit selected source",
@@ -1807,8 +1995,10 @@ const MENU: &[&str] = &[
     "Set shared setting",
     "Set OS override",
     "Set machine override",
+    "Ignore selected files in chezmoi and Git",
+    "Add developer ignore defaults to both files",
 ];
-const HELP: &str = "1 Status · 2 Files · 3 Git · 4 Machines · 0 Details\nTab focus next pane · z expand focused pane · Esc return\n↑/↓ or j/k move · PgUp/PgDn scroll\nFiles: →/l enter folder · ←/h parent · Space select · / filter · f All/Managed/Changed\nFiles: c capture HOME → source · a apply · r restore · e edit source\nGit: Space stage/unstage · v multi-select · c commit · d discard source → HEAD\nGit: h changes/history · F fetch · L pull · P push\n[/] previous/next tab in focused section · click tab labels · Enter focus details\n: all actions, Settings, Machines, Activity, Recovery, Packages\nR refresh · ? help · q quit when idle\nMouse: click panes/rows/footer hints · wheel scroll pane\nText fields receive all character keys before global commands. Paste supported.\nNative chezmoi previews may evaluate repository templates/hooks.\nHOME changes, source changes, staged changes and unpublished commits are distinct.";
+const HELP: &str = "1 Status · 2 Files · 3 Git · 4 Machines · 0 Details\nTab focus next pane · z expand focused pane · Esc return\n↑/↓ or j/k move · PgUp/PgDn scroll\nFiles: →/l enter folder · ←/h parent · Space select · / filter · f All/Managed/Changed\nFiles: c capture HOME → source · a apply · r restore · e edit source\nFiles / Git: i ignore in both chezmoi and Git; review then y\nCapture skips .DS_Store, node_modules, target, Python caches and .venv by default.\nFiles: d / Delete remove saved copies from dot (original files stay)\nGit: Space stage/unstage · v multi-select · c commit · d discard source → HEAD\nGit: h changes/history · F fetch · L pull · P push\n[/] previous/next tab in focused section · click tab labels · Enter focus details\n: all actions, Settings, Machines, Activity, Recovery, Packages\nR refresh · ? help · q quit when idle\nMouse: click panes/rows/footer hints · wheel scroll pane\nText fields receive all character keys before global commands. Paste supported.\nNative chezmoi previews may evaluate repository templates/hooks.\nHOME changes, source changes, staged changes and unpublished commits are distinct.";
 
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -1948,7 +2138,8 @@ pub fn switch_source(c: &mut Config, config_path: &Path, target: &Path) -> Resul
     ))
 }
 
-pub fn initialize(c: &Config, path: &Path, repo: Option<&str>) -> Result<String> {
+pub fn initialize(c: &Config, path: &Path, repo: Option<&str>) -> Result<SetupReport> {
+    let existed = c.source.exists();
     if let Some(repo) = repo {
         if repo.starts_with('-') || repo.contains('\n') {
             bail!("Invalid repository address");
@@ -1969,12 +2160,21 @@ pub fn initialize(c: &Config, path: &Path, repo: Option<&str>) -> Result<String>
             git::run(c, &["init", "-b", "main"])?;
         }
     }
+    crate::ignores::install_defaults(c)?;
     c.save(path)?;
     let skill = install_skill(c)?;
-    Ok(format!(
-        "Connected {}. HOME has not been applied.\n{skill}",
-        c.source.display()
-    ))
+    Ok(SetupReport {
+        kind: if repo.is_some() {
+            SetupKind::Cloned
+        } else if existed {
+            SetupKind::Existing
+        } else {
+            SetupKind::Created
+        },
+        details: format!(
+            "Developer ignore defaults are ready in .chezmoiignore and .gitignore.\n{skill}"
+        ),
+    })
 }
 
 #[cfg(test)]
@@ -2096,6 +2296,487 @@ mod tests {
                 .any(|(_, pane, index)| *pane == Pane::Details && *index == 3)
         );
     }
+    #[test]
+    fn focused_panel_has_a_bright_double_border_and_remove_is_discoverable() {
+        let (_t, mut a) = app();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let files = a.areas.files;
+        let git = a.areas.git;
+        let edge = |r: Rect| (r.right() - 1, r.y + 1);
+        assert_eq!(term.backend().buffer()[edge(files)].fg, FOCUS_BORDER);
+        assert_eq!(term.backend().buffer()[edge(files)].symbol(), "║");
+        assert_ne!(term.backend().buffer()[edge(git)].fg, FOCUS_BORDER);
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: git.right() - 1,
+            row: git.y + 1,
+            modifiers: KeyModifiers::NONE,
+        });
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(term.backend().buffer()[edge(git)].fg, FOCUS_BORDER);
+        assert_eq!(term.backend().buffer()[edge(git)].symbol(), "║");
+        assert_ne!(term.backend().buffer()[edge(files)].fg, FOCUS_BORDER);
+        a.pane = Pane::Files;
+        for (w, h) in [(120, 35), (80, 24), (45, 14)] {
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            assert!(
+                a.areas
+                    .footer
+                    .iter()
+                    .any(|(_, key)| *key == KeyCode::Char('d')),
+                "Remove must stay visible at {w}x{h}"
+            );
+        }
+    }
+
+    #[test]
+    fn remove_saved_copy_requires_review_and_preserves_original_file() {
+        let (_t, mut a) = app();
+        initialize(&a.config, &a.config_path, None).unwrap();
+        let plan =
+            operations::plan(&a.config, Action::Capture, &[".untracked".into()], None).unwrap();
+        operations::execute(&mut a.config, &a.config_path, &plan, &plan.id).unwrap();
+        a.selected.insert(".untracked".into());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let button = a
+            .areas
+            .footer
+            .iter()
+            .find(|(_, key)| *key == KeyCode::Char('d'))
+            .unwrap()
+            .0;
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.job.is_some() && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(a.modal, Some(Modal::Review { ref plan, .. }) if plan.action == Action::Forget && plan.paths == [".untracked"])
+        );
+        term.draw(|f| a.draw(f)).unwrap();
+        let text = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Your original files stay"));
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(
+            a.config.source.join("dot_untracked").exists(),
+            "cancel must preserve the saved copy"
+        );
+        a.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while a.job.is_some() && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(matches!(a.modal, Some(Modal::Review { .. })));
+        a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(a.modal, Some(Modal::Outcome { ref outcome, .. }) if outcome.failed.is_none() && outcome.action == Action::Forget)
+        );
+        assert!(!a.config.source.join("dot_untracked").exists());
+        assert_eq!(
+            fs::read_to_string(a.config.home.join(".untracked")).unwrap(),
+            "untracked"
+        );
+    }
+
+    #[test]
+    fn mouse_focus_changes_only_on_left_click() {
+        let (_t, mut a) = app();
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        for (pane, area) in [
+            (Pane::Status, a.areas.status),
+            (Pane::Git, a.areas.git),
+            (Pane::Machines, a.areas.machines),
+            (Pane::Activity, a.areas.activity),
+            (Pane::Details, a.areas.details),
+            (Pane::Files, a.areas.files),
+        ] {
+            a.pane = Pane::Files;
+            a.detail_owner = Pane::Files;
+            let event = event::MouseEvent {
+                kind: MouseEventKind::Moved,
+                column: area.x + area.width / 2,
+                row: area.y + area.height / 2,
+                modifiers: KeyModifiers::NONE,
+            };
+            for kind in [
+                MouseEventKind::Moved,
+                MouseEventKind::Drag(event::MouseButton::Left),
+                MouseEventKind::Up(event::MouseButton::Left),
+                MouseEventKind::Down(event::MouseButton::Right),
+                MouseEventKind::Down(event::MouseButton::Middle),
+                MouseEventKind::ScrollDown,
+                MouseEventKind::ScrollUp,
+                MouseEventKind::ScrollLeft,
+                MouseEventKind::ScrollRight,
+            ] {
+                a.mouse(event::MouseEvent { kind, ..event });
+                assert_eq!(a.pane, Pane::Files, "{kind:?} over {pane:?} stole focus");
+                assert_eq!(
+                    a.detail_owner,
+                    Pane::Files,
+                    "{kind:?} changed the detail context"
+                );
+            }
+            a.mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                ..event
+            });
+            assert_eq!(a.pane, pane, "click must focus {pane:?}");
+        }
+        a.pane = Pane::Files;
+        a.detail_owner = Pane::Files;
+        a.scroll = 0;
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: a.areas.details.x + 2,
+            row: a.areas.details.y + 2,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert_eq!(
+            a.scroll, 3,
+            "wheel must still scroll the pane under the pointer"
+        );
+        assert_eq!(a.pane, Pane::Files);
+        assert_eq!(a.detail_owner, Pane::Files);
+    }
+
+    #[test]
+    fn capture_review_requires_confirmation_and_result_routes_to_git() {
+        let (_t, mut a) = app();
+        initialize(&a.config, &a.config_path, None).unwrap();
+        let plan =
+            operations::plan(&a.config, Action::Capture, &[".untracked".into()], None).unwrap();
+        a.modal = Some(Modal::Review {
+            plan,
+            view: OperationView::default(),
+        });
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
+        terminal.draw(|f| a.draw(f)).unwrap();
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.job.is_none(), "Enter must never approve a review");
+        assert!(!a.config.source.join("dot_untracked").exists());
+        // Clicking a tab switches views without executing anything.
+        let changes = a
+            .areas
+            .operation
+            .controls
+            .iter()
+            .find(|(_, key)| *key == KeyCode::Char('2'))
+            .unwrap()
+            .0;
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: changes.x,
+            row: changes.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(a.modal, Some(Modal::Review { ref view, .. }) if view.tab == 1));
+        assert!(a.job.is_none());
+        terminal.draw(|f| a.draw(f)).unwrap();
+        let confirm = a
+            .areas
+            .operation
+            .controls
+            .iter()
+            .find(|(_, key)| *key == KeyCode::Char('y'))
+            .unwrap()
+            .0;
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: confirm.x,
+            row: confirm.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(a.modal, Some(Modal::Outcome { ref outcome, .. }) if outcome.failed.is_none() && outcome.succeeded == [".untracked"])
+        );
+        assert_eq!(
+            fs::read_to_string(a.config.source.join("dot_untracked")).unwrap(),
+            "untracked"
+        );
+        assert_eq!(
+            fs::read_to_string(a.config.home.join(".untracked")).unwrap(),
+            "untracked"
+        );
+        a.key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE));
+        assert!(matches!(a.modal, Some(Modal::Outcome { ref view, .. }) if view.tab == 1));
+        a.key(KeyEvent::new(KeyCode::Char('g'), KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert_eq!(a.pane, Pane::Git);
+    }
+
+    #[test]
+    fn operation_screens_render_long_lists_failures_and_narrow_terminals() {
+        let (_t, mut a) = app();
+        a.config.source = PathBuf::from("/Users/example/.local/share/chezmoi");
+        let paths: Vec<String> = [
+            ".agents/skills/dot/SKILL.md",
+            ".config/ghostty/config",
+            ".config/nvim/init.lua",
+            ".config/nvim/lua/keymaps.lua",
+            ".config/nvim/lua/options.lua",
+            ".config/starship.toml",
+            ".gitconfig",
+            ".zshrc",
+        ]
+        .into_iter()
+        .map(String::from)
+        .collect();
+        let plan = Plan {
+            id: "preview-fixture".into(), action: Action::Capture, paths: paths.clone(),
+            payload: None, fingerprint: String::new(), created_at: String::new(),
+            preview: "diff --git a/.config/ghostty/config b/.config/ghostty/config\n--- a/.config/ghostty/config\n+++ b/.config/ghostty/config\n@@ -1,3 +1,4 @@\n-font-size = 14\n+font-size = 16\n theme = catppuccin-mocha\n+window-padding-x = 12\n\nNEW source from HOME: .config/starship.toml\nadd_newline = false\n\n[character]\nsuccess_symbol = \"[>](bold green)\"\n".into(),
+        };
+        let outcome = Outcome {
+            id: plan.id.clone(),
+            action: Action::Capture,
+            succeeded: paths.clone(),
+            failed: None,
+            not_attempted: vec![],
+            message: String::new(),
+        };
+        let partial = Outcome {
+            succeeded: paths[..2].to_vec(),
+            failed: Some(paths[2].clone()),
+            not_attempted: paths[3..].to_vec(),
+            message: "Permission denied while reading init.lua".into(),
+            ..outcome.clone()
+        };
+        for (name, modal) in [
+            (
+                "capture-files",
+                Modal::Review {
+                    plan: plan.clone(),
+                    view: OperationView::default(),
+                },
+            ),
+            (
+                "capture-changes",
+                Modal::Review {
+                    plan: plan.clone(),
+                    view: OperationView { tab: 1, scroll: 0 },
+                },
+            ),
+            (
+                "capture-result",
+                Modal::Outcome {
+                    outcome: outcome.clone(),
+                    view: OperationView::default(),
+                },
+            ),
+            (
+                "capture-partial",
+                Modal::Outcome {
+                    outcome: partial,
+                    view: OperationView::default(),
+                },
+            ),
+        ] {
+            for (w, h) in [(120, 35), (80, 24), (45, 14), (20, 8)] {
+                a.modal = Some(modal.clone());
+                let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| a.draw(f)).unwrap();
+                let text = term
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(!text.contains("\"succeeded\""));
+                assert!(!text.contains("Space Select"));
+                assert!(
+                    text.contains("y Capture") || text.contains("Enter Done"),
+                    "primary control must remain visible at {w}x{h}"
+                );
+                if w >= 80 {
+                    assert!(text.contains("Esc Cancel") || text.contains("Enter Done"));
+                    if name == "capture-partial" {
+                        assert!(text.contains("Permission denied"));
+                        assert!(text.contains("Capture stopped"));
+                    }
+                }
+                if let Ok(dir) = std::env::var("DOT_OPERATION_RENDER_DIR") {
+                    let rows: Vec<_> = term
+                        .backend()
+                        .buffer()
+                        .content
+                        .chunks(w as usize)
+                        .map(|row| {
+                            row.iter().map(|c| serde_json::json!({
+                            "text":c.symbol(), "fg":format!("{:?}",c.fg), "bg":format!("{:?}",c.bg),
+                            "bold":c.modifier.contains(Modifier::BOLD),
+                        })).collect::<Vec<_>>()
+                        })
+                        .collect();
+                    fs::write(
+                        Path::new(&dir).join(format!("{name}-{w}x{h}.json")),
+                        serde_json::to_vec(&rows).unwrap(),
+                    )
+                    .unwrap();
+                }
+                a.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+                term.draw(|f| a.draw(f)).unwrap();
+                let text = term
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                if name == "capture-files" && w >= 45 {
+                    assert!(
+                        text.contains("options.lua"),
+                        "last target must remain reachable"
+                    );
+                }
+                a.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+                assert!(match &a.modal {
+                    Some(Modal::Review { view, .. } | Modal::Outcome { view, .. }) =>
+                        view.scroll == 0,
+                    _ => false,
+                });
+                a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+                assert!(a.modal.is_none());
+            }
+        }
+    }
+
+    #[test]
+    fn setup_reports_created_existing_and_downloaded_without_applying_settings() {
+        let (_t, a) = app();
+        fs::remove_dir(&a.config.source).unwrap();
+        let created = initialize(&a.config, &a.config_path, None).unwrap();
+        assert_eq!(created.kind, SetupKind::Created);
+        fs::write(a.config.source.join("dot_untracked"), "saved settings").unwrap();
+        let existing = initialize(&a.config, &a.config_path, None).unwrap();
+        assert_eq!(existing.kind, SetupKind::Existing);
+        assert_eq!(
+            fs::read_to_string(a.config.home.join(".untracked")).unwrap(),
+            "untracked"
+        );
+        let mut downloaded = a.config.clone();
+        downloaded.source = a.config.source.with_file_name("downloaded");
+        let cloned = initialize(&downloaded, &a.config_path, a.config.source.to_str()).unwrap();
+        assert_eq!(cloned.kind, SetupKind::Cloned);
+        assert_eq!(
+            fs::read_to_string(a.config.home.join(".untracked")).unwrap(),
+            "untracked"
+        );
+    }
+
+    #[test]
+    fn welcome_guide_is_responsive_scrollable_and_opens_files() {
+        let (_t, mut a) = app();
+        // Include a long path to exercise wrapping independently of the terminal size.
+        a.config.source = PathBuf::from("/Users/example/.local/share/a-long-folder-name/chezmoi");
+        let report = SetupReport {
+            kind: SetupKind::Created,
+            details: "Agent instructions installed.".into(),
+        };
+        for (w, h) in [(120, 35), (80, 24), (45, 14), (20, 8)] {
+            a.modal = Some(Modal::Welcome {
+                report: report.clone(),
+                scroll: 0,
+            });
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            let text = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains("Welcome"));
+            assert!(text.contains("Open files"));
+            assert!(!text.contains("HOME"));
+            assert!(!text.contains("Space Select"));
+            if w >= 45 {
+                assert!(text.contains("Powered by:"));
+            }
+            if w >= 80 {
+                assert!(text.contains("chezmoi"));
+                assert!(text.contains("Git"));
+            }
+            if let Ok(dir) = std::env::var("DOT_WELCOME_RENDER_DIR") {
+                let rows: Vec<_> = term.backend().buffer().content.chunks(w as usize)
+                    .map(|row| row.iter().map(|c| serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect::<Vec<_>>()).collect();
+                fs::write(
+                    Path::new(&dir).join(format!("welcome-{w}x{h}.json")),
+                    serde_json::to_vec(&rows).unwrap(),
+                )
+                .unwrap();
+            }
+            for _ in 0..100 {
+                a.key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+            }
+            term.draw(|f| a.draw(f)).unwrap();
+            let text = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            if w >= 45 {
+                assert!(text.contains("then y to use them."));
+            }
+            let button = a.areas.setup[0].0;
+            a.mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(a.modal.is_none());
+            assert_eq!(a.pane, Pane::Files);
+        }
+        a.modal = Some(Modal::Welcome {
+            report: report.clone(),
+            scroll: 0,
+        });
+        a.key(KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE));
+        assert!(
+            matches!(a.modal, Some(Modal::Text { ref text, .. }) if text.contains("Agent instructions installed."))
+        );
+        a.modal = Some(Modal::Welcome {
+            report: report.clone(),
+            scroll: 0,
+        });
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        a.modal = Some(Modal::Welcome { report, scroll: 0 });
+        assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
+    }
+
     #[test]
     fn setup_screen_routes_keyboard_and_mouse_to_existing_flows() {
         let (_t, mut a) = app();
@@ -2289,5 +2970,40 @@ mod tests {
             let rows:Vec<_>=b.content.chunks(120).map(|row|row.iter().map(|c|serde_json::json!({"text":c.symbol(),"fg":format!("{:?}",c.fg),"bg":format!("{:?}",c.bg)})).collect::<Vec<_>>()).collect();
             fs::write(path, serde_json::to_vec(&rows).unwrap()).unwrap();
         }
+    }
+    #[test]
+    fn files_and_details_hide_ignored_children_after_background_navigation() {
+        let (_t, mut a) = app();
+        initialize(&a.config, &a.config_path, None).unwrap();
+        fs::create_dir_all(a.config.home.join(".agents/skills")).unwrap();
+        fs::write(a.config.home.join(".agents/.DS_Store"), "junk").unwrap();
+        fs::write(a.config.home.join(".agents/skills/SKILL.md"), "skill").unwrap();
+        fs::create_dir_all(a.config.home.join(".Trash")).unwrap();
+        fs::write(a.config.home.join(".Trash/.DS_Store"), "junk").unwrap();
+        a.snapshot = backend::snapshot(&a.config).unwrap();
+        a.rebuild();
+        assert!(!a.rows.iter().any(|r| r.path == ".Trash"));
+        a.cursor = a.rows.iter().position(|r| r.path == ".agents").unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            a.pump();
+            if a.detail.contains("skills/") && a.job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(a.detail.contains("skills/"), "{}", a.detail);
+        assert!(!a.detail.contains(".DS_Store"));
+        a.enter_dir();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while Instant::now() < deadline {
+            a.pump();
+            if a.snapshot.directory_entries.contains_key(".agents") && a.job.is_none() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(a.rows.iter().any(|r| r.name == "skills"));
+        assert!(!a.rows.iter().any(|r| r.name == ".DS_Store"));
     }
 }

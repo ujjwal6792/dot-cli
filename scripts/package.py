@@ -39,7 +39,9 @@ def build(binary, platform, version, out, dependency=None):
     if actual != f'dot {version}':
         raise ValueError(f'Binary version {actual!r} does not match {version!r}')
     files = {'dot': (binary.read_bytes(), 0o755), 'libexec/chezmoi': (content['chezmoi'], 0o755),
-             'licenses/chezmoi.txt': (content['LICENSE'], 0o644)}
+             'licenses/chezmoi.txt': (content['LICENSE'], 0o644),
+             'licenses/branding.md': ((pathlib.Path(__file__).resolve().parent.parent /
+                                      'assets/branding/README.md').read_bytes(), 0o644)}
     manifest = {'schema': 2, 'version': version, 'platform': platform, 'chezmoi': VERSION,
                 'runtime': 'Rust + Ratatui; system Git',
                 'files': {name: {'sha256': sha(data), 'mode': mode} for name, (data, mode) in files.items()}}

@@ -41,16 +41,19 @@ with tempfile.TemporaryDirectory(prefix='dot-missing-source-') as temp:
                         break
         try:
             drain(0.8)
-            assert b'Source does not exist' in output, output.decode(errors='replace')
+            assert b'Welcome to dot' in output, output.decode(errors='replace')
             assert child.poll() is None
             if back == b'i':
                 assert not (root / 'missing').exists(), 'browsing must not initialize source'
-                assert b'Initialize a new local source' in output
+                assert b'Start fresh' in output
                 os.write(master, back)
                 deadline = time.monotonic() + 5
                 while not (root / 'home/.agents/skills/dot/SKILL.md').exists() and time.monotonic() < deadline:
                     drain(0.1)
                 drain(0.5)
+                assert b'Created a folder for your saved settings' in output
+                assert b'Powered by:' in output
+                assert b'Open files' in output
                 assert (root / 'missing/.git').is_dir(), 'setup action did not initialize Git source'
                 assert (root / 'home/.agents/skills/dot/SKILL.md').is_file(), 'setup did not install the agent skill'
                 assert (root / 'home/.visible-on-startup').read_text() == 'fixture\n'

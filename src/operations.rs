@@ -20,6 +20,8 @@ pub enum Action {
     Apply,
     Restore,
     Forget,
+    Ignore,
+    IgnoreDefaults,
     Enable,
     Disable,
     Stage,
@@ -38,6 +40,8 @@ impl Action {
             Self::Capture => "Capture HOME → source",
             Self::Apply => "Apply source → HOME",
             Self::Restore => "Restore source → HOME",
+            Self::Ignore => "Ignore in chezmoi and Git",
+            Self::IgnoreDefaults => "Add developer ignore defaults",
             Self::Forget => "Stop tracking (shared source)",
             Self::Enable => "Enable automatic updates here",
             Self::Disable => "Disable automatic updates here",
@@ -105,6 +109,8 @@ struct Recovery {
     plan: Plan,
     source: Vec<SavedFile>,
     home: Vec<SavedFile>,
+    #[serde(default)]
+    index: Option<SavedFile>,
     after: String,
     result: Outcome,
 }
@@ -234,14 +240,22 @@ fn plan_id(p: &Plan) -> Result<String> {
     ))?)[..24]
         .into())
 }
-pub fn plan(c: &Config, action: Action, paths: &[String], payload: Option<String>) -> Result<Plan> {
+pub fn plan(
+    c: &Config,
+    action: Action,
+    paths: &[String],
+    mut payload: Option<String>,
+) -> Result<Plan> {
     let _lock = Lock::acquire(c)?;
     let snap = if action.files() {
         Some(backend::snapshot(c)?)
     } else {
         None
     };
-    let targets = if let Some(s) = &snap {
+    let from_git = action == Action::Ignore && payload.as_deref() == Some("source");
+    let targets = if action == Action::Ignore {
+        crate::ignores::home_paths(c, paths, from_git)?
+    } else if let Some(s) = &snap {
         backend::exact_targets(c, s, paths, action == Action::Capture)?
     } else {
         for p in paths {
@@ -282,6 +296,16 @@ pub fn plan(c: &Config, action: Action, paths: &[String], payload: Option<String
                 }
             }
             text
+        }
+        Action::Ignore | Action::IgnoreDefaults => {
+            let change = if action == Action::IgnoreDefaults {
+                crate::ignores::defaults(c)?
+            } else {
+                crate::ignores::prepare(c, &targets, from_git.then_some(paths))?
+            };
+            let preview = change.preview.clone();
+            payload = Some(serde_json::to_string(&change)?);
+            preview
         }
         Action::Forget => format!(
             "Remove these configurations from SHARED source; keep HOME files. Publishing changes what other machines can manage.\n{}",
@@ -434,6 +458,8 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
             | Action::EditSource
             | Action::Discard
             | Action::Setting
+            | Action::Ignore
+            | Action::IgnoreDefaults
     ) {
         backup_source(c, &dir.join("source"))?
     } else {
@@ -445,10 +471,21 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
             home.push(saved(&c.home, path, &dir.join("home"))?);
         }
     }
+    let index = if p.action == Action::Ignore {
+        let path = git::index_path(c)?;
+        Some(saved(
+            path.parent().context("Git index parent missing")?,
+            "index",
+            &dir.join("git"),
+        )?)
+    } else {
+        None
+    };
     let pending = Recovery {
         plan: p.clone(),
         source: source.clone(),
         home: home.clone(),
+        index: index.clone(),
         after: String::new(),
         result: Outcome {
             id: p.id.clone(),
@@ -558,6 +595,7 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
         plan: p.clone(),
         source,
         home,
+        index,
         after,
         result: result.clone(),
     };
@@ -582,6 +620,12 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
 }
 fn execute_group(c: &mut Config, config_path: &Path, p: &Plan) -> Result<String> {
     let mut args = match p.action {
+        Action::Ignore | Action::IgnoreDefaults => {
+            return crate::ignores::apply(
+                c,
+                p.payload.as_deref().context("Ignore change missing")?,
+            );
+        }
         Action::Stage => process::strings(&["--literal-pathspecs", "add", "--"]),
         Action::Unstage => {
             if git::run(c, &["rev-parse", "HEAD"]).is_ok() {
@@ -687,6 +731,8 @@ pub fn recover(c: &Config, id: &str) -> Result<String> {
             | Action::EditSource
             | Action::Discard
             | Action::Setting
+            | Action::Ignore
+            | Action::IgnoreDefaults
     ) {
         bail!("This operation requires Git or scope recovery; file restore is not applicable");
     }
@@ -721,6 +767,14 @@ pub fn recover(c: &Config, id: &str) -> Result<String> {
     }
     for f in &r.home {
         restore_file(&c.home, f, &dir.join("home"))?;
+    }
+    if let Some(index) = &r.index {
+        let path = git::index_path(c)?;
+        restore_file(
+            path.parent().context("Git index parent missing")?,
+            index,
+            &dir.join("git"),
+        )?;
     }
     event(c, &r.plan, "restored")?;
     Ok("File backup restored. External script effects are not reversed.".into())

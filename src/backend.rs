@@ -1,7 +1,7 @@
 use crate::{
     config::{Config, clean_relative},
     git::{self, GitState},
-    process,
+    ignores, process,
 };
 use anyhow::{Context, Result, bail};
 use serde::{Deserialize, Serialize};
@@ -21,6 +21,11 @@ pub struct Managed {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub managed: BTreeMap<String, Managed>,
+    #[serde(default)]
+    pub managed_directories: BTreeSet<String>,
+    /// Native-approved immediate entries, inspected in background workers only.
+    #[serde(default)]
+    pub directory_entries: BTreeMap<String, BTreeSet<String>>,
     pub changes: BTreeMap<String, String>,
     pub git: GitState,
     pub observed_at: String,
@@ -98,18 +103,30 @@ pub fn snapshot(c: &Config) -> Result<Snapshot> {
             bail!("Managed source outside configured repository: {path}");
         }
     }
+    let managed_directories = chez(
+        c,
+        &["managed", "--path-style=relative", "--include=dirs", "-0"],
+    )?
+    .split('\0')
+    .filter(|p| !p.is_empty())
+    .map(str::to_owned)
+    .collect();
     let changes = parse_status(&chez(c, &["status", "--path-style=relative"])?);
     let git = git::status(c).unwrap_or_else(|e| GitState {
         error: Some(e.to_string()),
         ..Default::default()
     });
-    Ok(Snapshot {
+    let mut snapshot = Snapshot {
         managed,
+        managed_directories,
+        directory_entries: BTreeMap::new(),
         changes,
         git,
         observed_at: chrono::Utc::now().to_rfc3339(),
         warnings: vec![],
-    })
+    };
+    inspect_directory(c, &mut snapshot, "")?;
+    Ok(snapshot)
 }
 pub fn parse_status(text: &str) -> BTreeMap<String, String> {
     text.lines()
@@ -117,6 +134,92 @@ pub fn parse_status(text: &str) -> BTreeMap<String, String> {
         .map(|l| (l[3..].to_string(), l[..2].to_string()))
         .collect()
 }
+/// Inspect only the current directory, never recursively scan HOME. Native
+/// unmanaged prunes each unmanaged directory immediately. Managed directories
+/// must be excluded from its arguments because chezmoi would descend into them.
+/// Call from a worker; rows() itself only reads this cache and the local disk.
+pub fn inspect_directory(c: &Config, s: &mut Snapshot, directory: &str) -> Result<()> {
+    let base = if directory.is_empty() {
+        c.home.clone()
+    } else {
+        c.target(directory)?
+    };
+    // A user can navigate during the initial inspection. Check the directory
+    // and its ancestors as well, so a directly queried child cannot bypass an
+    // ignored parent that native tree walking would have pruned.
+    let mut ancestors = Vec::new();
+    let mut ancestor = Path::new(directory);
+    while !ancestor.as_os_str().is_empty() {
+        let relative = ancestor.to_string_lossy().into_owned();
+        if !s.managed_directories.contains(&relative) && c.home.join(ancestor).is_dir() {
+            ancestors.push(relative);
+        }
+        ancestor = ancestor.parent().unwrap_or_else(|| Path::new(""));
+    }
+    if !ancestors.is_empty() && native_unmanaged(c, &ancestors)?.len() != ancestors.len() {
+        s.directory_entries
+            .insert(directory.to_owned(), BTreeSet::new());
+        return Ok(());
+    }
+    let prefix = if directory.is_empty() {
+        String::new()
+    } else {
+        format!("{directory}/")
+    };
+    let mut candidates = Vec::new();
+    let mut visible = BTreeSet::new();
+    if base.is_dir() {
+        for entry in fs::read_dir(&base)? {
+            let entry = entry?;
+            let Some(name) = entry.file_name().to_str().map(str::to_owned) else {
+                continue;
+            };
+            let path = format!("{prefix}{name}");
+            if entry.path().starts_with(&c.source)
+                || entry.path().starts_with(&c.state)
+                || name == ".git"
+            {
+                continue;
+            }
+            if s.managed.contains_key(&path) || s.managed_directories.contains(&path) {
+                visible.insert(path);
+            } else {
+                candidates.push(path);
+            }
+        }
+    }
+    visible.extend(native_unmanaged(c, &candidates)?);
+    s.directory_entries.insert(directory.to_owned(), visible);
+    Ok(())
+}
+
+fn native_unmanaged(c: &Config, candidates: &[String]) -> Result<BTreeSet<String>> {
+    let mut visible = BTreeSet::new();
+    for chunk in candidates.chunks(128) {
+        let mut args = process::strings(&[
+            "unmanaged",
+            "--path-style=relative",
+            "-0",
+            "--include=files,symlinks,dirs",
+            "--",
+        ]);
+        for path in chunk {
+            args.push(c.target(path)?.to_string_lossy().into_owned());
+        }
+        let output = chez_args(c, args)?;
+        // Only accept requested immediate entries. This also prevents unexpected
+        // native output from ever broadening the scope of the browsing cache.
+        let accepted: BTreeSet<_> = output.split('\0').collect();
+        visible.extend(
+            chunk
+                .iter()
+                .filter(|p| accepted.contains(p.as_str()))
+                .cloned(),
+        );
+    }
+    Ok(visible)
+}
+
 pub fn rows(
     c: &Config,
     s: &Snapshot,
@@ -154,6 +257,15 @@ pub fn rows(
     let mut rows = vec![];
     for name in names {
         let path = format!("{prefix}{name}");
+        let inspected = s.directory_entries.get(directory);
+        if (inspected.is_some_and(|visible| !visible.contains(&path))
+            || inspected.is_none() && !s.observed_at.is_empty())
+            && !s.managed.contains_key(&path)
+            && !s.managed_directories.contains(&path)
+            && !s.managed.keys().any(|p| p.starts_with(&format!("{path}/")))
+        {
+            continue;
+        }
         let child_prefix = format!("{path}/");
         let descendants: Vec<_> = s
             .managed
@@ -221,23 +333,13 @@ pub fn exact_targets(
         }
         if full.is_dir() && !fs::symlink_metadata(&full)?.file_type().is_symlink() {
             if capture {
-                for e in walkdir::WalkDir::new(&full)
-                    .follow_links(false)
-                    .into_iter()
-                    .filter_entry(|e| {
-                        e.file_name() != ".git"
-                            && !e.path().starts_with(&c.source)
-                            && !e.path().starts_with(&c.state)
-                    })
-                {
-                    let e = e?;
-                    if !e.file_type().is_dir() {
-                        targets.insert(c.relative(&e.path().to_string_lossy())?);
-                    }
-                    if targets.len() > 10000 {
-                        bail!("Select a smaller folder (more than 10000 entries)");
-                    }
-                }
+                targets.extend(ignores::eligible(c, std::slice::from_ref(&p))?);
+                targets.extend(
+                    s.managed
+                        .keys()
+                        .filter(|k| k.starts_with(&format!("{p}/")))
+                        .cloned(),
+                );
             } else {
                 targets.extend(
                     s.managed
@@ -258,8 +360,30 @@ pub fn exact_targets(
             );
         }
     }
+    if capture {
+        let candidates: Vec<_> = targets
+            .iter()
+            .filter(|p| !s.managed.contains_key(*p))
+            .cloned()
+            .collect();
+        let eligible = ignores::eligible(c, &candidates)?;
+        targets.retain(|p| s.managed.contains_key(p) || eligible.contains(p));
+    }
+    targets.retain(|p| {
+        let full = c.home.join(p);
+        !full.starts_with(&c.source)
+            && !full.starts_with(&c.state)
+            && !Path::new(p)
+                .components()
+                .any(|part| part.as_os_str() == ".git")
+    });
     if targets.is_empty() {
-        bail!("No eligible files in selection");
+        bail!(
+            "No eligible files in selection. Ignored files are skipped; check .chezmoiignore and dot’s default exclusions"
+        );
+    }
+    if targets.len() > 10000 {
+        bail!("Select a smaller folder (more than 10000 eligible files)");
     }
     for p in &targets {
         c.target(p)?;

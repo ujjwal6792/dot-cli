@@ -23,9 +23,24 @@ cargo build --locked --release
 
 For an existing ordinary chezmoi source, use `dot init --source /absolute/source`.
 Without `--repo`, init connects the existing source or initializes a new Git
-repository. It creates local dot configuration and a small agent skill at
+repository. Setup adds editable developer defaults to `.chezmoiignore` (or its
+existing `.tmpl` variant) and `.gitignore`, preserving custom rules. It creates local dot configuration and a small agent skill at
 `~/.agents/skills/dot/SKILL.md`; it does not apply HOME files. Existing skill
 customizations are preserved, with conflicting updates written separately.
+After setup, a welcome screen explains whether dot created a settings folder,
+reused an existing one, or downloaded a repository. A short guide introduces
+Capture (save a copy) and Apply (use a saved copy), with setup details available
+on `d`. Enter opens Files; the guide scrolls in smaller terminals. The dot mark
+uses ordinary terminal characters. The compact powered-by row uses Nerd Fonts'
+home icon for chezmoi and Git icon; select a Nerd Font in your terminal, or run
+`DOT_ICONS=none dot` for text-only labels.
+
+Operation reviews have **Files** and **Changes** tabs (`1` / `2` or Tab).
+Review the exact targets and preview, then press `y` to confirm or Esc to cancel.
+Results summarize completed, failed, and skipped files, grouped by folder;
+**Details** keeps the raw operation record available. Press `g` to review the
+saved copies in Git. Arrow keys, Page Up/Down, Home/End, and the mouse wheel
+scroll the active tab.
 
 When the TUI cannot find its source, its setup screen offers `i` to initialize a
 local source, `c` to clone a repository, and `o` to connect an existing checkout.
@@ -43,7 +58,8 @@ existing custom checkout. The config path is a **dot** TOML file; use
 
 Persistent Status, Files, Git and Machines panels share a large details area and
 compact activity log. `.agents/` and `.config/` appear as folders, not hundreds of
-flattened paths. All includes grey untracked entries; Managed and Changed narrow
+flattened paths. Files and folder Details hide entries excluded by native ignore
+rules. All includes grey eligible untracked entries; Managed and Changed narrow
 the view. Yellow folders have changed descendants. HOME matching source does not
 mean the source is committed or published.
 
@@ -53,6 +69,8 @@ mean the source is committed or published.
 | arrows or `j/k`, `h/l` | Navigate rows/folders |
 | Space in Files | Select files/folders |
 | `c`, `a`, `r` in Files | Capture, apply, restore |
+| `i` in Files or Git | Ignore in both chezmoi and Git with one reviewed action |
+| `d` or Delete in Files | Remove saved copies from dot after review; keep original files |
 | `e` in Files | Edit native source; Ctrl+S reviews changes |
 | Space in Git, `v` | Stage/unstage; multi-select Git paths |
 | `c` in Git, `P`, `L`, `F` | Commit, push, pull, fetch |
@@ -60,8 +78,11 @@ mean the source is committed or published.
 | `[`, `]`, `z` | Previous/next tab in the focused section; expand focused panel |
 | `:`, `?`, Esc | All actions, help, back/cancel |
 
-Mouse clicks focus rows/panels; checkboxes select, double-click opens folders,
-and scrolling follows the pane. Action menus support double-click activation.
+Only left mouse clicks move focus between panels; hovering and scrolling keep
+keyboard focus in place. The wheel scrolls the panel under the pointer.
+The focused panel has a bright mint double border.
+Checkboxes select, and double-click opens folders. Action menus support
+double-click activation.
 Review buttons are clickable. Terminal-delivered touchpad events use the same
 paths. Narrow terminals show the focused pane and retain Actions/Help.
 
@@ -89,6 +110,35 @@ automatic-update selection; restoring one file preserves the rest of that set.
 Stage, commit and push are separate. Commit shows the actual Git index, including
 externally staged work. Pull is clean and fast-forward-only. Resolve divergence,
 rebase and advanced history operations through Git/Lazygit, then refresh dot.
+
+### Ignore files once, in both tools
+
+Select a file or folder in **Files** or **Git**, press **i Ignore**, review both
+rule changes, then press **y**. Dot maps the original path to chezmoi's saved
+filename (including `dot_`, `private_` and template attributes). It updates both
+ignore files and stops Git tracking the selected saved copies. Files stay on
+disk; tracked removals are staged for your next commit. Other staged work is
+preserved. An unsafe staged edit or a conflicting include exception stops the
+action. Recovery restores both ignore files and the previous Git index.
+
+Setup adds defaults for macOS/Linux metadata, Node dependencies and frontend
+caches, Python environments, Rust/JVM/Swift/Dart build output, coverage,
+Terraform working data and editor temporary files. `build`, `dist`, `target`,
+`node_modules`, `.DS_Store` and `.cache` are included. Lockfiles, source files,
+editor settings and script directories remain available. Rules are ordinary,
+editable native rules; chezmoi's templates and `!` exceptions still work.
+
+The [complete defaults catalog](docs/ignore-defaults.md) covers machine runtime
+folders as well as project-generated files, while preserving skills and useful
+settings. Filtering runs in background batches; browsing never recursively scans
+HOME or waits for a process per row.
+
+Existing installations can use **Actions → Add developer ignore defaults to
+both files**, or `dot plan ignore-defaults` followed by the normal execute step.
+Defaults do not untrack previously committed files automatically; select those
+files in Git and use **i Ignore**. Re-running setup preserves edits to the marked
+default sections. To undo a custom ignore after further work, remove its rules
+from both files and re-add the saved copies to Git.
 
 For scripts and agents, inspection and plans emit JSON:
 

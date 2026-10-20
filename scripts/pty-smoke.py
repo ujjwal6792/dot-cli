@@ -33,6 +33,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
     result = json.loads(run('execute', plan['id'], '--approve', plan['id']))
     assert result['failed'] is None, result
     (home / '.config/ghostty/config').write_text('font-size = 16\n')
+    (home / '.capture-demo').write_text('setting = example\n')
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
@@ -54,6 +55,45 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
     try:
         drain(1.5)
         assert child.poll() is None, output.decode(errors='replace')
+        os.write(master, b'/capture-demo')
+        drain(0.3)
+        os.write(master, b'\r ')
+        drain(0.3)
+        marker = len(output)
+        os.write(master, b'c')
+        drain(0.7)
+        assert b'Save a copy of your settings' in output[marker:]
+        assert not (source / 'dot_capture-demo').exists(), 'review must not execute'
+        os.write(master, b'2')
+        drain(0.3)
+        assert b'New saved copy:' in output[marker:]
+        os.write(master, b'y')
+        drain(1.0)
+        assert b'Your settings are saved' in output[marker:]
+        assert (source / 'dot_capture-demo').read_text() == 'setting = example\n'
+        assert (home / '.capture-demo').read_text() == 'setting = example\n'
+        os.write(master, b'2')
+        drain(0.2)
+        assert b'"succeeded"' in output[marker:], 'raw details must remain available'
+        os.write(master, b'g2')
+        drain(0.8)
+        marker = len(output)
+        os.write(master, b'i')
+        drain(0.8)
+        assert b'Ignore in chezmoi and Git' in output[marker:], repr(output[marker:])
+        assert '.capture-demo' not in (source / '.chezmoiignore').read_text()
+        os.write(master, b'2')
+        drain(0.3)
+        assert b'.chezmoiignore' in output[marker:] and b'.gitignore' in output[marker:]
+        os.write(master, b'y')
+        drain(1.0)
+        assert b'Ignored in chezmoi and Git' in output[marker:]
+        assert '.capture-demo' in (source / '.chezmoiignore').read_text()
+        assert '/dot_capture-demo' in (source / '.gitignore').read_text()
+        assert (source / 'dot_capture-demo').exists()
+        assert (home / '.capture-demo').exists()
+        os.write(master, b'\r')
+        drain(0.2)
         os.write(master, b'/q2Wconfig')
         drain(0.4)
         assert child.poll() is None, 'search text exited the application'
@@ -80,7 +120,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
             # macOS revokes the slave after the controlling session exits.
             assert '\x1b[?1049l' in text, 'alternate-screen restoration was not emitted'
         assert 'Files' in text and 'Actions' in text and 'q2Wconfig' in text
-        print('PASS: CLI init/capture, real PTY launch, search ownership, resize, action menu, clean quit and terminal restoration sequence')
+        print('PASS: CLI init/capture, TUI capture and unified Ignore review/confirm/results, search ownership, resize, action menu, clean quit and terminal restoration sequence')
     finally:
         if child.poll() is None:
             child.kill()

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32">
+  <title>dot — a settings file, with a dot at its heart</title>
+  <path fill="#61dab3" d="M2 2h9v4H6v20h5v4H2zm19 0h9v28h-9v-4h5V6h-5z"/>
+  <circle cx="16" cy="16" r="4" fill="#61dab3"/>
+</svg>

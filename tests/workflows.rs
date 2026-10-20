@@ -508,3 +508,487 @@ fn symlinked_binary_uses_its_bundled_chezmoi() {
     );
     assert!(output.contains("bundled fixture"));
 }
+
+#[test]
+fn developer_defaults_are_native_editable_and_skip_generated_files() {
+    let mut f = Fixture::new();
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    let names = [
+        ".DS_Store",
+        "node_modules",
+        "target",
+        "__pycache__",
+        ".venv",
+        "dist",
+        "build",
+        ".next",
+        ".gradle",
+        ".build",
+        ".dart_tool",
+        ".terraform",
+        ".Trash-1000",
+        "._settings",
+        "thing.swp",
+    ];
+    for name in names {
+        f.write(&format!("project/deep/{name}/junk"), "generated");
+        fs::create_dir_all(f.c.source.join(format!("junk/{name}"))).unwrap();
+        fs::write(f.c.source.join(format!("junk/{name}/file")), "junk").unwrap();
+    }
+    f.write("project/settings.toml", "keep");
+    f.write("project/target.rs", "keep");
+    f.write("project/package-lock.json", "keep");
+    let p = operations::plan(&f.c, Action::Capture, &["project".into()], None).unwrap();
+    assert_eq!(
+        p.paths,
+        [
+            "project/package-lock.json",
+            "project/settings.toml",
+            "project/target.rs"
+        ]
+    );
+    assert!(
+        operations::execute(&mut f.c, &f.config, &p, &p.id)
+            .unwrap()
+            .failed
+            .is_none()
+    );
+    assert!(
+        !git::status(&f.c)
+            .unwrap()
+            .files
+            .iter()
+            .any(|p| p.path.starts_with("junk/"))
+    );
+    assert!(
+        operations::plan(
+            &f.c,
+            Action::Capture,
+            &["project/deep/target/junk".into()],
+            None
+        )
+        .is_err()
+    );
+    // Native exceptions work: defaults are editable rules, not a second hard-coded filter.
+    let file = f.c.source.join(".chezmoiignore");
+    let mut rules = fs::read_to_string(&file).unwrap();
+    rules.push_str("\n!project/deep/target\n!project/deep/target/**\n");
+    fs::write(file, rules).unwrap();
+    f.do_action(Action::Capture, &["project/deep/target/junk"]);
+    assert!(f.c.source.join("project/deep/target/junk").exists());
+}
+
+#[test]
+fn capture_respects_native_templated_nested_rules_and_exceptions() {
+    let mut f = Fixture::new();
+    for name in ["keep", "skip", "local", "other"] {
+        f.write(&format!("app/{name}"), "setting");
+    }
+    fs::create_dir_all(f.c.source.join("app")).unwrap();
+    fs::write(
+        f.c.source.join(".chezmoiignore"),
+        "{{ if .chezmoi.os }}\napp/*\n!app/keep\n!app/other\n{{ end }}\n",
+    )
+    .unwrap();
+    fs::write(f.c.source.join("app/.chezmoiignore"), "local\n").unwrap();
+    let p = operations::plan(&f.c, Action::Capture, &["app".into()], None).unwrap();
+    assert_eq!(p.paths, ["app/keep", "app/other"]);
+    f.do_action(Action::Capture, &["app"]);
+    assert!(!f.c.source.join("app/skip").exists());
+    assert!(operations::plan(&f.c, Action::Capture, &["app/skip".into()], None).is_err());
+}
+
+#[test]
+fn ignore_folder_is_reviewed_recoverable_and_keeps_all_originals() {
+    let mut f = Fixture::new();
+    f.write("app/cache/file", "original");
+    f.write("app/keep", "settings");
+    f.do_action(Action::Capture, &["app"]);
+    f.commit();
+    let p = operations::plan(&f.c, Action::Ignore, &["app/cache".into()], None).unwrap();
+    assert_eq!(p.paths, ["app/cache"]);
+    assert!(p.preview.contains("+app/cache\n+app/cache/**"));
+    assert!(!f.c.source.join(".chezmoiignore").exists());
+    assert!(operations::execute(&mut f.c, &f.config, &p, "wrong approval").is_err());
+    assert!(
+        operations::execute(&mut f.c, &f.config, &p, &p.id)
+            .unwrap()
+            .failed
+            .is_none()
+    );
+    assert_eq!(
+        fs::read_to_string(f.c.home.join("app/cache/file")).unwrap(),
+        "original"
+    );
+    assert!(f.c.source.join("app/cache/file").exists());
+    assert!(
+        !backend::snapshot(&f.c)
+            .unwrap()
+            .managed
+            .contains_key("app/cache/file")
+    );
+    assert_eq!(
+        operations::plan(&f.c, Action::Capture, &["app".into()], None)
+            .unwrap()
+            .paths,
+        ["app/keep"]
+    );
+    operations::recover(&f.c, &p.id).unwrap();
+    assert!(!f.c.source.join(".chezmoiignore").exists());
+    assert!(
+        backend::snapshot(&f.c)
+            .unwrap()
+            .managed
+            .contains_key("app/cache/file")
+    );
+}
+
+#[test]
+fn ignore_rules_escape_exact_paths_and_preserve_templates() {
+    let mut f = Fixture::new();
+    let name = "app/a [b]*? {c}! file";
+    f.write(name, "ignored");
+    f.write("app/neighbour", "keep");
+    fs::write(
+        f.c.source.join(".chezmoiignore.tmpl"),
+        "# existing\n{{ if eq .chezmoi.os \"none\" }}\nother\n{{ end }}",
+    )
+    .unwrap();
+    f.do_action(Action::Ignore, &[name]);
+    let rules = fs::read_to_string(f.c.source.join(".chezmoiignore.tmpl")).unwrap();
+    assert!(rules.starts_with("# existing\n{{ if"));
+    assert!(!f.c.source.join(".chezmoiignore").exists());
+    let p = operations::plan(&f.c, Action::Capture, &["app".into()], None).unwrap();
+    assert_eq!(p.paths, ["app/neighbour"]);
+    for unsafe_name in ["app/new\nrule", "app/{{ .chezmoi.os }}", "app/x # comment"] {
+        f.write(unsafe_name, "untouched");
+        assert!(operations::plan(&f.c, Action::Ignore, &[unsafe_name.into()], None).is_err());
+    }
+    assert!(
+        operations::plan(&f.c, Action::Ignore, &[name.into()], None)
+            .unwrap_err()
+            .to_string()
+            .contains("already exist")
+    );
+}
+
+#[test]
+fn one_ignore_action_maps_dotfiles_and_untracks_git_without_deleting() {
+    let mut f = Fixture::new();
+    f.write(".config/app/one", "original");
+    f.do_action(Action::Capture, &[".config"]);
+    f.commit();
+    let p = operations::plan(&f.c, Action::Ignore, &[".config/app/one".into()], None).unwrap();
+    assert!(p.preview.contains("/dot_config/app/one"));
+    assert!(p.preview.contains("Stop Git tracking"));
+    assert!(
+        operations::execute(&mut f.c, &f.config, &p, &p.id)
+            .unwrap()
+            .failed
+            .is_none()
+    );
+    assert!(
+        !git::run(&f.c, &["ls-files"])
+            .unwrap()
+            .contains("dot_config/app/one")
+    );
+    assert!(
+        !backend::snapshot(&f.c)
+            .unwrap()
+            .managed
+            .contains_key(".config/app/one")
+    );
+    assert!(f.c.home.join(".config/app/one").exists());
+    assert!(f.c.source.join("dot_config/app/one").exists());
+    assert!(f.c.source.join(".chezmoiignore").exists());
+    assert!(f.c.source.join(".gitignore").exists());
+    operations::recover(&f.c, &p.id).unwrap();
+    assert!(
+        git::run(&f.c, &["ls-files"])
+            .unwrap()
+            .contains("dot_config/app/one")
+    );
+    assert!(git::status(&f.c).unwrap().files.is_empty());
+}
+
+#[test]
+fn ignore_from_git_maps_native_attributes_and_keeps_unrelated_staging() {
+    let mut f = Fixture::new();
+    fs::create_dir_all(f.c.source.join("private_dot_config")).unwrap();
+    fs::write(
+        f.c.source.join("private_dot_config/private_secret.tmpl"),
+        "original",
+    )
+    .unwrap();
+    fs::write(f.c.source.join("unrelated"), "before").unwrap();
+    f.commit();
+    fs::write(f.c.source.join("unrelated"), "after").unwrap();
+    git::run(&f.c, &["add", "unrelated"]).unwrap();
+    let p = operations::plan(
+        &f.c,
+        Action::Ignore,
+        &["private_dot_config/private_secret.tmpl".into()],
+        Some("source".into()),
+    )
+    .unwrap();
+    assert_eq!(p.paths, [".config/secret"]);
+    assert!(
+        p.preview
+            .contains("+/private_dot_config/private_secret.tmpl")
+    );
+    assert!(
+        operations::execute(&mut f.c, &f.config, &p, &p.id)
+            .unwrap()
+            .failed
+            .is_none()
+    );
+    assert!(
+        git::run(&f.c, &["diff", "--cached"])
+            .unwrap()
+            .contains("+after")
+    );
+    assert!(!git::run(&f.c, &["ls-files"]).unwrap().contains("secret"));
+}
+
+#[test]
+fn defaults_preserve_existing_rules_and_are_idempotent() {
+    let f = Fixture::new();
+    fs::write(
+        f.c.source.join(".chezmoiignore.tmpl"),
+        "# mine\n{{ if eq .chezmoi.os \"linux\" }}\nlinux-only\n{{ end }}\n!keep\n",
+    )
+    .unwrap();
+    fs::write(f.c.source.join(".gitignore"), "# mine\n*.custom\n!keep\n").unwrap();
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    let chez = fs::read_to_string(f.c.source.join(".chezmoiignore.tmpl")).unwrap();
+    let git = fs::read_to_string(f.c.source.join(".gitignore")).unwrap();
+    assert!(
+        chez.ends_with("# mine\n{{ if eq .chezmoi.os \"linux\" }}\nlinux-only\n{{ end }}\n!keep\n")
+    );
+    assert!(git.ends_with("# mine\n*.custom\n!keep\n"));
+    assert!(!f.c.source.join(".chezmoiignore").exists());
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    assert_eq!(
+        fs::read_to_string(f.c.source.join(".chezmoiignore.tmpl")).unwrap(),
+        chez
+    );
+    assert_eq!(
+        fs::read_to_string(f.c.source.join(".gitignore")).unwrap(),
+        git
+    );
+}
+
+#[test]
+fn ignore_rejects_symlink_rule_files_and_stale_plans() {
+    let mut f = Fixture::new();
+    f.write(".one", "original");
+    let p = operations::plan(&f.c, Action::Ignore, &[".one".into()], None).unwrap();
+    fs::write(f.c.source.join(".chezmoiignore"), "# external edit\n").unwrap();
+    assert!(
+        operations::execute(&mut f.c, &f.config, &p, &p.id)
+            .unwrap_err()
+            .to_string()
+            .contains("changed after review")
+    );
+    fs::remove_file(f.c.source.join(".chezmoiignore")).unwrap();
+    std::os::unix::fs::symlink(f.c.home.join(".one"), f.c.source.join(".chezmoiignore")).unwrap();
+    assert!(operations::plan(&f.c, Action::Ignore, &[".one".into()], None).is_err());
+    assert_eq!(
+        fs::read_to_string(f.c.home.join(".one")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn ignore_conflicting_exception_rolls_back_both_files_and_keeps_index() {
+    let mut f = Fixture::new();
+    f.write(".one", "keep");
+    f.do_action(Action::Capture, &[".one"]);
+    fs::write(f.c.source.join(".chezmoiignore"), "!.one\n").unwrap();
+    f.commit();
+    let p = operations::plan(&f.c, Action::Ignore, &[".one".into()], None).unwrap();
+    let outcome = operations::execute(&mut f.c, &f.config, &p, &p.id).unwrap();
+    assert!(outcome.failed.is_some());
+    assert!(outcome.message.contains("exception"));
+    assert_eq!(
+        fs::read_to_string(f.c.source.join(".chezmoiignore")).unwrap(),
+        "!.one\n"
+    );
+    assert!(!f.c.source.join(".gitignore").exists());
+    assert!(git::status(&f.c).unwrap().files.is_empty());
+    assert!(git::run(&f.c, &["ls-files"]).unwrap().contains("dot_one"));
+}
+
+#[test]
+fn defaults_and_ignore_respect_relocated_chezmoi_root() {
+    let mut f = Fixture::new();
+    fs::write(f.c.source.join(".chezmoiroot"), "settings\n").unwrap();
+    fs::create_dir_all(f.c.source.join("settings")).unwrap();
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    assert!(f.c.source.join("settings/.chezmoiignore").exists());
+    assert!(f.c.source.join(".gitignore").exists());
+    f.write(".config/keep", "keep");
+    f.write(".config/node_modules/junk", "junk");
+    f.do_action(Action::Capture, &[".config"]);
+    assert!(f.c.source.join("settings/dot_config/keep").exists());
+    assert!(!f.c.source.join("settings/dot_config/node_modules").exists());
+    f.commit();
+    f.do_action(Action::Ignore, &[".config/keep"]);
+    assert!(
+        fs::read_to_string(f.c.source.join(".gitignore"))
+            .unwrap()
+            .contains("/settings/dot_config/keep")
+    );
+    assert!(
+        !git::run(&f.c, &["ls-files"])
+            .unwrap()
+            .contains("dot_config/keep")
+    );
+}
+
+#[test]
+fn ignore_finds_private_saved_copies_already_hidden_by_defaults() {
+    let mut f = Fixture::new();
+    f.write(".config/.cache/file", "cached");
+    fs::create_dir_all(f.c.source.join("private_dot_config/private_dot_cache")).unwrap();
+    fs::write(
+        f.c.source
+            .join("private_dot_config/private_dot_cache/private_file"),
+        "cached",
+    )
+    .unwrap();
+    f.commit();
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    assert!(
+        !backend::snapshot(&f.c)
+            .unwrap()
+            .managed
+            .contains_key(".config/.cache/file")
+    );
+    f.do_action(Action::Ignore, &[".config/.cache"]);
+    assert!(
+        !git::run(&f.c, &["ls-files"])
+            .unwrap()
+            .contains("private_file")
+    );
+    assert!(f.c.home.join(".config/.cache/file").exists());
+    assert!(
+        f.c.source
+            .join("private_dot_config/private_dot_cache/private_file")
+            .exists()
+    );
+}
+
+#[test]
+fn defaults_preserve_leading_whitespace_trimming_templates() {
+    let f = Fixture::new();
+    f.write(".custom", "private");
+    f.write(".keep", "settings");
+    fs::write(
+        f.c.source.join(".chezmoiignore"),
+        "{{- if .chezmoi.os -}}\n.custom\n{{- end }}\n",
+    )
+    .unwrap();
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    assert!(operations::plan(&f.c, Action::Capture, &[".custom".into()], None).is_err());
+    assert!(operations::plan(&f.c, Action::Capture, &[".keep".into()], None).is_ok());
+}
+
+#[test]
+fn machine_defaults_hide_runtime_but_keep_configs_and_skills() {
+    let f = Fixture::new();
+    let hidden = [
+        ".Trash",
+        ".trash",
+        ".android",
+        ".bob",
+        ".bundle",
+        ".cache",
+        ".cargo",
+        ".bun",
+        ".rustup",
+        ".ollama",
+        "Library",
+        "projects",
+        "Downloads",
+    ];
+    for dir in hidden {
+        f.write(&format!("{dir}/runtime"), "generated");
+    }
+    for path in [
+        ".DS_Store",
+        ".agents/.DS_Store",
+        ".codex/auth.json",
+        ".codex/sessions/session.json",
+        ".claude/projects/session.json",
+        ".config/nvim/.fastembed_cache/data",
+        ".ssh/id_ed25519",
+        ".local/state/app/data",
+    ] {
+        f.write(path, "generated");
+    }
+    let kept = [
+        ".zshrc",
+        ".gitconfig",
+        ".cargo-config-example",
+        ".codex/config.toml",
+        ".claude/settings.json",
+        ".agents/skills/example/SKILL.md",
+        ".config/nvim/init.lua",
+        ".ssh/config",
+        ".local/bin/myscript",
+    ];
+    for path in kept {
+        f.write(path, "settings");
+    }
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    let mut snapshot = backend::snapshot(&f.c).unwrap();
+    let rows = backend::rows(&f.c, &snapshot, "", backend::Filter::All, "").unwrap();
+    for name in hidden {
+        assert!(!rows.iter().any(|r| r.path == name), "visible: {name}");
+    }
+    assert!(!rows.iter().any(|r| r.path == ".DS_Store"));
+    backend::inspect_directory(&f.c, &mut snapshot, ".agents").unwrap();
+    let rows = backend::rows(&f.c, &snapshot, ".agents", backend::Filter::All, "").unwrap();
+    assert_eq!(
+        rows.iter().map(|r| r.name.as_str()).collect::<Vec<_>>(),
+        ["skills"]
+    );
+    let p = operations::plan(&f.c, Action::Capture, &kept.map(str::to_string), None).unwrap();
+    assert_eq!(p.paths.len(), kept.len());
+    // The checked-in catalog is exactly what setup writes on a fresh installation.
+    if let Ok(dir) = std::env::var("DOT_DEFAULTS_OUTPUT") {
+        fs::create_dir_all(&dir).unwrap();
+        for name in [".chezmoiignore", ".gitignore"] {
+            fs::copy(f.c.source.join(name), Path::new(&dir).join(name)).unwrap();
+        }
+    } else {
+        assert_eq!(
+            fs::read_to_string(f.c.source.join(".chezmoiignore")).unwrap(),
+            include_str!("../assets/defaults/.chezmoiignore")
+        );
+        assert_eq!(
+            fs::read_to_string(f.c.source.join(".gitignore")).unwrap(),
+            include_str!("../assets/defaults/.gitignore")
+        );
+    }
+}
+
+#[test]
+fn new_defaults_upgrade_v1_without_overwriting_edited_rules() {
+    let f = Fixture::new();
+    let custom = "# dot: developer ignore defaults v1\n# user deliberately edited the old block\ncustom-output\n!keep\n";
+    for name in [".chezmoiignore", ".gitignore"] {
+        fs::write(f.c.source.join(name), custom).unwrap();
+    }
+    dot_cli::ignores::install_defaults(&f.c).unwrap();
+    for name in [".chezmoiignore", ".gitignore"] {
+        let rules = fs::read_to_string(f.c.source.join(name)).unwrap();
+        assert!(rules.ends_with(custom));
+        assert!(rules.contains("# dot: machine ignore defaults v2"));
+        assert!(
+            !rules.contains("**/node_modules"),
+            "edited v1 must not be regenerated"
+        );
+    }
+}

@@ -1,7 +1,10 @@
 pub mod backend;
 pub mod config;
 pub mod git;
+pub mod ignores;
 pub mod migration;
+pub mod onboarding;
+pub mod operation_screen;
 pub mod operations;
 pub mod process;
 pub mod settings;

@@ -135,3 +135,13 @@ pub fn push_target(c: &Config) -> Result<(String, String, String)> {
     }
     Ok((remote, branch, target))
 }
+
+pub fn index_path(c: &Config) -> Result<std::path::PathBuf> {
+    Ok(std::path::PathBuf::from(
+        run(
+            c,
+            &["rev-parse", "--path-format=absolute", "--git-path", "index"],
+        )?
+        .trim(),
+    ))
+}

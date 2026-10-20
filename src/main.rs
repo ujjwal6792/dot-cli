@@ -3,7 +3,7 @@ use clap::{Parser, Subcommand};
 use dot_cli::{
     backend,
     config::Config,
-    git, migration,
+    migration,
     operations::{self, Action, Plan},
     process, settings, sync, ui,
 };
@@ -179,37 +179,8 @@ fn entry() -> Result<()> {
                 }
                 c.machine = m;
             }
-            if let Some(repo) = repo {
-                if repo.starts_with('-') || repo.contains('\n') {
-                    bail!("Invalid repository address");
-                }
-                if c.source.exists() {
-                    bail!(
-                        "Source already exists. Use --source with a new path or dot source to switch."
-                    );
-                }
-                if let Some(parent) = c.source.parent() {
-                    fs::create_dir_all(parent)?;
-                }
-                process::run(
-                    &c.git,
-                    &process::strings(&["clone", "--", &repo, &c.source.to_string_lossy()]),
-                    None,
-                    None,
-                )?;
-            } else {
-                fs::create_dir_all(&c.source)?;
-                if git::run(&c, &["rev-parse", "--show-toplevel"]).is_err() {
-                    git::run(&c, &["init", "-b", "main"])?;
-                }
-            }
-            c.save(&path)?;
-            let skill = ui::install_skill(&c)?;
-            println!(
-                "Connected {} on {}. No HOME files applied.\n{skill}\nRun dot to open the workspace.",
-                c.source.display(),
-                c.machine
-            );
+            let report = ui::initialize(&c, &path, repo.as_deref())?;
+            println!("{}", report.message(&c.source));
             Ok(())
         }
         Some(Commands::Status) => print(&backend::snapshot(&c)?),
