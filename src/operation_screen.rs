@@ -50,6 +50,7 @@ impl View {
 pub struct Areas {
     pub controls: Vec<(Rect, KeyCode)>,
     pub max_scroll: u16,
+    pub body: Rect,
 }
 
 fn name(action: Action) -> &'static str {
@@ -108,7 +109,7 @@ fn files(paths: &[String], label: &str, color: Color) -> Vec<Line<'static>> {
     lines
 }
 
-pub fn review(f: &mut Frame, c: &Config, plan: &Plan, view: &View) -> Areas {
+pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -> Areas {
     let capture = plan.action == Action::Capture;
     let forget = plan.action == Action::Forget;
     let ignore = matches!(plan.action, Action::Ignore | Action::IgnoreDefaults);
@@ -243,16 +244,19 @@ pub fn review(f: &mut Frame, c: &Config, plan: &Plan, view: &View) -> Areas {
     };
     draw(
         f,
+        area,
         header,
         ["1 Files", "2 Changes"],
         body,
         view,
-        &[(&confirm, KeyCode::Char('y')), ("Esc Cancel", KeyCode::Esc)],
-        if forget { AMBER } else { MINT },
+        Controls {
+            buttons: &[(&confirm, KeyCode::Char('y')), ("Esc Cancel", KeyCode::Esc)],
+            accent: if forget { AMBER } else { MINT },
+        },
     )
 }
 
-pub fn result(f: &mut Frame, c: &Config, outcome: &Outcome, view: &View) -> Areas {
+pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &View) -> Areas {
     let incomplete = outcome.failed.is_some() || !outcome.not_attempted.is_empty();
     let capture = outcome.action == Action::Capture;
     let forget = outcome.action == Action::Forget;
@@ -373,66 +377,75 @@ pub fn result(f: &mut Frame, c: &Config, outcome: &Outcome, view: &View) -> Area
     };
     draw(
         f,
+        area,
         header,
         ["1 Files", "2 Details"],
         body,
         view,
-        &[
-            ("Enter Done", KeyCode::Enter),
-            ("g Review in Git", KeyCode::Char('g')),
-        ],
-        accent,
+        Controls {
+            buttons: &[
+                ("Enter Done", KeyCode::Enter),
+                ("g Review in Git", KeyCode::Char('g')),
+            ],
+            accent,
+        },
     )
+}
+
+struct Controls<'a> {
+    buttons: &'a [(&'a str, KeyCode)],
+    accent: Color,
 }
 
 fn draw(
     f: &mut Frame,
+    content: Rect,
     header: Vec<Line<'static>>,
     tabs: [&str; 2],
     body: Text<'static>,
     view: &View,
-    buttons: &[(&str, KeyCode)],
-    accent: Color,
+    controls: Controls<'_>,
 ) -> Areas {
-    let area = f.area();
-    f.render_widget(Block::default().fg(INK).bg(BG), area);
-    let width = area
-        .width
-        .saturating_sub(if area.width >= 80 { 8 } else { 2 })
-        .min(112);
-    let height = area
-        .height
-        .saturating_sub(if area.height >= 26 { 4 } else { 0 })
-        .min(40);
-    let content = Rect::new(
-        area.x + area.width.saturating_sub(width) / 2,
-        area.y + area.height.saturating_sub(height) / 2,
-        width,
-        height,
-    );
+    let Controls { buttons, accent } = controls;
+    let width = content.width;
+    let height = content.height;
     let header = Paragraph::new(header).wrap(Wrap { trim: false });
     let header_height = (header.line_count(width) as u16).min(if height < 10 {
-        2
+        1
     } else if height < 16 {
-        3
+        2
     } else {
         7
     });
+    let button_width = buttons
+        .iter()
+        .map(|(label, _)| label.chars().count())
+        .sum::<usize>()
+        + buttons.len().saturating_sub(1) * 3;
+    let button_rows = if button_width > width as usize { 2 } else { 1 };
     let regions = Layout::vertical([
         Constraint::Length(header_height + u16::from(height >= 16)),
-        Constraint::Length(if height < 10 { 1 } else { 2 }),
+        Constraint::Length(if height < 16 { 1 } else { 2 }),
         Constraint::Min(1),
-        Constraint::Length(if height < 16 { 3 } else { 4 }),
+        Constraint::Length(button_rows + 1),
     ])
     .split(content);
     f.render_widget(header, regions[0]);
-    let mut areas = Areas::default();
+    let mut areas = Areas {
+        body: regions[2],
+        ..Areas::default()
+    };
     let mut x = regions[1].x;
     for (i, label) in tabs.into_iter().enumerate() {
-        let w = (label.len() as u16 + 4).min(regions[1].right().saturating_sub(x));
+        let display = if width < 48 {
+            label.to_owned()
+        } else {
+            format!("  {label}  ")
+        };
+        let w = (display.chars().count() as u16).min(regions[1].right().saturating_sub(x));
         let rect = Rect::new(x, regions[1].y, w, 1);
         f.render_widget(
-            Paragraph::new(format!("  {label}  ")).style(if i == view.tab {
+            Paragraph::new(display).style(if i == view.tab {
                 Style::default().fg(BG).bg(accent).bold()
             } else {
                 Style::default().fg(MUTED)
@@ -453,21 +466,18 @@ fn draw(
         paragraph.scroll((view.scroll.min(areas.max_scroll), 0)),
         regions[2],
     );
-    let mut x = regions[3].x;
-    for (i, (label, key)) in buttons.iter().enumerate() {
-        let w = (label.len() as u16 + 4).min(regions[3].right().saturating_sub(x));
-        let rect = Rect::new(x, regions[3].y.saturating_add(1), w, 1);
-        f.render_widget(
-            Paragraph::new(format!("  {label}  ")).style(if i == 0 {
-                Style::default().bg(accent).fg(BG).bold()
-            } else {
-                Style::default().fg(INK)
-            }),
-            rect,
-        );
-        areas.controls.push((rect, *key));
-        x = x.saturating_add(w + 2);
+    let button_area = Rect::new(
+        regions[3].x,
+        regions[3].y,
+        regions[3].width,
+        regions[3].height.saturating_sub(1),
+    );
+    let controls = crate::dialog::controls(f, button_area, buttons);
+    if let Some((rect, _)) = controls.first() {
+        f.buffer_mut()
+            .set_style(*rect, Style::default().fg(BG).bg(accent).bold());
     }
+    areas.controls.extend(controls);
     let hint = if width < 48 {
         "↑/↓ Scroll · Tab View"
     } else {

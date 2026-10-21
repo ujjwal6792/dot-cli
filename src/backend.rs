@@ -41,6 +41,19 @@ pub struct Row {
     pub children: usize,
     pub status: String,
 }
+
+/// A valid selection with no eligible targets, rather than an inspection failure.
+#[derive(Debug)]
+pub struct NoEligibleFiles;
+
+impl std::fmt::Display for NoEligibleFiles {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("No eligible files in selection. Ignored files are skipped; check .chezmoiignore and dot’s default exclusions")
+    }
+}
+
+impl std::error::Error for NoEligibleFiles {}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Filter {
     #[default]
@@ -378,9 +391,7 @@ pub fn exact_targets(
                 .any(|part| part.as_os_str() == ".git")
     });
     if targets.is_empty() {
-        bail!(
-            "No eligible files in selection. Ignored files are skipped; check .chezmoiignore and dot’s default exclusions"
-        );
+        return Err(NoEligibleFiles.into());
     }
     if targets.len() > 10000 {
         bail!("Select a smaller folder (more than 10000 eligible files)");

@@ -4,6 +4,7 @@ import fcntl
 import os
 import pathlib
 import pty
+import re
 import select
 import struct
 import subprocess
@@ -51,7 +52,9 @@ with tempfile.TemporaryDirectory(prefix='dot-missing-source-') as temp:
                 while not (root / 'home/.agents/skills/dot/SKILL.md').exists() and time.monotonic() < deadline:
                     drain(0.1)
                 drain(0.5)
-                assert b'Created a folder for your saved settings' in output
+                # Incremental redraws can move the cursor across unchanged spaces.
+                visible = re.sub(rb'\x1b\[[0-?]*[ -/]*[@-~]', b' ', output)
+                assert re.search(rb'Created\s+a\s+folder\s+for\s+your\s+saved\s+settings', visible)
                 assert b'Powered by:' in output
                 assert b'Open files' in output
                 assert (root / 'missing/.git').is_dir(), 'setup action did not initialize Git source'

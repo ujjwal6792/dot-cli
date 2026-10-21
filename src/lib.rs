@@ -1,5 +1,6 @@
 pub mod backend;
 pub mod config;
+mod dialog;
 pub mod git;
 pub mod ignores;
 pub mod migration;

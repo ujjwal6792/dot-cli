@@ -35,12 +35,17 @@ uses ordinary terminal characters. The compact powered-by row uses Nerd Fonts'
 home icon for chezmoi and Git icon; select a Nerd Font in your terminal, or run
 `DOT_ICONS=none dot` for text-only labels.
 
-Operation reviews have **Files** and **Changes** tabs (`1` / `2` or Tab).
-Review the exact targets and preview, then press `y` to confirm or Esc to cancel.
+Actions open centered dialogs over the workspace. Preparing, review, execution,
+and results stay in the same dialog. Reviews have **Files** and **Changes** tabs
+(`1` / `2` or Tab). Review the exact targets and preview, then press `y` to confirm
+or Esc to cancel. Running operations stay open until their result is available.
 Results summarize completed, failed, and skipped files, grouped by folder;
-**Details** keeps the raw operation record available. Press `g` to review the
-saved copies in Git. Arrow keys, Page Up/Down, Home/End, and the mouse wheel
-scroll the active tab.
+**Details** keeps the raw operation record available. Enter or Esc closes the
+result and returns to your panel; `g` explicitly opens Git. Arrow keys, Page
+Up/Down, Home/End, and the mouse wheel inside the dialog scroll the active tab.
+Dialogs adapt to small terminals; clicks outside them leave the workspace alone.
+Removing an untracked file or folder shows a compact **Nothing to remove**
+message; the original files stay on disk.
 
 When the TUI cannot find its source, its setup screen offers `i` to initialize a
 local source, `c` to clone a repository, and `o` to connect an existing checkout.
@@ -71,7 +76,7 @@ mean the source is committed or published.
 | `c`, `a`, `r` in Files | Capture, apply, restore |
 | `i` in Files or Git | Ignore in both chezmoi and Git with one reviewed action |
 | `d` or Delete in Files | Remove saved copies from dot after review; keep original files |
-| `e` in Files | Edit native source; Ctrl+S reviews changes |
+| `e` in Files | Edit native source; Ctrl+S reviews changes; F2 expands/restores the editor |
 | Space in Git, `v` | Stage/unstage; multi-select Git paths |
 | `c` in Git, `P`, `L`, `F` | Commit, push, pull, fetch |
 | `/`, `f` | Search; All/Managed/Changed |

@@ -1,7 +1,7 @@
 use crate::{
     backend::{self, Filter, Row, Snapshot},
     config::{Config, atomic_write},
-    git, migration,
+    dialog, git, migration,
     onboarding::{self, SetupKind, SetupReport},
     operation_screen::{self, View as OperationView},
     operations::{self, Action, Outcome, Plan},
@@ -75,6 +75,15 @@ enum Control {
 #[derive(Clone, Debug)]
 enum Modal {
     Setup,
+    Busy {
+        label: String,
+        cancellable: bool,
+    },
+    Report {
+        title: String,
+        text: String,
+        scroll: u16,
+    },
     Welcome {
         report: SetupReport,
         scroll: u16,
@@ -82,6 +91,7 @@ enum Modal {
     Confirm {
         command: Control,
         text: String,
+        scroll: u16,
     },
     Menu(usize),
     Input {
@@ -103,6 +113,7 @@ enum Modal {
     },
 }
 enum Work {
+    NothingToRemove(String),
     ConfigMessage(Config, String),
     Welcome(Config, SetupReport),
     Snapshot(Snapshot),
@@ -122,10 +133,12 @@ struct Job {
     rx: Receiver<Result<Work>>,
     label: String,
     kind: JobKind,
+    discard: bool,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
     Operation,
+    Preparation,
     Inspection,
     Preview,
 }
@@ -141,6 +154,9 @@ struct Areas {
     footer: Vec<(Rect, KeyCode)>,
     setup: Vec<(Rect, KeyCode)>,
     welcome_scroll_max: u16,
+    modal_scroll_max: u16,
+    modal_controls: Vec<(Rect, KeyCode)>,
+    modal_body: Rect,
     operation: operation_screen::Areas,
     tabs: Vec<(Rect, Pane, usize)>,
 }
@@ -184,6 +200,7 @@ pub struct App {
     last_click: Option<(String, Instant)>,
     input_cursor: usize,
     external: bool,
+    editor_expanded: bool,
 }
 impl App {
     pub fn new(config: Config, path: PathBuf) -> Self {
@@ -226,6 +243,7 @@ impl App {
             last_click: None,
             input_cursor: 0,
             external: false,
+            editor_expanded: false,
         };
         // Local browsing must not depend on a successful chezmoi/Git inspection.
         // The native snapshot enriches these rows when it becomes available.
@@ -245,6 +263,13 @@ impl App {
             self.notice = "An operation is already running".into();
             return;
         }
+        if matches!(kind, JobKind::Operation | JobKind::Preparation) {
+            self.searching = false;
+            self.modal = Some(Modal::Busy {
+                label: label.into(),
+                cancellable: kind == JobKind::Preparation,
+            });
+        }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
             let _ = tx.send(f());
@@ -253,6 +278,7 @@ impl App {
             rx,
             label: label.into(),
             kind,
+            discard: false,
         });
     }
     fn refresh(&mut self) {
@@ -297,97 +323,122 @@ impl App {
             Err(_) => None,
         });
         if let Some(result) = received {
-            let kind = self.job.take().unwrap().kind;
+            let completed = self.job.take().unwrap();
+            let kind = completed.kind;
             if kind == JobKind::Inspection {
                 // Failed inspection must not turn dismissal into an immediate retry.
                 // Keep the workspace available; R or setup explicitly retries.
                 self.last_refresh = Instant::now();
                 self.refresh_failed = result.is_err();
             }
-            match result {
-                Ok(Work::Snapshot(s)) => {
-                    self.snapshot = s;
-                    self.rebuild();
-                    self.preview_key.clear();
-                    self.last_refresh = Instant::now();
-                    self.notice = "Ready · HOME, source and Git state are separate".into();
-                }
-                Ok(Work::Directory { directory, entries }) => {
-                    self.snapshot
-                        .directory_entries
-                        .insert(directory.clone(), entries);
-                    if directory == self.directory {
+            // A cancelled preparation may finish later; it must never reopen a dialog.
+            if !completed.discard {
+                match result {
+                    Ok(Work::NothingToRemove(text)) => {
+                        self.notice = "Nothing to remove".into();
+                        self.modal = Some(Modal::Text {
+                            title: "Nothing to remove".into(),
+                            text,
+                            scroll: 0,
+                        });
+                    }
+                    Ok(Work::Snapshot(s)) => {
+                        self.snapshot = s;
                         self.rebuild();
                         self.preview_key.clear();
+                        self.last_refresh = Instant::now();
+                        self.notice = "Ready · HOME, source and Git state are separate".into();
                     }
-                }
-                Ok(Work::Preview { key, text }) => {
-                    if key == self.current_key() {
-                        self.detail = text;
-                        self.scroll = 0;
+                    Ok(Work::Directory { directory, entries }) => {
+                        self.snapshot
+                            .directory_entries
+                            .insert(directory.clone(), entries);
+                        if directory == self.directory {
+                            self.rebuild();
+                            self.preview_key.clear();
+                        }
                     }
-                }
-                Ok(Work::Plan(p)) => {
-                    self.modal = Some(Modal::Review {
-                        plan: p,
-                        view: OperationView::default(),
-                    })
-                }
-                Ok(Work::Applied(c, r)) => {
-                    self.config = c;
-                    self.notice = format!(
-                        "{} updated · {} failed · {} not attempted. {}",
-                        r.succeeded.len(),
-                        usize::from(r.failed.is_some()),
-                        r.not_attempted.len(),
-                        r.message
-                    );
-                    self.modal = Some(Modal::Outcome {
-                        outcome: r,
-                        view: OperationView::default(),
-                    });
-                    self.selected.clear();
-                    self.git_selected.clear();
-                    self.refresh();
-                }
-                Ok(Work::ConfigMessage(c, t)) => {
-                    self.config = c;
-                    self.directory.clear();
-                    self.notice = t.clone();
-                    self.modal = Some(Modal::Text {
-                        title: "Result".into(),
-                        text: t,
-                        scroll: 0,
-                    });
-                    self.refresh();
-                }
-                Ok(Work::Welcome(c, report)) => {
-                    self.config = c;
-                    self.directory.clear();
-                    self.modal = Some(Modal::Welcome { report, scroll: 0 });
-                    self.refresh();
-                }
-                Ok(Work::Message(t)) => {
-                    self.modal = Some(Modal::Text {
-                        title: "Result".into(),
-                        text: t,
-                        scroll: 0,
-                    });
-                    self.refresh();
-                }
-                Err(e) => {
-                    self.notice = e.to_string();
-                    self.modal = Some(
-                        if kind == JobKind::Inspection && !self.config.source.exists() {
-                            Modal::Setup
-                        } else {
-                            Modal::Text {
-                                title: "Needs attention".into(),
-                                text: format!("{e:#}"),
-                                scroll: 0,
-                            }
-                        },
-                    );
+                    Ok(Work::Preview { key, text }) => {
+                        if key == self.current_key() {
+                            self.detail = text;
+                            self.scroll = 0;
+                        }
+                    }
+                    Ok(Work::Plan(p)) => {
+                        self.modal = Some(Modal::Review {
+                            plan: p,
+                            view: OperationView::default(),
+                        })
+                    }
+                    Ok(Work::Applied(c, r)) => {
+                        self.config = c;
+                        self.notice = format!(
+                            "{} updated · {} failed · {} not attempted. {}",
+                            r.succeeded.len(),
+                            usize::from(r.failed.is_some()),
+                            r.not_attempted.len(),
+                            r.message
+                        );
+                        self.modal = Some(Modal::Outcome {
+                            outcome: r,
+                            view: OperationView::default(),
+                        });
+                        self.selected.clear();
+                        self.git_selected.clear();
+                        self.refresh();
+                    }
+                    Ok(Work::ConfigMessage(c, t)) => {
+                        if self.config.source != c.source {
+                            self.directory.clear();
+                        }
+                        self.config = c;
+                        self.notice = t.clone();
+                        self.modal = Some(Modal::Report {
+                            title: "Result".into(),
+                            text: t,
+                            scroll: 0,
+                        });
+                        self.refresh();
+                    }
+                    Ok(Work::Welcome(c, report)) => {
+                        self.config = c;
+                        self.directory.clear();
+                        self.modal = Some(Modal::Welcome { report, scroll: 0 });
+                        self.refresh();
+                    }
+                    Ok(Work::Message(t)) => {
+                        self.modal = Some(Modal::Report {
+                            title: "Result".into(),
+                            text: t,
+                            scroll: 0,
+                        });
+                        self.refresh();
+                    }
+                    Err(e) => {
+                        self.notice = e.to_string();
+                        if matches!(kind, JobKind::Inspection | JobKind::Preview)
+                            && self.modal.is_some()
+                        {
+                            return;
+                        }
+                        self.modal = Some(
+                            if kind == JobKind::Inspection && !self.config.source.exists() {
+                                Modal::Setup
+                            } else if matches!(kind, JobKind::Operation | JobKind::Preparation) {
+                                Modal::Report {
+                                    title: "Needs attention".into(),
+                                    text: format!("{e:#}"),
+                                    scroll: 0,
+                                }
+                            } else {
+                                Modal::Text {
+                                    title: "Needs attention".into(),
+                                    text: format!("{e:#}"),
+                                    scroll: 0,
+                                }
+                            },
+                        );
+                    }
                 }
             }
         }
@@ -513,9 +564,20 @@ impl App {
         } else {
             payload
         };
-        self.modal = None;
-        self.launch(action.label(), move || {
-            Ok(Work::Plan(operations::plan(&c, action, &paths, payload)?))
+        self.launch_job(JobKind::Preparation, action.label(), move || {
+            match operations::plan(&c, action, &paths, payload) {
+                Err(error) if action == Action::Forget && error.is::<backend::NoEligibleFiles>() => {
+                    let subject = match paths.as_slice() {
+                        [path] if c.home.join(path).is_dir() => "This folder",
+                        [_] => "This file",
+                        _ => "This selection",
+                    };
+                    Ok(Work::NothingToRemove(format!(
+                        "{subject} contains no files tracked by dot.\nYour original files are unchanged."
+                    )))
+                }
+                result => result.map(Work::Plan),
+            }
         });
     }
     fn tab_index(&self, pane: Pane) -> usize {
@@ -647,6 +709,24 @@ impl App {
         if key.code == KeyCode::Char('c') && key.modifiers.contains(KeyModifiers::CONTROL) {
             return self.request_quit();
         }
+        if self.modal.is_some() {
+            if key.code == KeyCode::Char('q')
+                && matches!(
+                    self.modal,
+                    Some(
+                        Modal::Text { .. }
+                            | Modal::Report { .. }
+                            | Modal::Setup
+                            | Modal::Welcome { .. }
+                            | Modal::Outcome { .. }
+                    )
+                )
+            {
+                return self.request_quit();
+            }
+            self.modal_key(key);
+            return false;
+        }
         // Inputs own character keys before every global shortcut, including q and panel numbers.
         if self.searching {
             match key.code {
@@ -658,23 +738,6 @@ impl App {
                 _ => {}
             }
             self.rebuild();
-            return false;
-        }
-        if self.modal.is_some() {
-            if key.code == KeyCode::Char('q')
-                && matches!(
-                    self.modal,
-                    Some(
-                        Modal::Text { .. }
-                            | Modal::Setup
-                            | Modal::Welcome { .. }
-                            | Modal::Outcome { .. }
-                    )
-                )
-            {
-                return self.request_quit();
-            }
-            self.modal_key(key);
             return false;
         }
         match key.code {
@@ -787,6 +850,7 @@ impl App {
         false
     }
     fn edit_source(&mut self) {
+        self.editor_expanded = false;
         if let Some(row) = self.rows.get(self.cursor)
             && let Some(m) = self.snapshot.managed.get(&row.path)
         {
@@ -805,8 +869,20 @@ impl App {
         }
     }
     fn modal_key(&mut self, key: KeyEvent) {
+        // Keyboard/scroll interactions break a pending menu double-click.
+        self.last_click = None;
         let modal = self.modal.take().unwrap();
         match modal {
+            Modal::Busy { label, cancellable } => {
+                if cancellable && matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) {
+                    if let Some(job) = &mut self.job {
+                        job.discard = true;
+                    }
+                    self.notice = "Review cancelled; waiting for preparation to finish".into();
+                } else {
+                    self.modal = Some(Modal::Busy { label, cancellable });
+                }
+            }
             Modal::Welcome { report, mut scroll } => {
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc => {
@@ -843,14 +919,30 @@ impl App {
                 KeyCode::Esc | KeyCode::Enter => {}
                 _ => self.modal = Some(Modal::Setup),
             },
-            Modal::Confirm { command, text } => {
+            Modal::Confirm {
+                command,
+                text,
+                mut scroll,
+            } => {
                 if key.code == KeyCode::Char('y') {
                     self.confirm_control(command);
                 } else if !matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) {
-                    self.modal = Some(Modal::Confirm { command, text });
+                    let mut view = OperationView { tab: 0, scroll };
+                    view.key(key.code, self.areas.modal_scroll_max);
+                    scroll = view.scroll;
+                    self.modal = Some(Modal::Confirm {
+                        command,
+                        text,
+                        scroll,
+                    });
                 }
             }
             Modal::Input { purpose, mut text } => {
+                if matches!(purpose, Purpose::Source(_)) && key.code == KeyCode::F(2) {
+                    self.editor_expanded = !self.editor_expanded;
+                    self.modal = Some(Modal::Input { purpose, text });
+                    return;
+                }
                 if key.code == KeyCode::Esc {
                     return;
                 }
@@ -894,6 +986,7 @@ impl App {
                         Purpose::Source(_) => self.action(Action::EditSource, Some(text)),
                         Purpose::Switch => {
                             self.modal = Some(Modal::Confirm {
+                                scroll: 0,
                                 command: Control::Switch(PathBuf::from(&text)),
                                 text: format!(
                                     "Archive the existing source at {} and connect {}. HOME stays unchanged. Local automatic scope and trust will be reset.",
@@ -911,6 +1004,7 @@ impl App {
                         }
                         Purpose::Recover => {
                             self.modal = Some(Modal::Confirm {
+                                scroll: 0,
                                 command: Control::Recover(text.clone()),
                                 text: format!(
                                     "Restore backed-up files for {text}. A changed state blocks recovery; arbitrary script effects are not reversed."
@@ -985,24 +1079,46 @@ impl App {
                 }
                 self.modal = Some(Modal::Outcome { outcome, view });
             }
-            Modal::Text {
-                title,
-                text,
-                mut scroll,
-            } => {
+            Modal::Text { .. } | Modal::Report { .. } => {
+                let report = matches!(modal, Modal::Report { .. });
+                let (title, text, mut scroll) = match modal {
+                    Modal::Text {
+                        title,
+                        text,
+                        scroll,
+                    }
+                    | Modal::Report {
+                        title,
+                        text,
+                        scroll,
+                    } => (title, text, scroll),
+                    _ => unreachable!(),
+                };
                 if matches!(key.code, KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q')) {
                     return;
                 }
-                if matches!(key.code, KeyCode::Down | KeyCode::Char('j')) {
-                    scroll = scroll.saturating_add(1);
+                scroll = match key.code {
+                    KeyCode::Down | KeyCode::Char('j') => scroll.saturating_add(1),
+                    KeyCode::Up | KeyCode::Char('k') => scroll.saturating_sub(1),
+                    KeyCode::PageDown => scroll.saturating_add(10),
+                    KeyCode::PageUp => scroll.saturating_sub(10),
+                    KeyCode::Home => 0,
+                    KeyCode::End => self.areas.modal_scroll_max,
+                    _ => scroll,
                 }
-                if matches!(key.code, KeyCode::Up | KeyCode::Char('k')) {
-                    scroll = scroll.saturating_sub(1);
-                }
-                self.modal = Some(Modal::Text {
-                    title,
-                    text,
-                    scroll,
+                .min(self.areas.modal_scroll_max);
+                self.modal = Some(if report {
+                    Modal::Report {
+                        title,
+                        text,
+                        scroll,
+                    }
+                } else {
+                    Modal::Text {
+                        title,
+                        text,
+                        scroll,
+                    }
                 });
             }
             Modal::Menu(mut i) => {
@@ -1093,8 +1209,8 @@ impl App {
                     text: self.config.machine.clone(),
                 })
             }
-            23=>{self.modal=Some(Modal::Confirm{command:Control::Service,text:format!("Install and start a local user service for {}? Sync must already be enabled. It runs while the TUI is closed, checking every {} seconds.",self.config.machine,self.config.interval_seconds)});},
-            24=>self.modal=Some(Modal::Confirm{command:Control::Packages,text:"Install missing Git and chezmoi using Homebrew (macOS) or pacman (Linux)? The terminal will return to normal mode for package-manager authentication.".into()}),
+            23=>{self.modal=Some(Modal::Confirm{scroll:0,command:Control::Service,text:format!("Install and start a local user service for {}? Sync must already be enabled. It runs while the TUI is closed, checking every {} seconds.",self.config.machine,self.config.interval_seconds)});},
+            24=>self.modal=Some(Modal::Confirm{scroll:0,command:Control::Packages,text:"Install missing Git and chezmoi using Homebrew (macOS) or pacman (Linux)? The terminal will return to normal mode for package-manager authentication.".into()}),
             25 => {
                 let c = self.config.clone();
                 self.launch("Installing agent skill", move || {
@@ -1155,6 +1271,7 @@ impl App {
             }
         };
         self.modal = Some(Modal::Confirm {
+            scroll: 0,
             command: Control::Policy(key.into(), !current),
             text: format!("Set {key} = {} on this machine?\n\n{detail}", !current),
         });
@@ -1216,36 +1333,48 @@ impl App {
     fn mouse(&mut self, mouse: event::MouseEvent) {
         let pos = Position::new(mouse.column, mouse.row);
         if self.modal.is_some() {
+            if !self.areas.modal.contains(pos) {
+                return;
+            }
             match mouse.kind {
-                MouseEventKind::ScrollDown => {
-                    self.modal_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))
-                }
-                MouseEventKind::ScrollUp => {
-                    self.modal_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))
+                MouseEventKind::ScrollDown | MouseEventKind::ScrollUp => {
+                    if self.areas.modal_body.contains(pos) {
+                        let key = if mouse.kind == MouseEventKind::ScrollDown {
+                            KeyCode::Down
+                        } else {
+                            KeyCode::Up
+                        };
+                        self.modal_key(KeyEvent::new(key, KeyModifiers::NONE));
+                    }
                 }
                 MouseEventKind::Down(event::MouseButton::Left) => {
-                    if matches!(
-                        self.modal,
-                        Some(Modal::Review { .. } | Modal::Outcome { .. })
-                    ) {
-                        if let Some((_, code)) = self
-                            .areas
-                            .operation
-                            .controls
-                            .iter()
-                            .find(|(r, _)| r.contains(pos))
-                        {
-                            self.key(KeyEvent::new(*code, KeyModifiers::NONE));
-                        }
-                    } else if matches!(self.modal, Some(Modal::Setup | Modal::Welcome { .. })) {
-                        if let Some((_, code)) =
-                            self.areas.setup.iter().find(|(r, _)| r.contains(pos))
-                        {
-                            self.key(KeyEvent::new(*code, KeyModifiers::NONE));
-                        }
-                    } else if let Some(Modal::Menu(i)) = &mut self.modal {
+                    let hit = self
+                        .areas
+                        .modal_controls
+                        .iter()
+                        .chain(self.areas.operation.controls.iter())
+                        .chain(self.areas.setup.iter())
+                        .find(|(r, _)| r.contains(pos))
+                        .map(|(_, key)| *key);
+                    if let Some(key) = hit {
+                        let modifiers = if key == KeyCode::Char('s')
+                            && matches!(
+                                self.modal,
+                                Some(Modal::Input {
+                                    purpose: Purpose::Source(_),
+                                    ..
+                                })
+                            ) {
+                            KeyModifiers::CONTROL
+                        } else {
+                            KeyModifiers::NONE
+                        };
+                        self.key(KeyEvent::new(key, modifiers));
+                    } else if self.areas.modal_body.contains(pos)
+                        && let Some(Modal::Menu(i)) = &mut self.modal
+                    {
                         let index = self.menu_state.offset()
-                            + mouse.row.saturating_sub(self.areas.modal.y + 1) as usize;
+                            + (mouse.row - self.areas.modal_body.y) as usize;
                         if index < MENU.len() {
                             *i = index;
                             let key = format!("menu-{index}");
@@ -1257,21 +1386,6 @@ impl App {
                                 self.modal_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
                             }
                         }
-                    } else if matches!(self.modal, Some(Modal::Confirm { .. }))
-                        && mouse.row == self.areas.modal.bottom().saturating_sub(1)
-                    {
-                        self.modal_key(KeyEvent::new(
-                            if mouse.column < self.areas.modal.x + 20 {
-                                KeyCode::Char('y')
-                            } else {
-                                KeyCode::Esc
-                            },
-                            KeyModifiers::NONE,
-                        ));
-                    } else if matches!(self.modal, Some(Modal::Text { .. }))
-                        && mouse.row == self.areas.modal.bottom().saturating_sub(1)
-                    {
-                        self.modal = None;
                     }
                 }
                 _ => {}
@@ -1368,20 +1482,10 @@ impl App {
             let (button, max_scroll) =
                 onboarding::draw(f, area, &self.config.source, report, *scroll);
             self.areas.modal = area;
+            self.areas.modal_body = area;
             self.areas.setup.push((button, KeyCode::Enter));
             self.areas.welcome_scroll_max = max_scroll;
             return;
-        }
-        match &self.modal {
-            Some(Modal::Review { plan, view }) => {
-                self.areas.operation = operation_screen::review(f, &self.config, plan, view);
-                return;
-            }
-            Some(Modal::Outcome { outcome, view }) => {
-                self.areas.operation = operation_screen::result(f, &self.config, outcome, view);
-                return;
-            }
-            _ => {}
         }
         let outer = Layout::vertical([
             Constraint::Min(1),
@@ -1508,137 +1612,244 @@ impl App {
                 KeyCode::Char('?'),
             ));
         }
-        if let Some(modal) = self.modal.clone() {
-            self.areas.modal = outer[0];
-            f.render_widget(Clear, outer[0]);
-            match modal {
-                Modal::Welcome { .. } | Modal::Review { .. } | Modal::Outcome { .. } => {
-                    unreachable!("Dedicated screens are rendered before the workspace")
+        self.draw_modal(f, outer[0]);
+    }
+
+    fn draw_modal(&mut self, f: &mut Frame, workspace: Rect) {
+        let Some(modal) = self.modal.clone() else {
+            return;
+        };
+        let area = f.area();
+        let bounds = match &modal {
+            Modal::Setup => workspace,
+            Modal::Welcome { .. } => unreachable!("Welcome is a startup screen"),
+            Modal::Review { .. }
+            | Modal::Outcome { .. }
+            | Modal::Busy { .. }
+            | Modal::Report { .. } => dialog::operation_bounds(area),
+            Modal::Menu(_) => dialog::bounds(area, 76, 24),
+            Modal::Input {
+                purpose: Purpose::Source(_),
+                ..
+            } => {
+                if self.editor_expanded {
+                    area
+                } else {
+                    dialog::operation_bounds(area)
                 }
-                Modal::Setup => {
-                    let block = Block::bordered()
-                        .title("Welcome to dot · Save and reuse your app settings")
-                        .title_bottom("[Enter / Esc Back · q / Ctrl+C Quit]");
-                    let inner = block.inner(outer[0]);
-                    f.render_widget(block, outer[0]);
-                    let areas = Layout::vertical([
-                        Constraint::Length(4),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Length(1),
-                        Constraint::Min(0),
-                    ])
-                    .split(inner);
-                    f.render_widget(Paragraph::new(format!(
-                        "Choose where dot will keep copies of your settings.\nThe folder below hasn't been created yet:\n{}\nYour apps' current settings won't change during setup.",
-                        self.config.source.display()
-                    )).wrap(Wrap { trim: false }), areas[0]);
-                    self.areas.setup.clear();
-                    for (index, (label, code)) in [
-                        (
-                            "[i] Start fresh · Create a settings folder",
-                            KeyCode::Char('i'),
-                        ),
-                        (
-                            "[c] Download settings from a Git repository",
-                            KeyCode::Char('c'),
-                        ),
-                        (
-                            "[o] Use a settings folder already on this computer",
-                            KeyCode::Char('o'),
-                        ),
-                        ("[Esc] Explore my files without setup", KeyCode::Esc),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        f.render_widget(
-                            Paragraph::new(label).style(Style::default().fg(Color::LightCyan)),
-                            areas[index + 1],
-                        );
-                        self.areas.setup.push((areas[index + 1], code));
-                    }
+            }
+            Modal::Input { .. } => dialog::bounds(area, 72, 8),
+            Modal::Confirm { text, .. } => {
+                let width = dialog::bounds(area, 72, 20).width.saturating_sub(2);
+                let lines = Paragraph::new(text.as_str())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width);
+                dialog::bounds(area, 72, (lines.saturating_add(5).min(24) as u16).max(8))
+            }
+            Modal::Text { text, .. } => {
+                let width = dialog::bounds(area, 88, 26).width.saturating_sub(2);
+                let lines = Paragraph::new(text.as_str())
+                    .wrap(Wrap { trim: false })
+                    .line_count(width);
+                dialog::bounds(area, 88, lines.saturating_add(5).min(26) as u16)
+            }
+        };
+        self.areas.modal = bounds;
+        if !matches!(modal, Modal::Setup) {
+            dialog::dim(f);
+        }
+        let editor_title = match &modal {
+            Modal::Input {
+                purpose: Purpose::Source(path),
+                ..
+            } => format!("Edit source · {path}"),
+            _ => String::new(),
+        };
+        let title = match &modal {
+            Modal::Setup => "Welcome to dot · Save and reuse your app settings",
+            Modal::Review { .. } => "Review operation",
+            Modal::Outcome { .. } => "Operation result",
+            Modal::Busy {
+                cancellable: true, ..
+            } => "Preparing review",
+            Modal::Busy { .. } => "Operation in progress",
+            Modal::Report { title, .. } | Modal::Text { title, .. } => title,
+            Modal::Confirm { .. } => "Review local action",
+            Modal::Menu(_) => "Actions · Enter activate · Esc cancel",
+            Modal::Input { purpose, .. } => match purpose {
+                Purpose::Setting(_) => "Setting key=value",
+                Purpose::Repo => "Repository URL",
+                Purpose::Commit => "Commit message",
+                Purpose::Source(_) => &editor_title,
+                Purpose::Switch => "New source path",
+                Purpose::Machine => "Machine label",
+                Purpose::Recover => "Recovery id",
+            },
+            Modal::Welcome { .. } => unreachable!(),
+        };
+        let inner = dialog::frame(f, bounds, title);
+        let regions =
+            Layout::vertical([Constraint::Min(0), Constraint::Length(2.min(inner.height))])
+                .split(inner);
+        self.areas.modal_body = regions[0];
+        match modal {
+            Modal::Welcome { .. } => unreachable!(),
+            Modal::Review { plan, view } => {
+                self.areas.operation =
+                    operation_screen::review(f, inner, &self.config, &plan, &view);
+                self.areas.modal_body = self.areas.operation.body;
+            }
+            Modal::Outcome { outcome, view } => {
+                self.areas.operation =
+                    operation_screen::result(f, inner, &self.config, &outcome, &view);
+                self.areas.modal_body = self.areas.operation.body;
+            }
+            Modal::Busy { label, cancellable } => {
+                let message = if cancellable {
+                    format!("{label}…\n\nChecking exact targets and preparing the preview.")
+                } else {
+                    format!(
+                        "{label}…\n\nPlease wait for the result. This operation cannot be cancelled."
+                    )
+                };
+                f.render_widget(
+                    Paragraph::new(message).wrap(Wrap { trim: false }),
+                    regions[0],
+                );
+                if cancellable {
+                    self.areas.modal_controls =
+                        dialog::controls(f, regions[1], &[("Esc Cancel", KeyCode::Esc)]);
                 }
-                Modal::Confirm { text, .. } => {
-                    f.render_widget(
-                        Paragraph::new(text).wrap(Wrap { trim: false }).block(
-                            Block::bordered()
-                                .title("Review local action · y confirm · Esc cancel")
-                                .title_bottom("[y Execute]         [Esc Cancel]"),
-                        ),
-                        outer[0],
-                    );
+            }
+            Modal::Setup => {
+                let areas = Layout::vertical([
+                    Constraint::Length(4),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Length(1),
+                    Constraint::Min(0),
+                ])
+                .split(inner);
+                f.render_widget(Paragraph::new(format!(
+                    "Choose where dot will keep copies of your settings.\nThe folder below hasn't been created yet:\n{}\nYour apps' current settings won't change during setup.",
+                    self.config.source.display()
+                )).wrap(Wrap { trim: false }), areas[0]);
+                for (index, (label, code)) in [
+                    (
+                        "[i] Start fresh · Create a settings folder",
+                        KeyCode::Char('i'),
+                    ),
+                    (
+                        "[c] Download settings from a Git repository",
+                        KeyCode::Char('c'),
+                    ),
+                    (
+                        "[o] Use a settings folder already on this computer",
+                        KeyCode::Char('o'),
+                    ),
+                    ("[Esc] Explore my files without setup", KeyCode::Esc),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    f.render_widget(Paragraph::new(label).fg(Color::LightCyan), areas[index + 1]);
+                    self.areas.setup.push((areas[index + 1], code));
                 }
-                Modal::Menu(i) => {
-                    self.menu_state.select(Some(i));
-                    let list = List::new(MENU.iter().map(|s| ListItem::new(*s)))
-                        .block(Block::bordered().title("Actions · Enter activate · Esc cancel"))
-                        .highlight_style(selection_style())
-                        .highlight_symbol("› ");
-                    f.render_stateful_widget(list, outer[0], &mut self.menu_state);
+                // Keep the existing startup exit affordance.
+                f.render_widget(
+                    Paragraph::new("Enter / Esc Back · q / Ctrl+C Quit"),
+                    Rect::new(
+                        bounds.x + 1,
+                        bounds.bottom().saturating_sub(1),
+                        bounds.width.saturating_sub(2),
+                        1,
+                    ),
+                );
+            }
+            Modal::Confirm { text, scroll, .. } => {
+                self.areas.modal_scroll_max = Paragraph::new(text.as_str())
+                    .wrap(Wrap { trim: false })
+                    .line_count(regions[0].width)
+                    .saturating_sub(regions[0].height as usize)
+                    .min(u16::MAX as usize) as u16;
+                f.render_widget(
+                    Paragraph::new(text)
+                        .wrap(Wrap { trim: false })
+                        .scroll((scroll.min(self.areas.modal_scroll_max), 0)),
+                    regions[0],
+                );
+                self.areas.modal_controls = dialog::controls(
+                    f,
+                    regions[1],
+                    &[
+                        ("y Execute", KeyCode::Char('y')),
+                        ("Esc Cancel", KeyCode::Esc),
+                    ],
+                );
+            }
+            Modal::Menu(i) => {
+                self.menu_state.select(Some(i));
+                let list = List::new(MENU.iter().map(|s| ListItem::new(*s)))
+                    .highlight_style(selection_style())
+                    .highlight_symbol("› ");
+                f.render_stateful_widget(list, regions[0], &mut self.menu_state);
+                self.areas.modal_controls = dialog::controls(
+                    f,
+                    regions[1],
+                    &[
+                        ("Enter Activate", KeyCode::Enter),
+                        ("Esc Cancel", KeyCode::Esc),
+                    ],
+                );
+            }
+            Modal::Text { text, scroll, .. } | Modal::Report { text, scroll, .. } => {
+                let paragraph = Paragraph::new(text).wrap(Wrap { trim: false });
+                self.areas.modal_scroll_max = paragraph
+                    .line_count(regions[0].width)
+                    .saturating_sub(regions[0].height as usize)
+                    .min(u16::MAX as usize) as u16;
+                f.render_widget(
+                    paragraph.scroll((scroll.min(self.areas.modal_scroll_max), 0)),
+                    regions[0],
+                );
+                self.areas.modal_controls =
+                    dialog::controls(f, regions[1], &[("Enter / Esc Close", KeyCode::Esc)]);
+            }
+            Modal::Input { purpose, text } => {
+                let source = matches!(purpose, Purpose::Source(_));
+                let mut display = text;
+                let byte = display
+                    .char_indices()
+                    .nth(self.input_cursor)
+                    .map(|(i, _)| i)
+                    .unwrap_or(display.len());
+                // Include the cursor marker in wrapping so it remains visible at line ends.
+                display.insert(byte, '▏');
+                let prefix = &display[..byte + '▏'.len_utf8()];
+                let cursor_rows = Paragraph::new(prefix)
+                    .wrap(Wrap { trim: false })
+                    .line_count(regions[0].width);
+                let offset = cursor_rows
+                    .saturating_sub(regions[0].height as usize)
+                    .min(u16::MAX as usize) as u16;
+                f.render_widget(
+                    Paragraph::new(display)
+                        .scroll((offset, 0))
+                        .wrap(Wrap { trim: false }),
+                    regions[0],
+                );
+                let submit = if source {
+                    ("Ctrl+S Review", KeyCode::Char('s'))
+                } else {
+                    ("Enter Continue", KeyCode::Enter)
+                };
+                // Source review clicks use the same Ctrl+S modifiers as the keyboard.
+                let mut controls = vec![submit, ("Esc Cancel", KeyCode::Esc)];
+                if source {
+                    controls.push(("F2 Expand/restore", KeyCode::F(2)));
                 }
-                Modal::Text {
-                    title,
-                    text,
-                    scroll,
-                } => {
-                    f.render_widget(
-                        Paragraph::new(text)
-                            .block(
-                                Block::bordered()
-                                    .title(format!("{title} · Enter/Esc back"))
-                                    .title_bottom("[Enter / Esc Back · q / Ctrl+C Quit]"),
-                            )
-                            .wrap(Wrap { trim: false })
-                            .scroll((scroll, 0)),
-                        outer[0],
-                    );
-                }
-                Modal::Input { purpose, text } => {
-                    let title = match purpose {
-                        Purpose::Setting(_) => "Setting key=value · Enter review · Esc cancel",
-                        Purpose::Repo => {
-                            "Repository URL · Enter clone to configured source · Esc cancel"
-                        }
-                        Purpose::Commit => "Commit message · Enter review",
-                        Purpose::Source(ref p) => {
-                            let _ = p;
-                            "Edit source · Ctrl+S review · arrows move · Esc cancel"
-                        }
-                        Purpose::Switch => {
-                            "New source path · Enter archives and switches · Esc cancel"
-                        }
-                        Purpose::Machine => "Machine label · Enter save",
-                        Purpose::Recover => {
-                            "Recovery id · Enter restores if unchanged · Esc cancel"
-                        }
-                    };
-                    let mut display = text;
-                    let byte = display
-                        .char_indices()
-                        .nth(self.input_cursor)
-                        .map(|(i, _)| i)
-                        .unwrap_or(display.len());
-                    let before = &display[..byte];
-                    let width = outer[0].width.saturating_sub(2).max(1) as usize;
-                    let cursor_row: usize = before
-                        .split('\n')
-                        .map(|line| 1 + line.chars().count() / width)
-                        .sum::<usize>()
-                        .saturating_sub(1);
-                    let offset = cursor_row
-                        .saturating_sub(outer[0].height.saturating_sub(4) as usize)
-                        .min(u16::MAX as usize) as u16;
-                    display.insert(byte, '▏');
-                    f.render_widget(
-                        Paragraph::new(display)
-                            .scroll((offset, 0))
-                            .block(Block::bordered().title(title))
-                            .wrap(Wrap { trim: false }),
-                        outer[0],
-                    );
-                }
+                self.areas.modal_controls = dialog::controls(f, regions[1], &controls);
             }
         }
     }
@@ -2052,16 +2263,16 @@ pub fn run(config: Config, path: PathBuf) -> Result<()> {
                 Event::Mouse(m) => app.mouse(m),
                 Event::Resize(_, _) => {}
                 Event::Paste(s) => {
-                    if app.searching {
-                        app.query.push_str(&s);
-                        app.rebuild();
-                    } else if let Some(Modal::Input { text, .. }) = &mut app.modal {
+                    if let Some(Modal::Input { text, .. }) = &mut app.modal {
                         let mut chars: Vec<_> = text.chars().collect();
                         let i = app.input_cursor.min(chars.len());
                         let add: Vec<_> = s.chars().collect();
                         app.input_cursor = i + add.len();
                         chars.splice(i..i, add);
                         *text = chars.into_iter().collect();
+                    } else if app.modal.is_none() && app.searching {
+                        app.query.push_str(&s);
+                        app.rebuild();
                     }
                 }
                 _ => {}
@@ -2213,6 +2424,73 @@ mod tests {
         (tmp, a)
     }
     #[test]
+    fn action_dialogs_preserve_the_workspace_around_their_bounds() {
+        let (_t, mut a) = app();
+        let plan = Plan {
+            id: "dialog-fixture".into(),
+            action: Action::Capture,
+            paths: vec![".untracked".into()],
+            payload: None,
+            fingerprint: String::new(),
+            created_at: String::new(),
+            preview: "New saved copy: .untracked".into(),
+        };
+        let outcome = Outcome {
+            id: plan.id.clone(),
+            action: plan.action,
+            succeeded: plan.paths.clone(),
+            failed: None,
+            not_attempted: vec![],
+            message: String::new(),
+        };
+        for modal in [
+            Modal::Menu(0),
+            Modal::Input {
+                purpose: Purpose::Commit,
+                text: "Save settings".into(),
+            },
+            Modal::Confirm {
+                command: Control::Service,
+                text: "Start the service?".into(),
+                scroll: 0,
+            },
+            Modal::Text {
+                title: "Help".into(),
+                text: HELP.into(),
+                scroll: 0,
+            },
+            Modal::Review {
+                plan,
+                view: OperationView::default(),
+            },
+            Modal::Outcome {
+                outcome,
+                view: OperationView::default(),
+            },
+        ] {
+            a.modal = None;
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            let workspace = term.backend().buffer().clone();
+            a.modal = Some(modal.clone());
+            term.draw(|f| a.draw(f)).unwrap();
+            let bounds = a.areas.modal;
+            assert!(bounds.x > 0 && bounds.y > 0, "not an overlay: {modal:?}");
+            assert!(bounds.right() < 120 && bounds.bottom() < 35);
+            for y in 0..35 {
+                for x in 0..120 {
+                    if !bounds.contains(Position::new(x, y)) {
+                        assert_eq!(
+                            term.backend().buffer()[(x, y)].symbol(),
+                            workspace[(x, y)].symbol()
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
     fn brackets_switch_only_the_focused_section_and_wrap() {
         let (_t, mut a) = app();
         let panes = [
@@ -2245,6 +2523,272 @@ mod tests {
         a.key(KeyEvent::new(KeyCode::Char(']'), KeyModifiers::NONE));
         assert_eq!(a.query, "[]");
         assert_eq!(a.activity_tab, 0);
+    }
+
+    #[test]
+    fn dialog_mouse_and_keyboard_never_reach_the_workspace() {
+        let (_t, mut a) = app();
+        a.query = "keep-search".into();
+        a.searching = true;
+        a.selected.insert(".untracked".into());
+        let before = (
+            a.pane,
+            a.directory.clone(),
+            a.cursor,
+            a.query.clone(),
+            a.selected.clone(),
+        );
+        for (w, h) in [(120, 35), (80, 24), (45, 14), (20, 8)] {
+            a.modal = Some(Modal::Menu(4));
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            for kind in [
+                MouseEventKind::ScrollDown,
+                MouseEventKind::Down(event::MouseButton::Left),
+            ] {
+                a.mouse(event::MouseEvent {
+                    kind,
+                    column: 0,
+                    row: 0,
+                    modifiers: KeyModifiers::NONE,
+                });
+            }
+            a.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+            assert!(matches!(a.modal, Some(Modal::Menu(4))));
+            assert_eq!(
+                (
+                    a.pane,
+                    a.directory.clone(),
+                    a.cursor,
+                    a.query.clone(),
+                    a.selected.clone()
+                ),
+                before
+            );
+            // Border/blank-area clicks cannot select an action.
+            a.mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                column: a.areas.modal.x,
+                row: a.areas.modal.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(matches!(a.modal, Some(Modal::Menu(4))));
+            let body = a.areas.modal_body;
+            let expected = a.menu_state.offset();
+            a.mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                column: body.x,
+                row: body.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(matches!(a.modal, Some(Modal::Menu(i)) if i == expected));
+            let cancel = a
+                .areas
+                .modal_controls
+                .iter()
+                .find(|(_, key)| *key == KeyCode::Esc)
+                .unwrap()
+                .0;
+            a.mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                column: cancel.x,
+                row: cancel.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert!(a.modal.is_none());
+            assert_eq!(
+                (
+                    a.pane,
+                    a.directory.clone(),
+                    a.cursor,
+                    a.query.clone(),
+                    a.selected.clone()
+                ),
+                before
+            );
+        }
+    }
+
+    #[test]
+    fn cancelled_preparation_never_reopens_a_dialog() {
+        let (_t, mut a) = app();
+        let (tx, rx) = mpsc::channel::<Result<Work>>();
+        a.launch_job(JobKind::Preparation, "Preparing capture", move || {
+            rx.recv().unwrap()
+        });
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Busy {
+                cancellable: true,
+                ..
+            })
+        ));
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        a.modal = Some(Modal::Menu(2));
+        tx.send(Ok(Work::Plan(Plan {
+            id: "abandoned".into(),
+            action: Action::Capture,
+            paths: vec![".untracked".into()],
+            payload: None,
+            fingerprint: String::new(),
+            created_at: String::new(),
+            preview: String::new(),
+        })))
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while a.job.is_some() && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(a.job.is_none());
+        assert!(matches!(a.modal, Some(Modal::Menu(2))));
+        assert!(!a.config.source.join("dot_untracked").exists());
+    }
+
+    #[test]
+    fn removing_untracked_entries_shows_a_compact_nothing_to_remove_message() {
+        let (_t, mut a) = app();
+        initialize(&a.config, &a.config_path, None).unwrap();
+        fs::create_dir(a.config.home.join("scratch")).unwrap();
+        fs::write(a.config.home.join("scratch/keep.txt"), "keep original").unwrap();
+        a.snapshot = backend::snapshot(&a.config).unwrap();
+        a.rebuild();
+        for (path, key, subject) in [
+            ("scratch", KeyCode::Char('d'), "This folder"),
+            (".untracked", KeyCode::Delete, "This file"),
+        ] {
+            a.cursor = a.rows.iter().position(|row| row.path == path).unwrap();
+            a.key(KeyEvent::new(key, KeyModifiers::NONE));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while matches!(a.modal, Some(Modal::Busy { .. })) && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                matches!(a.modal, Some(Modal::Text { ref title, ref text, .. })
+                if title == "Nothing to remove" && text.starts_with(subject) && text.contains("no files tracked by dot"))
+            );
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            assert!(a.areas.modal.height < 12, "no-op message should be compact");
+            assert!(a.areas.modal.width < 100);
+            a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(a.modal.is_none());
+            assert_eq!(a.rows[a.cursor].path, path);
+        }
+        assert_eq!(
+            fs::read_to_string(a.config.home.join("scratch/keep.txt")).unwrap(),
+            "keep original"
+        );
+        assert_eq!(
+            fs::read_to_string(a.config.home.join(".untracked")).unwrap(),
+            "untracked"
+        );
+
+        // An untracked item must not suppress removal of tracked files in the same selection.
+        fs::write(a.config.source.join("dot_tracked"), "saved").unwrap();
+        fs::write(a.config.home.join(".tracked"), "original").unwrap();
+        a.selected = ["scratch".into(), ".tracked".into()].into();
+        a.menu_action(3);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while matches!(a.modal, Some(Modal::Busy { .. })) && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(a.modal, Some(Modal::Review { ref plan, .. }) if plan.paths == [".tracked"])
+        );
+        assert_eq!(
+            fs::read_to_string(a.config.source.join("dot_tracked")).unwrap(),
+            "saved"
+        );
+    }
+
+    #[test]
+    fn background_failures_do_not_replace_an_open_dialog() {
+        for kind in [JobKind::Inspection, JobKind::Preview] {
+            let (_t, mut a) = app();
+            a.modal = Some(Modal::Report {
+                title: "Result".into(),
+                text: "Completed".into(),
+                scroll: 0,
+            });
+            let (tx, rx) = mpsc::channel::<Result<Work>>();
+            a.launch_job(kind, "Refreshing background state", move || {
+                rx.recv().unwrap()
+            });
+            tx.send(Err(anyhow::anyhow!("Fixture background failure")))
+                .unwrap();
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while a.job.is_some() && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(a.job.is_none());
+            assert!(matches!(a.modal, Some(Modal::Report { ref text, .. }) if text == "Completed"));
+        }
+    }
+
+    #[test]
+    fn operation_errors_and_source_editor_resize_inside_dialogs() {
+        let (_t, mut a) = app();
+        let (tx, rx) = mpsc::channel::<Result<Work>>();
+        a.launch("Executing operation", move || rx.recv().unwrap());
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let bounds = a.areas.modal;
+        for key in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {
+            a.key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(matches!(
+                a.modal,
+                Some(Modal::Busy {
+                    cancellable: false,
+                    ..
+                })
+            ));
+        }
+        tx.send(Err(anyhow::anyhow!("Fixture operation failed")))
+            .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while a.job.is_some() && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(a.modal, Some(Modal::Report { ref text, .. }) if text.contains("Fixture operation failed"))
+        );
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.areas.modal, bounds);
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        a.modal = Some(Modal::Input {
+            purpose: Purpose::Source(".zshrc".into()),
+            text: "héllo\n".repeat(100),
+        });
+        a.input_cursor = 600;
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.areas.modal, bounds);
+        a.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.areas.modal, Rect::new(0, 0, 120, 35));
+        a.key(KeyEvent::new(KeyCode::F(2), KeyModifiers::NONE));
+        term.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.areas.modal, bounds);
+        for (w, h) in [(45, 14), (20, 8)] {
+            term.resize(Rect::new(0, 0, w, h)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            let text = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(
+                text.contains('▏'),
+                "editor cursor lost after resize at {w}x{h}"
+            );
+        }
     }
     #[test]
     fn tab_headers_are_clickable_and_keep_active_tab_visible_when_narrow() {
@@ -2495,6 +3039,7 @@ mod tests {
         assert!(matches!(a.modal, Some(Modal::Review { ref view, .. }) if view.tab == 1));
         assert!(a.job.is_none());
         terminal.draw(|f| a.draw(f)).unwrap();
+        let review_bounds = a.areas.modal;
         let confirm = a
             .areas
             .operation
@@ -2509,6 +3054,24 @@ mod tests {
             row: confirm.y,
             modifiers: KeyModifiers::NONE,
         });
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Busy {
+                cancellable: false,
+                ..
+            })
+        ));
+        a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        terminal.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.areas.modal, review_bounds);
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Busy {
+                cancellable: false,
+                ..
+            })
+        ));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
             a.pump();
@@ -2517,6 +3080,8 @@ mod tests {
         assert!(
             matches!(a.modal, Some(Modal::Outcome { ref outcome, .. }) if outcome.failed.is_none() && outcome.succeeded == [".untracked"])
         );
+        terminal.draw(|f| a.draw(f)).unwrap();
+        assert_eq!(a.areas.modal, review_bounds);
         assert_eq!(
             fs::read_to_string(a.config.source.join("dot_untracked")).unwrap(),
             "untracked"
@@ -2603,12 +3168,10 @@ mod tests {
                 a.modal = Some(modal.clone());
                 let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
                 term.draw(|f| a.draw(f)).unwrap();
-                let text = term
-                    .backend()
-                    .buffer()
-                    .content
-                    .iter()
-                    .map(|c| c.symbol())
+                let bounds = a.areas.modal;
+                let text = (bounds.y..bounds.bottom())
+                    .flat_map(|y| (bounds.x..bounds.right()).map(move |x| (x, y)))
+                    .map(|pos| term.backend().buffer()[pos].symbol())
                     .collect::<String>();
                 assert!(!text.contains("\"succeeded\""));
                 assert!(!text.contains("Space Select"));
@@ -2898,6 +3461,7 @@ mod tests {
             rx,
             label: "Inspection".into(),
             kind: JobKind::Inspection,
+            discard: false,
         });
         assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
         a.searching = true;
