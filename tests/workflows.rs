@@ -635,6 +635,7 @@ fn ignore_folder_is_reviewed_recoverable_and_keeps_all_originals() {
     );
     operations::recover(&f.c, &p.id).unwrap();
     assert!(!f.c.source.join(".chezmoiignore").exists());
+    assert!(!f.c.source.join(".gitignore").exists());
     assert!(
         backend::snapshot(&f.c)
             .unwrap()

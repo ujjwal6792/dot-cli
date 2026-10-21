@@ -796,8 +796,10 @@ pub fn recover(c: &Config, id: &str) -> Result<String> {
         );
     }
     // Source-wide backup permits recovery of new captures with chezmoi-selected source names.
+    // Prune Git before descending. Filtering a contents-first walk can skip later
+    // siblings when the deferred .git directory is rejected.
     let existing: Vec<_> = walkdir::WalkDir::new(&c.source)
-        .contents_first(true)
+        .sort_by_file_name()
         .into_iter()
         .filter_entry(|e| e.file_name() != ".git")
         .collect::<std::result::Result<_, _>>()?;

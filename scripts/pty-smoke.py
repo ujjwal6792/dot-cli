@@ -53,6 +53,24 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
                     output.extend(os.read(master, 65536))
                 except OSError:
                     break
+    def request_review(key, expected):
+        marker = len(output)
+        os.write(master, key)
+        deadline = time.monotonic() + 8
+        retry_at = time.monotonic() + 0.25
+        while time.monotonic() < deadline:
+            drain(0.1)
+            since_request = output[marker:]
+            if expected in since_request:
+                return marker
+            # Background reads can still own the worker after navigation.
+            # Retry only a refused preparation shortcut, never a confirmation.
+            refused = (b'Wait for the current' in since_request
+                       or b'An operation is already running' in since_request)
+            if refused and time.monotonic() >= retry_at:
+                os.write(master, key)
+                retry_at = time.monotonic() + 0.25
+        raise AssertionError(f'Review did not open: {expected!r}: {output[marker:]!r}')
     try:
         drain(1.5)
         assert child.poll() is None, output.decode(errors='replace')
@@ -60,10 +78,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
         drain(0.3)
         os.write(master, b'\r ')
         drain(0.3)
-        marker = len(output)
-        os.write(master, b'c')
-        drain(1.1)
-        assert b'Save a copy of your settings' in output[marker:]
+        marker = request_review(b'c', b'Save a copy of your settings')
         assert not (source / 'dot_capture-demo').exists(), 'review must not execute'
         os.write(master, b'2')
         drain(0.3)
@@ -78,10 +93,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
         assert b'"succeeded"' in output[marker:], 'raw details must remain available'
         os.write(master, b'g2')
         drain(0.8)
-        marker = len(output)
-        os.write(master, b'i')
-        drain(1.1)
-        assert b'Ignore in chezmoi and Git' in output[marker:], repr(output[marker:])
+        marker = request_review(b'i', b'No files will be deleted.')
         assert '.capture-demo' not in (source / '.chezmoiignore').read_text()
         os.write(master, b'2')
         drain(0.3)
@@ -98,18 +110,12 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
         # d reviews deletion of originals; Esc must keep the entire original.
         os.write(master, b'2/' + b'\x7f' * 32 + b'trash-demo\r')
         drain(0.8)
-        marker = len(output)
-        os.write(master, b'd')
-        drain(1.1)
-        assert b'Move original files to Trash' in output[marker:]
+        marker = request_review(b'd', b'Move original files to Trash')
         assert (home / '.trash-demo').read_text() == 'keep until reviewed and confirmed\n'
         os.write(master, b'\x1b')
         drain(0.3)
         assert (home / '.trash-demo').exists(), 'cancelling Trash moved an original'
-        marker = len(output)
-        os.write(master, b'r')
-        drain(1.1)
-        assert b'Nothing to remove' in output[marker:], 'r must remove saved copies, not originals'
+        marker = request_review(b'r', b'Nothing to remove')
         assert (home / '.trash-demo').exists()
         os.write(master, b'\x1b')
         drain(0.2)
