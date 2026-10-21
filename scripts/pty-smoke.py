@@ -34,6 +34,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
     assert result['failed'] is None, result
     (home / '.config/ghostty/config').write_text('font-size = 16\n')
     (home / '.capture-demo').write_text('setting = example\n')
+    (home / '.trash-demo').write_text('keep until reviewed and confirmed\n')
     master, slave = pty.openpty()
     fcntl.ioctl(slave, termios.TIOCSWINSZ, struct.pack('HHHH', 35, 120, 0, 0))
     original = termios.tcgetattr(slave)
@@ -61,13 +62,13 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
         drain(0.3)
         marker = len(output)
         os.write(master, b'c')
-        drain(0.7)
+        drain(1.1)
         assert b'Save a copy of your settings' in output[marker:]
         assert not (source / 'dot_capture-demo').exists(), 'review must not execute'
         os.write(master, b'2')
         drain(0.3)
         assert b'New saved copy:' in output[marker:]
-        os.write(master, b'y')
+        os.write(master, b'\r')
         drain(1.0)
         assert b'Your settings are saved' in output[marker:]
         assert (source / 'dot_capture-demo').read_text() == 'setting = example\n'
@@ -79,7 +80,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
         drain(0.8)
         marker = len(output)
         os.write(master, b'i')
-        drain(0.8)
+        drain(1.1)
         assert b'Ignore in chezmoi and Git' in output[marker:], repr(output[marker:])
         assert '.capture-demo' not in (source / '.chezmoiignore').read_text()
         os.write(master, b'2')
@@ -93,6 +94,24 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
         assert (source / 'dot_capture-demo').exists()
         assert (home / '.capture-demo').exists()
         os.write(master, b'\r')
+        drain(0.2)
+        # d reviews deletion of originals; Esc must keep the entire original.
+        os.write(master, b'2/' + b'\x7f' * 32 + b'trash-demo\r')
+        drain(0.8)
+        marker = len(output)
+        os.write(master, b'd')
+        drain(1.1)
+        assert b'Move original files to Trash' in output[marker:]
+        assert (home / '.trash-demo').read_text() == 'keep until reviewed and confirmed\n'
+        os.write(master, b'\x1b')
+        drain(0.3)
+        assert (home / '.trash-demo').exists(), 'cancelling Trash moved an original'
+        marker = len(output)
+        os.write(master, b'r')
+        drain(1.1)
+        assert b'Nothing to remove' in output[marker:], 'r must remove saved copies, not originals'
+        assert (home / '.trash-demo').exists()
+        os.write(master, b'\x1b')
         drain(0.2)
         os.write(master, b'/q2Wconfig')
         drain(0.4)
@@ -120,7 +139,7 @@ with tempfile.TemporaryDirectory(prefix='dot-pty-') as temp:
             # macOS revokes the slave after the controlling session exits.
             assert '\x1b[?1049l' in text, 'alternate-screen restoration was not emitted'
         assert 'Files' in text and 'Actions' in text and 'q2Wconfig' in text
-        print('PASS: CLI init/capture, TUI capture and unified Ignore review/confirm/results, search ownership, resize, action menu, clean quit and terminal restoration sequence')
+        print('PASS: CLI init/capture, Enter/y capture/Ignore confirmation/results, d Trash review/cancel, r saved-copy removal, search, resize, action menu, clean quit and terminal restoration')
     finally:
         if child.poll() is None:
             child.kill()

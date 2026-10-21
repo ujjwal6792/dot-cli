@@ -144,11 +144,11 @@ pub fn draw(
         ),
         (
             "2  Save a copy",
-            "Press c (Capture). Review the copy, then y to save it.",
+            "Press c (Capture). Review the copy, then Enter or y to save it.",
         ),
         (
             "3  Later, use a saved copy",
-            "Press a (Apply). Review the changes, then y to use them.",
+            "Press a (Apply). Review the changes, then Enter or y to use them.",
         ),
     ];
     for (title, body) in steps {

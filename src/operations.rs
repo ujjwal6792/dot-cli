@@ -20,6 +20,7 @@ pub enum Action {
     Apply,
     Restore,
     Forget,
+    Trash,
     Ignore,
     IgnoreDefaults,
     Enable,
@@ -43,6 +44,7 @@ impl Action {
             Self::Ignore => "Ignore in chezmoi and Git",
             Self::IgnoreDefaults => "Add developer ignore defaults",
             Self::Forget => "Stop tracking (shared source)",
+            Self::Trash => "Move untracked originals to Trash",
             Self::Enable => "Enable automatic updates here",
             Self::Disable => "Disable automatic updates here",
             Self::Stage => "Stage source changes",
@@ -63,6 +65,7 @@ impl Action {
                 | Self::Apply
                 | Self::Restore
                 | Self::Forget
+                | Self::Trash
                 | Self::Enable
                 | Self::Disable
                 | Self::EditSource
@@ -253,7 +256,11 @@ pub fn plan(
         None
     };
     let from_git = action == Action::Ignore && payload.as_deref() == Some("source");
-    let targets = if action == Action::Ignore {
+    let targets = if action == Action::Trash {
+        let (targets, digest) = crate::trash_originals::prepare(c, snap.as_ref().unwrap(), paths)?;
+        payload = Some(digest);
+        targets
+    } else if action == Action::Ignore {
         crate::ignores::home_paths(c, paths, from_git)?
     } else if let Some(s) = &snap {
         backend::exact_targets(c, s, paths, action == Action::Capture)?
@@ -281,6 +288,7 @@ pub fn plan(
         }
     }
     let preview = match action {
+        Action::Trash => crate::trash_originals::preview(c, &targets)?,
         Action::Apply | Action::Restore => backend::preview(c, &targets, false)?,
         Action::Capture => {
             let managed: Vec<_> = targets
@@ -439,12 +447,37 @@ fn backup_source(c: &Config, dir: &Path) -> Result<Vec<SavedFile>> {
     Ok(files)
 }
 pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> Result<Outcome> {
+    execute_with_trash(
+        c,
+        config_path,
+        p,
+        approve,
+        crate::trash_originals::move_to_trash,
+    )
+}
+
+fn execute_with_trash(
+    c: &mut Config,
+    config_path: &Path,
+    p: &Plan,
+    approve: &str,
+    mut move_to_trash: impl FnMut(&Path) -> Result<()>,
+) -> Result<Outcome> {
     let _lock = Lock::acquire(c)?;
     if p.id != approve || p.id != plan_id(p)? {
         bail!("Approval does not match the exact plan");
     }
     if fingerprint(c, &p.paths, p.action.files())? != p.fingerprint {
         bail!("Files, Git state, or rules changed after review. Create a fresh plan.");
+    }
+    if p.action == Action::Trash {
+        let (targets, digest) =
+            crate::trash_originals::prepare(c, &backend::snapshot(c)?, &p.paths)?;
+        if targets != p.paths || p.payload.as_deref() != Some(digest.as_str()) {
+            bail!(
+                "Original files or folder contents changed after review. Create a fresh Trash plan."
+            );
+        }
     }
     let dir = c.state.join("backups").join(&p.id);
     fs::create_dir_all(&dir)?;
@@ -466,7 +499,7 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
         vec![]
     };
     let mut home = vec![];
-    if p.action.files() {
+    if p.action.files() && p.action != Action::Trash {
         for path in &p.paths {
             home.push(saved(&c.home, path, &dir.join("home"))?);
         }
@@ -511,12 +544,18 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
     };
     let per_file = matches!(
         p.action,
-        Action::Capture | Action::Apply | Action::Restore | Action::Forget | Action::EditSource
+        Action::Capture
+            | Action::Apply
+            | Action::Restore
+            | Action::Forget
+            | Action::Trash
+            | Action::EditSource
     );
     if per_file {
         for (i, path) in p.paths.iter().enumerate() {
             let target = c.target(path)?;
             let r = match p.action {
+                Action::Trash => move_to_trash(&target).map(|_| String::new()),
                 Action::Capture => backend::chez(
                     c,
                     &[
@@ -589,6 +628,10 @@ pub fn execute(c: &mut Config, config_path: &Path, p: &Plan, approve: &str) -> R
                 result.message = e.to_string();
             }
         }
+    }
+    if p.action == Action::Trash && result.failed.is_none() {
+        result.message =
+            "Originals moved to system Trash. Restore them using your system Trash.".into();
     }
     let after = fingerprint(c, &p.paths, p.action.files())?;
     let recovery = Recovery {
@@ -722,6 +765,11 @@ pub fn recover(c: &Config, id: &str) -> Result<String> {
     let _lock = Lock::acquire(c)?;
     let dir = c.state.join("backups").join(id);
     let r: Recovery = serde_json::from_slice(&fs::read(dir.join("recovery.json"))?)?;
+    if r.plan.action == Action::Trash {
+        bail!(
+            "Restore moved originals using your system Trash; dot does not restore Trash entries"
+        );
+    }
     if !matches!(
         r.plan.action,
         Action::Capture
@@ -806,4 +854,180 @@ fn restore_file(root: &Path, f: &SavedFile, backup: &Path) -> Result<()> {
         fs::set_permissions(&p, fs::Permissions::from_mode(f.mode))?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod trash_tests {
+    use super::*;
+
+    fn fixture() -> (tempfile::TempDir, Config, PathBuf, PathBuf) {
+        let temp = tempfile::tempdir().unwrap();
+        let c = Config {
+            home: temp.path().join("home"),
+            source: temp.path().join("source"),
+            state: temp.path().join("state"),
+            chezmoi_config: Some(temp.path().join("chezmoi.toml")),
+            ..Default::default()
+        };
+        for path in [&c.home, &c.source, &c.state] {
+            fs::create_dir_all(path).unwrap();
+        }
+        fs::write(c.chezmoi_config.as_ref().unwrap(), "").unwrap();
+        git::run(&c, &["init", "-b", "main"]).unwrap();
+        let config = temp.path().join("dot.toml");
+        c.save(&config).unwrap();
+        let trash = temp.path().join("Trash");
+        fs::create_dir(&trash).unwrap();
+        (temp, c, config, trash)
+    }
+
+    #[test]
+    fn reviewed_trash_moves_only_exact_originals_and_preserves_link_targets() {
+        let (temp, mut c, config, trash) = fixture();
+        fs::create_dir(c.home.join("scratch")).unwrap();
+        fs::write(c.home.join("scratch/keep.txt"), "nested original").unwrap();
+        fs::write(c.home.join("loose"), "original").unwrap();
+        let outside = temp.path().join("outside");
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("keep.txt"), "link target").unwrap();
+        symlink(&outside, c.home.join("alias")).unwrap();
+        let paths = ["scratch", "scratch/keep.txt", "loose", "alias"].map(String::from);
+        let p = plan(&c, Action::Trash, &paths, None).unwrap();
+        assert_eq!(p.paths, ["alias", "loose", "scratch"]);
+        assert!(
+            p.preview
+                .contains(&c.home.join("scratch").display().to_string())
+        );
+        assert!(
+            c.home.join("scratch/keep.txt").is_file(),
+            "planning must not move originals"
+        );
+        assert!(
+            execute_with_trash(&mut c, &config, &p, "wrong", |_| panic!(
+                "unapproved Trash call"
+            ))
+            .is_err()
+        );
+        let before_git = git::status(&c).unwrap().files;
+        let outcome = execute_with_trash(&mut c, &config, &p, &p.id, |path| {
+            fs::rename(path, trash.join(path.file_name().unwrap()))?;
+            Ok(())
+        })
+        .unwrap();
+        assert!(outcome.failed.is_none());
+        assert_eq!(outcome.succeeded, p.paths);
+        assert_eq!(
+            fs::read_to_string(trash.join("scratch/keep.txt")).unwrap(),
+            "nested original"
+        );
+        assert!(
+            fs::symlink_metadata(trash.join("alias"))
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert_eq!(
+            fs::read_to_string(outside.join("keep.txt")).unwrap(),
+            "link target"
+        );
+        assert!(!c.home.join("loose").exists());
+        assert_eq!(git::status(&c).unwrap().files.len(), before_git.len());
+        assert!(
+            recover(&c, &p.id)
+                .unwrap_err()
+                .to_string()
+                .contains("system Trash")
+        );
+    }
+
+    #[test]
+    fn trash_rejects_managed_files_mixed_selections_and_changed_folder_contents() {
+        let (_temp, mut c, config, _trash) = fixture();
+        fs::write(c.source.join("dot_managed"), "saved").unwrap();
+        fs::write(c.home.join(".managed"), "original").unwrap();
+        fs::create_dir(c.home.join("scratch")).unwrap();
+        fs::write(c.home.join("scratch/file"), "before").unwrap();
+        for paths in [
+            vec![".managed".into()],
+            vec!["scratch".into(), ".managed".into()],
+        ] {
+            let error = plan(&c, Action::Trash, &paths, None)
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("managed"));
+        }
+        let p = plan(&c, Action::Trash, &["scratch".into()], None).unwrap();
+        fs::write(c.home.join("scratch/file"), "changed after review").unwrap();
+        let error = execute_with_trash(&mut c, &config, &p, &p.id, |_| panic!("stale Trash call"))
+            .unwrap_err();
+        assert!(error.to_string().contains("changed after review"));
+        assert!(c.home.join("scratch/file").is_file());
+        fs::create_dir(c.source.join("scratch")).unwrap();
+        fs::write(c.source.join("scratch/file"), "saved now").unwrap();
+        assert!(
+            plan(&c, Action::Trash, &["scratch".into()], None)
+                .unwrap_err()
+                .to_string()
+                .contains("managed")
+        );
+    }
+
+    #[test]
+    fn trash_refuses_escape_paths_protected_folders_and_managed_empty_directories() {
+        let (_temp, mut c, _config, _trash) = fixture();
+        c.source = c.home.join("internal/source");
+        c.state = c.home.join("internal/state");
+        fs::create_dir_all(&c.source).unwrap();
+        fs::create_dir_all(&c.state).unwrap();
+        fs::create_dir(c.home.join(".git")).unwrap();
+        fs::create_dir(c.home.join("empty")).unwrap();
+        symlink(&c.source, c.home.join("link")).unwrap();
+        let mut snapshot = backend::Snapshot::default();
+        snapshot.managed_directories.insert("empty".into());
+        for path in [
+            "",
+            "../escape",
+            "internal",
+            "internal/source",
+            "internal/state",
+            ".git",
+            "empty",
+            "link/child",
+        ] {
+            assert!(
+                crate::trash_originals::prepare(&c, &snapshot, &[path.into()]).is_err(),
+                "allowed {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn trash_stops_after_a_failure_and_reports_unattempted_originals() {
+        let (_temp, mut c, config, trash) = fixture();
+        for name in ["first", "second", "third"] {
+            fs::write(c.home.join(name), name).unwrap();
+        }
+        let p = plan(
+            &c,
+            Action::Trash,
+            &["first".into(), "second".into(), "third".into()],
+            None,
+        )
+        .unwrap();
+        let outcome = execute_with_trash(&mut c, &config, &p, &p.id, |path| {
+            if path.file_name().unwrap() == "second" {
+                bail!("fixture Trash unavailable");
+            }
+            fs::rename(path, trash.join(path.file_name().unwrap()))?;
+            Ok(())
+        })
+        .unwrap();
+        assert_eq!(outcome.succeeded, ["first"]);
+        assert_eq!(outcome.failed.as_deref(), Some("second"));
+        assert_eq!(outcome.not_attempted, ["third"]);
+        assert!(outcome.message.contains("Trash unavailable"));
+        assert!(trash.join("first").is_file());
+        assert!(c.home.join("second").is_file());
+        assert!(c.home.join("third").is_file());
+    }
 }

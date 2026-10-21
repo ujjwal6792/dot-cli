@@ -2,13 +2,13 @@
 use crate::{
     config::Config,
     operations::{Action, Outcome, Plan},
+    syntax,
 };
 use crossterm::event::KeyCode;
 use ratatui::{prelude::*, widgets::*};
 use std::{collections::BTreeMap, path::Path};
 
 const BG: Color = Color::Rgb(24, 26, 31);
-const INK: Color = Color::Rgb(235, 239, 243);
 const MUTED: Color = Color::Rgb(160, 168, 180);
 const MINT: Color = Color::Rgb(97, 218, 179);
 const RED: Color = Color::Rgb(255, 140, 140);
@@ -59,6 +59,7 @@ fn name(action: Action) -> &'static str {
         Action::Apply => "Apply",
         Action::Restore => "Restore",
         Action::Forget => "Stop tracking",
+        Action::Trash => "Move to Trash",
         Action::Ignore => "Ignore",
         Action::IgnoreDefaults => "Add ignore defaults",
         Action::Enable => "Enable updates",
@@ -112,11 +113,14 @@ fn files(paths: &[String], label: &str, color: Color) -> Vec<Line<'static>> {
 pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -> Areas {
     let capture = plan.action == Action::Capture;
     let forget = plan.action == Action::Forget;
+    let trash = plan.action == Action::Trash;
     let ignore = matches!(plan.action, Action::Ignore | Action::IgnoreDefaults);
     let title = if capture {
         "Save a copy of your settings".into()
     } else if forget {
         "Remove saved copies from dot".into()
+    } else if trash {
+        "Move original files to Trash".into()
     } else {
         format!("Review {}", name(plan.action).to_lowercase())
     };
@@ -127,6 +131,8 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
                 "{} selected  ·  Current settings → Saved copies",
                 file_count(plan.paths.len())
             )
+        } else if trash {
+            format!("{} original items selected", plan.paths.len())
         } else {
             format!("{} selected", file_count(plan.paths.len()))
         })
@@ -138,6 +144,12 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
     } else if forget {
         header.push(Line::from("Your original files stay on this computer.").fg(MINT));
         header.push(Line::from("Dot will stop tracking these files.").fg(MUTED));
+    }
+    if trash {
+        header
+            .push(Line::from("Only untracked originals; folders include all contents.").fg(AMBER));
+        header
+            .push(Line::from("Recover using system Trash. Saved copies stay unchanged.").fg(MUTED));
     }
     if ignore {
         header.push(
@@ -157,6 +169,8 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
         let mut lines = vec![
             Line::from(if capture {
                 "These files will be copied into your settings folder."
+            } else if trash {
+                "These original paths will be moved to your system Trash."
             } else if forget {
                 "Only the saved copies below will be removed from your settings folder."
             } else {
@@ -174,9 +188,19 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
             );
             lines.push(Line::from(""));
         }
+        let original_paths: Vec<_> = if trash {
+            plan.paths
+                .iter()
+                .map(|path| c.home.join(path).display().to_string())
+                .collect()
+        } else {
+            plan.paths.clone()
+        };
         lines.extend(files(
-            &plan.paths,
-            if ignore {
+            &original_paths,
+            if trash {
+                "TRASH"
+            } else if ignore {
                 "IGNORE"
             } else if capture {
                 "COPY"
@@ -185,7 +209,7 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
             } else {
                 "TARGET"
             },
-            if forget { AMBER } else { MINT },
+            if forget || trash { AMBER } else { MINT },
         ));
         if plan.paths.is_empty() {
             lines.push(Line::from(
@@ -209,39 +233,22 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
             lines.push(Line::from(format!("Commit message: {payload}")));
             lines.push(Line::from(""));
         }
-        for line in plan.preview.lines() {
-            let color = if line.starts_with("+++")
-                || line.starts_with("---")
-                || line.starts_with("diff ")
-                || line.starts_with("NEW source from HOME:")
-            {
-                INK
-            } else if line.starts_with('+') {
-                MINT
-            } else if line.starts_with('-') {
-                RED
-            } else if line.starts_with("@@") {
-                AMBER
-            } else {
-                INK
-            };
-            let display = if let Some(path) = line.strip_prefix("NEW source from HOME: ") {
-                format!("New saved copy: {path}")
-            } else {
-                line.to_owned()
-            };
-            lines.push(Line::from(display).fg(color));
-        }
+        lines.extend(syntax::preview(&plan.preview).lines);
         if plan.preview.is_empty() {
             lines.push(Line::from("No content differences to display.").fg(MUTED));
         }
         Text::from(lines)
     };
-    let confirm = if forget {
-        "y Remove copies".into()
-    } else {
-        format!("y {}", name(plan.action))
+    let confirm_action = match plan.action {
+        Action::Forget => "Remove",
+        Action::Trash => "Trash",
+        Action::Enable => "Enable",
+        Action::Disable => "Disable",
+        Action::EditSource | Action::Setting => "Save",
+        Action::IgnoreDefaults => "Defaults",
+        action => name(action),
     };
+    let confirm = format!("Enter/y {confirm_action}");
     draw(
         f,
         area,
@@ -251,7 +258,7 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
         view,
         Controls {
             buttons: &[(&confirm, KeyCode::Char('y')), ("Esc Cancel", KeyCode::Esc)],
-            accent: if forget { AMBER } else { MINT },
+            accent: if forget || trash { AMBER } else { MINT },
         },
     )
 }
@@ -260,6 +267,7 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
     let incomplete = outcome.failed.is_some() || !outcome.not_attempted.is_empty();
     let capture = outcome.action == Action::Capture;
     let forget = outcome.action == Action::Forget;
+    let trash = outcome.action == Action::Trash;
     let ignore = outcome.action == Action::Ignore;
     let accent = if incomplete { AMBER } else { MINT };
     let title = if incomplete {
@@ -268,12 +276,16 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
         "Your settings are saved".into()
     } else if forget {
         "Saved copies removed from dot".into()
+    } else if trash {
+        "Originals moved to Trash".into()
     } else if ignore {
         "Ignored in chezmoi and Git".into()
     } else {
         format!("{} complete", name(outcome.action))
     };
-    let done = if capture {
+    let done = if trash {
+        "moved to Trash"
+    } else if capture {
         "saved"
     } else if forget {
         "no longer tracked"
@@ -293,6 +305,8 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
             )
         } else if outcome.succeeded.is_empty() {
             "Completed successfully".into()
+        } else if trash {
+            format!("{} original items {done}", outcome.succeeded.len())
         } else {
             format!("{} {done}", file_count(outcome.succeeded.len()))
         }),
@@ -300,11 +314,16 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
     if capture {
         header.push(Line::from("Your apps still use their current settings.").fg(MUTED));
         header.push(Line::from(format!("Saved copies  {}", c.source.display())).fg(MUTED));
+    } else if trash {
+        header.push(Line::from("Restore moved originals using your system Trash.").fg(MUTED));
     } else if forget || ignore {
         header.push(Line::from("Your original files are still on this computer.").fg(MUTED));
     }
     let body = if view.tab == 1 {
-        Text::from(serde_json::to_string_pretty(outcome).unwrap_or_default())
+        syntax::source(
+            "outcome.json",
+            &serde_json::to_string_pretty(outcome).unwrap_or_default(),
+        )
     } else {
         let mut lines = vec![];
         // Failures come first, even when hundreds of files succeeded.
@@ -335,6 +354,9 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
                     .fg(MUTED),
             );
             lines.push(Line::from(""));
+        } else if trash {
+            lines.push(Line::from("Saved copies and Git are unchanged.").fg(MUTED));
+            lines.push(Line::from(""));
         } else if !outcome.message.is_empty() {
             lines.push(Line::from(outcome.message.clone()));
             lines.push(Line::from(""));
@@ -345,6 +367,8 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
                     "Saved files"
                 } else if forget {
                     "No longer tracked"
+                } else if trash {
+                    "Moved originals"
                 } else {
                     "Completed files"
                 })
@@ -356,6 +380,8 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
                     "SAVED"
                 } else if forget {
                     "REMOVED"
+                } else if trash {
+                    "TRASHED"
                 } else {
                     "DONE"
                 },
@@ -383,10 +409,14 @@ pub fn result(f: &mut Frame, area: Rect, c: &Config, outcome: &Outcome, view: &V
         body,
         view,
         Controls {
-            buttons: &[
-                ("Enter Done", KeyCode::Enter),
-                ("g Review in Git", KeyCode::Char('g')),
-            ],
+            buttons: if trash {
+                &[("Enter Done", KeyCode::Enter)]
+            } else {
+                &[
+                    ("Enter Done", KeyCode::Enter),
+                    ("g Review in Git", KeyCode::Char('g')),
+                ]
+            },
             accent,
         },
     )

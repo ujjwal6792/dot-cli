@@ -35,17 +35,26 @@ uses ordinary terminal characters. The compact powered-by row uses Nerd Fonts'
 home icon for chezmoi and Git icon; select a Nerd Font in your terminal, or run
 `DOT_ICONS=none dot` for text-only labels.
 
-Actions open centered dialogs over the workspace. Preparing, review, execution,
-and results stay in the same dialog. Reviews have **Files** and **Changes** tabs
-(`1` / `2` or Tab). Review the exact targets and preview, then press `y` to confirm
+Preparing a review shows a toast at the bottom right while browsing remains
+available. Slow refreshes and detail loading use the same toast
+area, while fast background work stays quiet. Once shown, a toast stays visible
+for at least 0.8 seconds, even if processing finishes sooner; Esc still cancels
+preparation immediately. Once ready, review, execution, and results share a
+centered dialog. A ready review waits for an active search or
+form to close before opening. Reviews have **Files** and **Changes** tabs
+(`1` / `2` or Tab). Review the exact targets and preview, then press Enter or `y` to confirm
 or Esc to cancel. Running operations stay open until their result is available.
 Results summarize completed, failed, and skipped files, grouped by folder;
 **Details** keeps the raw operation record available. Enter or Esc closes the
 result and returns to your panel; `g` explicitly opens Git. Arrow keys, Page
 Up/Down, Home/End, and the mouse wheel inside the dialog scroll the active tab.
 Dialogs adapt to small terminals; clicks outside them leave the workspace alone.
-Removing an untracked file or folder shows a compact **Nothing to remove**
-message; the original files stay on disk.
+Using `r` on an untracked file or folder shows a compact **Nothing to remove**
+message; the original files stay on disk. To remove an untracked original, use
+`d` (or Delete), review its exact path, then confirm **Move to Trash**. Folders
+include all contents; links move only the link. Managed files and folders with
+managed descendants are refused. Saved copies stay unchanged. Recover moved
+originals using your system Trash; `R` restores from saved configuration.
 
 When the TUI cannot find its source, its setup screen offers `i` to initialize a
 local source, `c` to clone a repository, and `o` to connect an existing checkout.
@@ -73,15 +82,17 @@ mean the source is committed or published.
 | `1`–`4`, `0`, Tab | Focus panels/details |
 | arrows or `j/k`, `h/l` | Navigate rows/folders |
 | Space in Files | Select files/folders |
-| `c`, `a`, `r` in Files | Capture, apply, restore |
+| `c`, `a`, `R` in Files | Capture, apply, restore originals from saved copies |
 | `i` in Files or Git | Ignore in both chezmoi and Git with one reviewed action |
-| `d` or Delete in Files | Remove saved copies from dot after review; keep original files |
+| `r` in Files | Remove saved copies from dot after review; keep originals |
+| `d` or Delete in Files | Move untracked originals to system Trash after review |
 | `e` in Files | Edit native source; Ctrl+S reviews changes; F2 expands/restores the editor |
 | Space in Git, `v` | Stage/unstage; multi-select Git paths |
 | `c` in Git, `P`, `L`, `F` | Commit, push, pull, fetch |
 | `/`, `f` | Search; All/Managed/Changed |
 | `[`, `]`, `z` | Previous/next tab in the focused section; expand focused panel |
 | `:`, `?`, Esc | All actions, help, back/cancel |
+| Ctrl+R | Refresh the workspace |
 
 Only left mouse clicks move focus between panels; hovering and scrolling keep
 keyboard focus in place. The wheel scrolls the panel under the pointer.
@@ -95,6 +106,15 @@ Each section shows its tabs in the border: Status (Overview/Paths), Files
 (All/Managed/Changed), Git (Changes/Commits), Machines (Local/Reports), Details
 (Diff/Source/Rules/Activity), and Activity (Recent/All). Click a tab or use `[`/`]`
 in that section. Each section keeps its own active tab; Tab still changes focus.
+
+File previews, source editing, and review/Git diffs use bundled Tree-sitter
+syntax highlighting. Shell startup files, TOML, JSON/JSONC, YAML, INI (including
+Git and Ghostty config), Lua, Python, Rust, JavaScript/JSX, and TypeScript/TSX
+are recognized automatically, including chezmoi attribute names and `.tmpl`
+suffixes. Shell files use the Bash grammar. Diff markers and red/green backgrounds
+remain visible alongside syntax colors. No separate Tree-sitter installation is
+needed. Highlights are cached; unsupported files, files over 256 KiB, and parsing
+timeouts fall back to readable text.
 
 Esc/Enter dismisses an error; `q` exits an error/help screen and Ctrl+C exits from
 any screen unless a write operation is still running. Inspection does not block
@@ -119,7 +139,7 @@ rebase and advanced history operations through Git/Lazygit, then refresh dot.
 ### Ignore files once, in both tools
 
 Select a file or folder in **Files** or **Git**, press **i Ignore**, review both
-rule changes, then press **y**. Dot maps the original path to chezmoi's saved
+rule changes, then press **Enter** or **y**. Dot maps the original path to chezmoi's saved
 filename (including `dot_`, `private_` and template attributes). It updates both
 ignore files and stops Git tracking the selected saved copies. Files stay on
 disk; tracked removals are staged for your next commit. Other staged work is

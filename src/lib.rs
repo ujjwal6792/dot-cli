@@ -10,4 +10,7 @@ pub mod operations;
 pub mod process;
 pub mod settings;
 pub mod sync;
+mod syntax;
+mod toast;
+mod trash_originals;
 pub mod ui;

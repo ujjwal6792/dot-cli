@@ -5,7 +5,7 @@ use crate::{
     onboarding::{self, SetupKind, SetupReport},
     operation_screen::{self, View as OperationView},
     operations::{self, Action, Outcome, Plan},
-    sync,
+    sync, syntax, toast,
 };
 use anyhow::{Context, Result, bail};
 use crossterm::{
@@ -23,6 +23,8 @@ use std::{
     sync::mpsc::{self, Receiver},
     time::{Duration, Instant},
 };
+
+const TOAST_MIN_VISIBLE: Duration = Duration::from_millis(800);
 
 const UNTRACKED_TEXT: Color = Color::Rgb(160, 168, 180);
 const FOCUS_BORDER: Color = Color::Rgb(97, 218, 179);
@@ -77,7 +79,6 @@ enum Modal {
     Setup,
     Busy {
         label: String,
-        cancellable: bool,
     },
     Report {
         title: String,
@@ -134,6 +135,8 @@ struct Job {
     label: String,
     kind: JobKind,
     discard: bool,
+    started: Instant,
+    toast_started: Option<Instant>,
 }
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum JobKind {
@@ -158,6 +161,7 @@ struct Areas {
     modal_controls: Vec<(Rect, KeyCode)>,
     modal_body: Rect,
     operation: operation_screen::Areas,
+    toast: toast::Areas,
     tabs: Vec<(Rect, Pane, usize)>,
 }
 
@@ -182,6 +186,7 @@ pub struct App {
     git_state: ListState,
     menu_state: ListState,
     modal: Option<Modal>,
+    pending_review: Option<Plan>,
     job: Option<Job>,
     preview_key: String,
     scroll: u16,
@@ -225,6 +230,7 @@ impl App {
             git_state: ListState::default(),
             menu_state: ListState::default(),
             modal: None,
+            pending_review: None,
             job: None,
             preview_key: String::new(),
             scroll: 0,
@@ -264,11 +270,15 @@ impl App {
             return;
         }
         if matches!(kind, JobKind::Operation | JobKind::Preparation) {
+            self.pending_review = None;
             self.searching = false;
-            self.modal = Some(Modal::Busy {
-                label: label.into(),
-                cancellable: kind == JobKind::Preparation,
-            });
+            self.modal = if kind == JobKind::Operation {
+                Some(Modal::Busy {
+                    label: label.into(),
+                })
+            } else {
+                None
+            };
         }
         let (tx, rx) = mpsc::channel();
         std::thread::spawn(move || {
@@ -279,6 +289,8 @@ impl App {
             label: label.into(),
             kind,
             discard: false,
+            started: Instant::now(),
+            toast_started: None,
         });
     }
     fn refresh(&mut self) {
@@ -315,12 +327,24 @@ impl App {
         });
     }
     fn pump(&mut self) {
-        let received = self.job.as_ref().and_then(|j| match j.rx.try_recv() {
-            Ok(r) => Some(r),
-            Err(mpsc::TryRecvError::Disconnected) => {
-                Some(Err(anyhow::anyhow!("Worker stopped unexpectedly")))
+        let received = self.job.as_ref().and_then(|j| {
+            // Keep a visible status readable without sleeping or delaying the worker.
+            // Cancellation bypasses the minimum and discards the queued result.
+            if !j.discard
+                && (j
+                    .toast_started
+                    .is_some_and(|shown| shown.elapsed() < TOAST_MIN_VISIBLE)
+                    || j.kind == JobKind::Preparation && j.toast_started.is_none())
+            {
+                return None;
             }
-            Err(_) => None,
+            match j.rx.try_recv() {
+                Ok(r) => Some(r),
+                Err(mpsc::TryRecvError::Disconnected) => {
+                    Some(Err(anyhow::anyhow!("Worker stopped unexpectedly")))
+                }
+                Err(_) => None,
+            }
         });
         if let Some(result) = received {
             let completed = self.job.take().unwrap();
@@ -365,10 +389,7 @@ impl App {
                         }
                     }
                     Ok(Work::Plan(p)) => {
-                        self.modal = Some(Modal::Review {
-                            plan: p,
-                            view: OperationView::default(),
-                        })
+                        self.pending_review = Some(p);
                     }
                     Ok(Work::Applied(c, r)) => {
                         self.config = c;
@@ -441,6 +462,16 @@ impl App {
                     }
                 }
             }
+        }
+        // A nonmodal preparation must not interrupt typing or replace another form.
+        if self.modal.is_none()
+            && !self.searching
+            && let Some(plan) = self.pending_review.take()
+        {
+            self.modal = Some(Modal::Review {
+                plan,
+                view: OperationView::default(),
+            });
         }
         if self.job.is_none()
             && self.modal.is_none()
@@ -727,6 +758,19 @@ impl App {
             self.modal_key(key);
             return false;
         }
+        if key.code == KeyCode::Esc && self.pending_review.take().is_some() {
+            self.notice = "Review cancelled".into();
+            return false;
+        }
+        if key.code == KeyCode::Esc
+            && let Some(job) = &mut self.job
+            && job.kind == JobKind::Preparation
+            && !job.discard
+        {
+            job.discard = true;
+            self.notice = "Review cancelled".into();
+            return false;
+        }
         // Inputs own character keys before every global shortcut, including q and panel numbers.
         if self.searching {
             match key.code {
@@ -763,7 +807,7 @@ impl App {
                 })
             }
             KeyCode::Char(':') => self.modal = Some(Modal::Menu(0)),
-            KeyCode::Char('R') => self.refresh(),
+            KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.refresh(),
             KeyCode::Char('/') => {
                 self.pane = Pane::Files;
                 self.searching = true;
@@ -825,9 +869,10 @@ impl App {
                 self.action(Action::Ignore, None)
             }
             KeyCode::Char('a') if self.pane == Pane::Files => self.action(Action::Apply, None),
-            KeyCode::Char('r') if self.pane == Pane::Files => self.action(Action::Restore, None),
+            KeyCode::Char('R') if self.pane == Pane::Files => self.action(Action::Restore, None),
+            KeyCode::Char('r') if self.pane == Pane::Files => self.action(Action::Forget, None),
             KeyCode::Char('d') | KeyCode::Delete if self.pane == Pane::Files => {
-                self.action(Action::Forget, None)
+                self.action(Action::Trash, None)
             }
             KeyCode::Char('d') if self.pane == Pane::Git && !self.history_view => {
                 self.action(Action::Discard, None)
@@ -873,15 +918,8 @@ impl App {
         self.last_click = None;
         let modal = self.modal.take().unwrap();
         match modal {
-            Modal::Busy { label, cancellable } => {
-                if cancellable && matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) {
-                    if let Some(job) = &mut self.job {
-                        job.discard = true;
-                    }
-                    self.notice = "Review cancelled; waiting for preparation to finish".into();
-                } else {
-                    self.modal = Some(Modal::Busy { label, cancellable });
-                }
+            Modal::Busy { label } => {
+                self.modal = Some(Modal::Busy { label });
             }
             Modal::Welcome { report, mut scroll } => {
                 match key.code {
@@ -924,7 +962,7 @@ impl App {
                 text,
                 mut scroll,
             } => {
-                if key.code == KeyCode::Char('y') {
+                if matches!(key.code, KeyCode::Char('y') | KeyCode::Enter) {
                     self.confirm_control(command);
                 } else if !matches!(key.code, KeyCode::Esc | KeyCode::Char('n')) {
                     let mut view = OperationView { tab: 0, scroll };
@@ -1053,7 +1091,7 @@ impl App {
             }
             Modal::Review { plan, mut view } => match key.code {
                 KeyCode::Esc | KeyCode::Char('n') => {}
-                KeyCode::Char('y') => {
+                KeyCode::Char('y') | KeyCode::Enter => {
                     let mut c = self.config.clone();
                     let path = self.config_path.clone();
                     self.launch("Executing reviewed operation", move || {
@@ -1069,7 +1107,7 @@ impl App {
             Modal::Outcome { outcome, mut view } => {
                 match key.code {
                     KeyCode::Enter | KeyCode::Esc => return,
-                    KeyCode::Char('g') => {
+                    KeyCode::Char('g') if outcome.action != Action::Trash => {
                         self.pane = Pane::Git;
                         self.detail_owner = Pane::Git;
                         self.history_view = false;
@@ -1240,6 +1278,7 @@ impl App {
             }
             32 => self.action(Action::Ignore, None),
             33 => self.action(Action::IgnoreDefaults, None),
+            34 => self.action(Action::Trash, None),
             29..=31 => {
                 self.modal = Some(Modal::Input {
                     purpose: Purpose::Setting(match i {
@@ -1332,6 +1371,18 @@ impl App {
     }
     fn mouse(&mut self, mouse: event::MouseEvent) {
         let pos = Position::new(mouse.column, mouse.row);
+        if self.modal.is_none() && self.areas.toast.bounds.contains(pos) {
+            if mouse.kind == MouseEventKind::Down(event::MouseButton::Left)
+                && self
+                    .areas
+                    .toast
+                    .cancel
+                    .is_some_and(|rect| rect.contains(pos))
+            {
+                self.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            return;
+        }
         if self.modal.is_some() {
             if !self.areas.modal.contains(pos) {
                 return;
@@ -1525,6 +1576,7 @@ impl App {
         let message = self
             .job
             .as_ref()
+            .filter(|j| j.kind == JobKind::Operation)
             .map(|j| format!("{}…", j.label))
             .unwrap_or_else(|| self.notice.clone());
         f.render_widget(
@@ -1535,11 +1587,12 @@ impl App {
         let mut bindings: Vec<(&str, KeyCode)> = if self.pane == Pane::Files {
             vec![
                 ("Space Select", KeyCode::Char(' ')),
+                ("r Remove", KeyCode::Char('r')),
+                ("d Trash", KeyCode::Char('d')),
+                ("R Restore", KeyCode::Char('R')),
                 ("c Capture", KeyCode::Char('c')),
-                ("d Remove", KeyCode::Char('d')),
                 ("i Ignore", KeyCode::Char('i')),
                 ("a Apply", KeyCode::Char('a')),
-                ("r Restore", KeyCode::Char('r')),
                 ("f Filter", KeyCode::Char('f')),
                 (": Actions", KeyCode::Char(':')),
                 ("? Help", KeyCode::Char('?')),
@@ -1613,6 +1666,35 @@ impl App {
             ));
         }
         self.draw_modal(f, outer[0]);
+        if self.modal.is_none() && self.pending_review.is_some() {
+            self.areas.toast = toast::draw(
+                f,
+                outer[0],
+                "Review ready",
+                "Finish your current input to open the review.",
+                true,
+            );
+        } else if self.modal.is_none()
+            && let Some(job) = &mut self.job
+            && job.kind != JobKind::Operation
+            && !job.discard
+            && (job.kind == JobKind::Preparation
+                || job.started.elapsed() >= Duration::from_millis(250))
+        {
+            job.toast_started.get_or_insert_with(Instant::now);
+            let title = match job.kind {
+                JobKind::Preparation => "Preparing review",
+                JobKind::Inspection => "Refreshing",
+                _ => "Loading details",
+            };
+            self.areas.toast = toast::draw(
+                f,
+                outer[0],
+                title,
+                &format!("{}…", job.label),
+                job.kind == JobKind::Preparation,
+            );
+        }
     }
 
     fn draw_modal(&mut self, f: &mut Frame, workspace: Rect) {
@@ -1669,9 +1751,6 @@ impl App {
             Modal::Setup => "Welcome to dot · Save and reuse your app settings",
             Modal::Review { .. } => "Review operation",
             Modal::Outcome { .. } => "Operation result",
-            Modal::Busy {
-                cancellable: true, ..
-            } => "Preparing review",
             Modal::Busy { .. } => "Operation in progress",
             Modal::Report { title, .. } | Modal::Text { title, .. } => title,
             Modal::Confirm { .. } => "Review local action",
@@ -1704,22 +1783,12 @@ impl App {
                     operation_screen::result(f, inner, &self.config, &outcome, &view);
                 self.areas.modal_body = self.areas.operation.body;
             }
-            Modal::Busy { label, cancellable } => {
-                let message = if cancellable {
-                    format!("{label}…\n\nChecking exact targets and preparing the preview.")
-                } else {
-                    format!(
-                        "{label}…\n\nPlease wait for the result. This operation cannot be cancelled."
-                    )
-                };
+            Modal::Busy { label } => {
                 f.render_widget(
-                    Paragraph::new(message).wrap(Wrap { trim: false }),
+                    Paragraph::new(format!("{label}…\n\nPlease wait for the result. This operation cannot be cancelled."))
+                        .wrap(Wrap { trim: false }),
                     regions[0],
                 );
-                if cancellable {
-                    self.areas.modal_controls =
-                        dialog::controls(f, regions[1], &[("Esc Cancel", KeyCode::Esc)]);
-                }
             }
             Modal::Setup => {
                 let areas = Layout::vertical([
@@ -1783,7 +1852,7 @@ impl App {
                     f,
                     regions[1],
                     &[
-                        ("y Execute", KeyCode::Char('y')),
+                        ("Enter/y Execute", KeyCode::Char('y')),
                         ("Esc Cancel", KeyCode::Esc),
                     ],
                 );
@@ -1818,12 +1887,18 @@ impl App {
             }
             Modal::Input { purpose, text } => {
                 let source = matches!(purpose, Purpose::Source(_));
-                let mut display = text;
-                let byte = display
+                let byte = text
                     .char_indices()
                     .nth(self.input_cursor)
                     .map(|(i, _)| i)
-                    .unwrap_or(display.len());
+                    .unwrap_or(text.len());
+                let styled = if let Purpose::Source(path) = &purpose {
+                    syntax::source(path, &text)
+                } else {
+                    Text::from(text.clone())
+                };
+                let styled = syntax::caret(styled, &text, byte);
+                let mut display = text;
                 // Include the cursor marker in wrapping so it remains visible at line ends.
                 display.insert(byte, '▏');
                 let prefix = &display[..byte + '▏'.len_utf8()];
@@ -1834,7 +1909,7 @@ impl App {
                     .saturating_sub(regions[0].height as usize)
                     .min(u16::MAX as usize) as u16;
                 f.render_widget(
-                    Paragraph::new(display)
+                    Paragraph::new(styled)
                         .scroll((offset, 0))
                         .wrap(Wrap { trim: false }),
                     regions[0],
@@ -2101,7 +2176,7 @@ impl App {
         self.areas.details = r;
         let block = self.tab_block(r, Pane::Details, "0 Details · ");
         f.render_widget(
-            Paragraph::new(diff_text(&self.detail))
+            Paragraph::new(syntax::preview(&self.detail))
                 .block(block)
                 .scroll((self.scroll, 0)),
             r,
@@ -2153,26 +2228,6 @@ fn vertical_cursor(chars: &[char], cursor: usize, delta: isize) -> usize {
     let end = starts.get(target + 1).map(|v| v - 1).unwrap_or(chars.len());
     (starts[target] + column).min(end)
 }
-fn diff_text(text: &str) -> Text<'static> {
-    Text::from(
-        text.lines()
-            .map(|l| {
-                Line::styled(
-                    l.to_string(),
-                    Style::default().fg(if l.starts_with('+') {
-                        Color::Green
-                    } else if l.starts_with('-') {
-                        Color::Red
-                    } else if l.starts_with("@@") {
-                        Color::Cyan
-                    } else {
-                        Color::White
-                    }),
-                )
-            })
-            .collect::<Vec<_>>(),
-    )
-}
 const MENU: &[&str] = &[
     "Capture selected HOME changes → source",
     "Apply selected source → HOME",
@@ -2208,8 +2263,9 @@ const MENU: &[&str] = &[
     "Set machine override",
     "Ignore selected files in chezmoi and Git",
     "Add developer ignore defaults to both files",
+    "Delete untracked originals · move to system Trash",
 ];
-const HELP: &str = "1 Status · 2 Files · 3 Git · 4 Machines · 0 Details\nTab focus next pane · z expand focused pane · Esc return\n↑/↓ or j/k move · PgUp/PgDn scroll\nFiles: →/l enter folder · ←/h parent · Space select · / filter · f All/Managed/Changed\nFiles: c capture HOME → source · a apply · r restore · e edit source\nFiles / Git: i ignore in both chezmoi and Git; review then y\nCapture skips .DS_Store, node_modules, target, Python caches and .venv by default.\nFiles: d / Delete remove saved copies from dot (original files stay)\nGit: Space stage/unstage · v multi-select · c commit · d discard source → HEAD\nGit: h changes/history · F fetch · L pull · P push\n[/] previous/next tab in focused section · click tab labels · Enter focus details\n: all actions, Settings, Machines, Activity, Recovery, Packages\nR refresh · ? help · q quit when idle\nMouse: click panes/rows/footer hints · wheel scroll pane\nText fields receive all character keys before global commands. Paste supported.\nNative chezmoi previews may evaluate repository templates/hooks.\nHOME changes, source changes, staged changes and unpublished commits are distinct.";
+const HELP: &str = "1 Status · 2 Files · 3 Git · 4 Machines · 0 Details\nTab focus next pane · z expand focused pane · Esc return\n↑/↓ or j/k move · PgUp/PgDn scroll\nFiles: →/l enter folder · ←/h parent · Space select · / filter · f All/Managed/Changed\nFiles: c capture HOME → source · a apply · R restore · e edit source\nFiles / Git: i ignore in both chezmoi and Git; review then Enter or y\nCapture skips .DS_Store, node_modules, target, Python caches and .venv by default.\nFiles: r remove saved copies (originals stay) · d / Delete move untracked originals to Trash\nGit: Space stage/unstage · v multi-select · c commit · d discard source → HEAD\nGit: h changes/history · F fetch · L pull · P push\n[/] previous/next tab in focused section · click tab labels · Enter focus details\n: all actions, Settings, Machines, Activity, Recovery, Packages\nCtrl+R refresh · ? help · q quit when idle\nMouse: click panes/rows/footer hints · wheel scroll pane\nText fields receive all character keys before global commands. Paste supported.\nNative chezmoi previews may evaluate repository templates/hooks.\nHOME changes, source changes, staged changes and unpublished commits are distinct.";
 
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -2424,6 +2480,43 @@ mod tests {
         (tmp, a)
     }
     #[test]
+    fn syntax_colors_reach_file_details_editor_and_review() {
+        let (_t, mut a) = app();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        let mint = Color::Rgb(97, 218, 179);
+        fn has_colored_symbol(
+            term: &Terminal<ratatui::backend::TestBackend>,
+            area: Rect,
+            symbol: &str,
+            color: Color,
+        ) -> bool {
+            (area.y..area.bottom()).any(|y| {
+                (area.x..area.right()).any(|x| {
+                    let cell = &term.backend().buffer()[(x, y)];
+                    cell.symbol() == symbol && cell.fg == color
+                })
+            })
+        }
+        a.detail = "SOURCE private_dot_zshrc.tmpl\n\nexport NAME=\"Ω\"\n".into();
+        term.draw(|f| a.draw(f)).unwrap();
+        assert!(has_colored_symbol(&term, a.areas.details, "Ω", mint));
+        a.modal = Some(Modal::Input {
+            purpose: Purpose::Source(".zshrc".into()),
+            text: "export NAME=\"Ω\"\n".into(),
+        });
+        term.draw(|f| a.draw(f)).unwrap();
+        assert!(has_colored_symbol(&term, a.areas.modal_body, "Ω", mint));
+        a.modal = Some(Modal::Review { plan: Plan {
+            id: "syntax".into(), action: Action::Capture, paths: vec![".zshrc".into()], payload: None,
+            fingerprint: String::new(), created_at: String::new(),
+            preview: "--- a/.zshrc\n+++ b/.zshrc\n@@ -1 +1 @@\n-export NAME=\"Ω\"\n+export NAME=\"Ψ\"\n".into(),
+        }, view: OperationView { tab: 1, scroll: 0 } });
+        term.draw(|f| a.draw(f)).unwrap();
+        assert!(has_colored_symbol(&term, a.areas.operation.body, "Ω", mint));
+        assert!(has_colored_symbol(&term, a.areas.operation.body, "Ψ", mint));
+    }
+
+    #[test]
     fn action_dialogs_preserve_the_workspace_around_their_bounds() {
         let (_t, mut a) = app();
         let plan = Plan {
@@ -2610,19 +2703,257 @@ mod tests {
     }
 
     #[test]
+    fn quick_preparation_keeps_its_toast_visible_before_opening_review() {
+        let (_t, mut a) = app();
+        let (tx, rx) = mpsc::channel();
+        a.job = Some(Job {
+            rx,
+            label: "Capture".into(),
+            kind: JobKind::Preparation,
+            discard: false,
+            started: Instant::now(),
+            toast_started: None,
+        });
+        tx.send(Ok(Work::Plan(Plan {
+            id: "quick".into(),
+            action: Action::Capture,
+            paths: vec![".untracked".into()],
+            payload: None,
+            fingerprint: String::new(),
+            created_at: String::new(),
+            preview: String::new(),
+        })))
+        .unwrap();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        a.pump();
+        assert!(
+            a.modal.is_none(),
+            "a quick result must not immediately replace the preparation toast"
+        );
+        assert!(a.job.is_some());
+        term.draw(|f| a.draw(f)).unwrap();
+        assert!(!a.areas.toast.bounds.is_empty());
+        a.job.as_mut().unwrap().toast_started = Some(Instant::now() - Duration::from_millis(200));
+        a.pump();
+        assert!(
+            a.modal.is_none(),
+            "the toast must still be visible before 0.8 seconds"
+        );
+        a.job.as_mut().unwrap().toast_started = Some(Instant::now() - Duration::from_millis(801));
+        a.pump();
+        assert!(matches!(a.modal, Some(Modal::Review { ref plan, .. }) if plan.id == "quick"));
+        term.draw(|f| a.draw(f)).unwrap();
+        assert!(a.areas.toast.bounds.is_empty());
+    }
+
+    #[test]
+    fn preparation_uses_a_bottom_right_toast_without_stealing_focus() {
+        let (_t, mut a) = app();
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let workspace = term.backend().buffer().clone();
+        let (tx, rx) = mpsc::channel::<Result<Work>>();
+        a.launch_job(JobKind::Preparation, "Capture HOME → source", move || {
+            rx.recv().unwrap()
+        });
+        let non_modal = a.modal.is_none();
+        tx.send(Err(anyhow::anyhow!("cancelled fixture"))).unwrap();
+        assert!(
+            non_modal,
+            "preparation must leave the workspace interactive"
+        );
+        term.draw(|f| a.draw(f)).unwrap();
+        let bounds = a.areas.toast.bounds;
+        assert!(
+            bounds.x > 60 && bounds.y > 25,
+            "toast must be at the bottom right"
+        );
+        assert!(bounds.width <= 48 && bounds.height <= 6);
+        for y in 0..35 {
+            for x in 0..120 {
+                if !bounds.contains(Position::new(x, y)) {
+                    assert_eq!(
+                        term.backend().buffer()[(x, y)],
+                        workspace[(x, y)],
+                        "toast must not dim or replace the workspace"
+                    );
+                }
+            }
+        }
+        let text = term
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|c| c.symbol())
+            .collect::<String>();
+        assert!(text.contains("Preparing review"));
+        assert!(text.contains("Capture HOME → source"));
+        if let Ok(path) = std::env::var("DOT_TOAST_RENDER_PATH") {
+            let rows: Vec<_> = term.backend().buffer().content.chunks(120).map(|row| {
+                row.iter().map(|cell| serde_json::json!({
+                    "text": cell.symbol(), "fg": format!("{:?}", cell.fg), "bg": format!("{:?}", cell.bg),
+                })).collect::<Vec<_>>()
+            }).collect();
+            fs::write(path, serde_json::to_vec(&rows).unwrap()).unwrap();
+        }
+        a.key(KeyEvent::new(KeyCode::Char('3'), KeyModifiers::NONE));
+        assert_eq!(
+            a.pane,
+            Pane::Git,
+            "preparation must not trap workspace navigation"
+        );
+        for (w, h) in [(80, 24), (45, 14), (20, 8)] {
+            term.backend_mut().resize(w, h);
+            term.resize(Rect::new(0, 0, w, h)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            assert!(a.areas.toast.bounds.right() >= w - 1);
+            assert!(a.areas.toast.bounds.bottom() >= h - 3);
+            assert!(
+                a.areas.toast.bounds.bottom() <= h - 2,
+                "keep footer controls available"
+            );
+        }
+        let cancel = a.areas.toast.cancel.unwrap();
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: cancel.x,
+            row: cancel.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(a.job.as_ref().unwrap().discard);
+        assert_eq!(
+            a.pane,
+            Pane::Git,
+            "toast clicks must not reach the panel underneath"
+        );
+        term.draw(|f| a.draw(f)).unwrap();
+        assert!(a.areas.toast.bounds.is_empty());
+        a.modal = Some(Modal::Menu(0));
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while a.job.is_some() && Instant::now() < deadline {
+            a.pump();
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(
+            matches!(a.modal, Some(Modal::Menu(0))),
+            "cancelled preparation must not show its result"
+        );
+    }
+
+    #[test]
+    fn ready_review_waits_for_search_or_another_form_to_close() {
+        for search in [true, false] {
+            let (_t, mut a) = app();
+            a.preview_key = a.current_key();
+            let (tx, rx) = mpsc::channel::<Result<Work>>();
+            a.launch_job(JobKind::Preparation, "Capture", move || rx.recv().unwrap());
+            if search {
+                a.searching = true;
+            } else {
+                a.modal = Some(Modal::Input {
+                    purpose: Purpose::Commit,
+                    text: String::new(),
+                });
+            }
+            tx.send(Ok(Work::Plan(Plan {
+                id: "ready".into(),
+                action: Action::Capture,
+                paths: vec![".untracked".into()],
+                payload: None,
+                fingerprint: String::new(),
+                created_at: String::new(),
+                preview: String::new(),
+            })))
+            .unwrap();
+            if let Some(job) = &mut a.job {
+                job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+            }
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while a.pending_review.is_none() && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(a.pending_review.is_some());
+            a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+            assert!(
+                a.job.is_none(),
+                "typing y must not approve the pending operation"
+            );
+            if search {
+                assert_eq!(a.query, "y");
+                a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+            } else {
+                assert!(matches!(a.modal, Some(Modal::Input { ref text, .. }) if text == "y"));
+                a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            }
+            a.pump();
+            assert!(matches!(a.modal, Some(Modal::Review { ref plan, .. }) if plan.id == "ready"));
+            assert!(a.pending_review.is_none());
+        }
+    }
+
+    #[test]
+    fn slow_background_work_uses_toasts_that_disappear_on_completion() {
+        for (kind, title) in [
+            (JobKind::Inspection, "Refreshing"),
+            (JobKind::Preview, "Loading details"),
+        ] {
+            let (_t, mut a) = app();
+            let (tx, rx) = mpsc::channel::<Result<Work>>();
+            a.launch_job(kind, "Background fixture", move || rx.recv().unwrap());
+            let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+            term.draw(|f| a.draw(f)).unwrap();
+            assert!(
+                a.areas.toast.bounds.is_empty(),
+                "fast refreshes should not flash a toast"
+            );
+            a.job.as_mut().unwrap().started = Instant::now() - Duration::from_millis(300);
+            term.draw(|f| a.draw(f)).unwrap();
+            assert!(a.modal.is_none());
+            assert!(a.areas.toast.bounds.x > 60);
+            let text = term
+                .backend()
+                .buffer()
+                .content
+                .iter()
+                .map(|c| c.symbol())
+                .collect::<String>();
+            assert!(text.contains(title));
+            assert!(a.areas.toast.cancel.is_none());
+            let result = if kind == JobKind::Inspection {
+                Work::Snapshot(a.snapshot.clone())
+            } else {
+                Work::Preview {
+                    key: a.current_key(),
+                    text: "Ready".into(),
+                }
+            };
+            a.job.as_mut().unwrap().toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+            tx.send(Ok(result)).unwrap();
+            // Open help while the worker finishes; it must not be replaced by status UI.
+            a.modal = Some(Modal::Menu(0));
+            let deadline = Instant::now() + Duration::from_secs(2);
+            while a.job.is_some() && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(a.modal, Some(Modal::Menu(0))));
+            a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            term.draw(|f| a.draw(f)).unwrap();
+            assert!(a.areas.toast.bounds.is_empty());
+        }
+    }
+
+    #[test]
     fn cancelled_preparation_never_reopens_a_dialog() {
         let (_t, mut a) = app();
         let (tx, rx) = mpsc::channel::<Result<Work>>();
         a.launch_job(JobKind::Preparation, "Preparing capture", move || {
             rx.recv().unwrap()
         });
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Busy {
-                cancellable: true,
-                ..
-            })
-        ));
+        assert!(a.modal.is_none());
         a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         assert!(a.modal.is_none());
         a.modal = Some(Modal::Menu(2));
@@ -2655,13 +2986,21 @@ mod tests {
         a.snapshot = backend::snapshot(&a.config).unwrap();
         a.rebuild();
         for (path, key, subject) in [
-            ("scratch", KeyCode::Char('d'), "This folder"),
-            (".untracked", KeyCode::Delete, "This file"),
+            ("scratch", KeyCode::Char('r'), "This folder"),
+            (".untracked", KeyCode::Char('r'), "This file"),
         ] {
             a.cursor = a.rows.iter().position(|row| row.path == path).unwrap();
             a.key(KeyEvent::new(key, KeyModifiers::NONE));
+            if let Some(job) = &mut a.job {
+                job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+            }
             let deadline = Instant::now() + Duration::from_secs(5);
-            while matches!(a.modal, Some(Modal::Busy { .. })) && Instant::now() < deadline {
+            while a
+                .job
+                .as_ref()
+                .is_some_and(|job| job.kind == JobKind::Preparation)
+                && Instant::now() < deadline
+            {
                 a.pump();
                 std::thread::sleep(Duration::from_millis(5));
             }
@@ -2691,8 +3030,16 @@ mod tests {
         fs::write(a.config.home.join(".tracked"), "original").unwrap();
         a.selected = ["scratch".into(), ".tracked".into()].into();
         a.menu_action(3);
+        if let Some(job) = &mut a.job {
+            job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
-        while matches!(a.modal, Some(Modal::Busy { .. })) && Instant::now() < deadline {
+        while a
+            .job
+            .as_ref()
+            .is_some_and(|job| job.kind == JobKind::Preparation)
+            && Instant::now() < deadline
+        {
             a.pump();
             std::thread::sleep(Duration::from_millis(5));
         }
@@ -2740,13 +3087,7 @@ mod tests {
         let bounds = a.areas.modal;
         for key in [KeyCode::Esc, KeyCode::Char('y'), KeyCode::Enter] {
             a.key(KeyEvent::new(key, KeyModifiers::NONE));
-            assert!(matches!(
-                a.modal,
-                Some(Modal::Busy {
-                    cancellable: false,
-                    ..
-                })
-            ));
+            assert!(matches!(a.modal, Some(Modal::Busy { .. })));
         }
         tx.send(Err(anyhow::anyhow!("Fixture operation failed")))
             .unwrap();
@@ -2775,6 +3116,7 @@ mod tests {
         term.draw(|f| a.draw(f)).unwrap();
         assert_eq!(a.areas.modal, bounds);
         for (w, h) in [(45, 14), (20, 8)] {
+            term.backend_mut().resize(w, h);
             term.resize(Rect::new(0, 0, w, h)).unwrap();
             term.draw(|f| a.draw(f)).unwrap();
             let text = term
@@ -2841,6 +3183,90 @@ mod tests {
         );
     }
     #[test]
+    fn restore_is_uppercase_r_and_refresh_uses_control_r() {
+        for (key, kind, label) in [
+            (
+                KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE),
+                JobKind::Preparation,
+                Action::Restore.label(),
+            ),
+            (
+                KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL),
+                JobKind::Inspection,
+                "Inspecting chezmoi and Git",
+            ),
+        ] {
+            let (_t, mut a) = app();
+            a.config.chezmoi = "/not/a/command".into();
+            a.key(key);
+            let job = a
+                .job
+                .take()
+                .expect("shortcut must launch the intended action");
+            assert!(job.kind == kind);
+            assert_eq!(job.label, label);
+            let _ = job.rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        }
+    }
+
+    #[test]
+    fn delete_original_shortcuts_review_trash_and_cancel_without_moving_files() {
+        let (_t, mut a) = app();
+        initialize(&a.config, &a.config_path, None).unwrap();
+        fs::create_dir(a.config.home.join("scratch")).unwrap();
+        fs::write(
+            a.config.home.join("scratch/original.txt"),
+            "keep until confirmed",
+        )
+        .unwrap();
+        a.snapshot = backend::snapshot(&a.config).unwrap();
+        a.rebuild();
+        a.cursor = a.rows.iter().position(|row| row.path == "scratch").unwrap();
+        for key in [KeyCode::Char('d'), KeyCode::Delete] {
+            a.key(KeyEvent::new(key, KeyModifiers::NONE));
+            a.job.as_mut().unwrap().toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while a.job.is_some() && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(matches!(a.modal, Some(Modal::Review { ref plan, .. })
+                if plan.action == Action::Trash && plan.paths == ["scratch"]));
+            for (w, h) in [(120, 35), (80, 24), (45, 14), (20, 8)] {
+                let mut term = Terminal::new(ratatui::backend::TestBackend::new(w, h)).unwrap();
+                term.draw(|f| a.draw(f)).unwrap();
+                let text = term
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|c| c.symbol())
+                    .collect::<String>();
+                assert!(
+                    text.contains("Enter/y Trash"),
+                    "Trash control missing at {w}x{h}"
+                );
+                assert!(
+                    a.areas
+                        .operation
+                        .controls
+                        .iter()
+                        .any(|(_, key)| *key == KeyCode::Esc)
+                );
+                if w >= 80 {
+                    assert!(text.contains("Only untracked originals"));
+                }
+            }
+            a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+            assert!(a.modal.is_none());
+            assert_eq!(
+                fs::read_to_string(a.config.home.join("scratch/original.txt")).unwrap(),
+                "keep until confirmed"
+            );
+        }
+    }
+
+    #[test]
     fn focused_panel_has_a_bright_double_border_and_remove_is_discoverable() {
         let (_t, mut a) = app();
         let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
@@ -2869,7 +3295,7 @@ mod tests {
                 a.areas
                     .footer
                     .iter()
-                    .any(|(_, key)| *key == KeyCode::Char('d')),
+                    .any(|(_, key)| *key == KeyCode::Char('r')),
                 "Remove must stay visible at {w}x{h}"
             );
         }
@@ -2889,7 +3315,7 @@ mod tests {
             .areas
             .footer
             .iter()
-            .find(|(_, key)| *key == KeyCode::Char('d'))
+            .find(|(_, key)| *key == KeyCode::Char('r'))
             .unwrap()
             .0;
         a.mouse(event::MouseEvent {
@@ -2898,6 +3324,9 @@ mod tests {
             row: button.y,
             modifiers: KeyModifiers::NONE,
         });
+        if let Some(job) = &mut a.job {
+            job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while a.job.is_some() && Instant::now() < deadline {
             a.pump();
@@ -2920,7 +3349,10 @@ mod tests {
             a.config.source.join("dot_untracked").exists(),
             "cancel must preserve the saved copy"
         );
-        a.key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::NONE));
+        if let Some(job) = &mut a.job {
+            job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while a.job.is_some() && Instant::now() < deadline {
             a.pump();
@@ -2928,6 +3360,9 @@ mod tests {
         }
         assert!(matches!(a.modal, Some(Modal::Review { .. })));
         a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
+        if let Some(job) = &mut a.job {
+            job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+        }
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
             a.pump();
@@ -3007,6 +3442,64 @@ mod tests {
     }
 
     #[test]
+    fn enter_and_y_both_confirm_operation_reviews_and_local_controls() {
+        for key in [KeyCode::Char('y'), KeyCode::Enter] {
+            let (_t, mut a) = app();
+            initialize(&a.config, &a.config_path, None).unwrap();
+            let plan =
+                operations::plan(&a.config, Action::Capture, &[".untracked".into()], None).unwrap();
+            a.modal = Some(Modal::Review {
+                plan,
+                view: OperationView::default(),
+            });
+            a.key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(
+                matches!(a.modal, Some(Modal::Busy { .. })),
+                "{key:?} must confirm the review"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                matches!(a.modal, Some(Modal::Outcome { ref outcome, .. }) if outcome.failed.is_none())
+            );
+            assert_eq!(
+                fs::read_to_string(a.config.source.join("dot_untracked")).unwrap(),
+                "untracked"
+            );
+            // Finish background inspection before removing the fixture.
+            if let Some(job) = a.job.take() {
+                let _ = job.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+
+            let (_t, mut a) = app();
+            a.config.chezmoi = "/not/a/command".into();
+            a.config.save(&a.config_path).unwrap();
+            a.modal = Some(Modal::Confirm {
+                command: Control::Policy("trusted".into(), true),
+                text: "Enable trusted mode?".into(),
+                scroll: 0,
+            });
+            a.key(KeyEvent::new(key, KeyModifiers::NONE));
+            assert!(
+                matches!(a.modal, Some(Modal::Busy { .. })),
+                "{key:?} must confirm the local action"
+            );
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !a.config.trusted && Instant::now() < deadline {
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(Config::load(&a.config_path).unwrap().trusted);
+            if let Some(job) = a.job.take() {
+                let _ = job.rx.recv_timeout(Duration::from_secs(5)).unwrap();
+            }
+        }
+    }
+
+    #[test]
     fn capture_review_requires_confirmation_and_result_routes_to_git() {
         let (_t, mut a) = app();
         initialize(&a.config, &a.config_path, None).unwrap();
@@ -3018,8 +3511,7 @@ mod tests {
         });
         let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(80, 24)).unwrap();
         terminal.draw(|f| a.draw(f)).unwrap();
-        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
-        assert!(a.job.is_none(), "Enter must never approve a review");
+        assert!(a.job.is_none(), "rendering a review must not execute it");
         assert!(!a.config.source.join("dot_untracked").exists());
         // Clicking a tab switches views without executing anything.
         let changes = a
@@ -3054,24 +3546,12 @@ mod tests {
             row: confirm.y,
             modifiers: KeyModifiers::NONE,
         });
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Busy {
-                cancellable: false,
-                ..
-            })
-        ));
+        assert!(matches!(a.modal, Some(Modal::Busy { .. })));
         a.key(KeyEvent::new(KeyCode::Char('y'), KeyModifiers::NONE));
         a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
         terminal.draw(|f| a.draw(f)).unwrap();
         assert_eq!(a.areas.modal, review_bounds);
-        assert!(matches!(
-            a.modal,
-            Some(Modal::Busy {
-                cancellable: false,
-                ..
-            })
-        ));
+        assert!(matches!(a.modal, Some(Modal::Busy { .. })));
         let deadline = Instant::now() + Duration::from_secs(5);
         while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
             a.pump();
@@ -3135,6 +3615,16 @@ mod tests {
             ..outcome.clone()
         };
         for (name, modal) in [
+            ("trash-review", Modal::Review {
+                plan: Plan { action: Action::Trash, paths: vec!["Downloads/old-file.txt".into(), "scratch".into()],
+                    preview: "FILE  /Users/example/Downloads/old-file.txt\nFOLDER  /Users/example/scratch\nFolders include all contents. Recover using system Trash.".into(), ..plan.clone() },
+                view: OperationView::default(),
+            }),
+            ("trash-result", Modal::Outcome {
+                outcome: Outcome { action: Action::Trash, succeeded: vec!["Downloads/old-file.txt".into(), "scratch".into()],
+                    message: "Originals moved to system Trash. Restore them using your system Trash.".into(), ..outcome.clone() },
+                view: OperationView::default(),
+            }),
             (
                 "capture-files",
                 Modal::Review {
@@ -3176,7 +3666,7 @@ mod tests {
                 assert!(!text.contains("\"succeeded\""));
                 assert!(!text.contains("Space Select"));
                 assert!(
-                    text.contains("y Capture") || text.contains("Enter Done"),
+                    text.contains("Enter/y Capture") || text.contains("Enter/y Trash") || text.contains("Enter Done"),
                     "primary control must remain visible at {w}x{h}"
                 );
                 if w >= 80 {
@@ -3310,7 +3800,7 @@ mod tests {
                 .map(|c| c.symbol())
                 .collect::<String>();
             if w >= 45 {
-                assert!(text.contains("then y to use them."));
+                assert!(text.contains("Enter or y to use them."));
             }
             let button = a.areas.setup[0].0;
             a.mouse(event::MouseEvent {
@@ -3440,7 +3930,7 @@ mod tests {
         a.last_refresh = Instant::now() - Duration::from_secs(30);
         a.pump();
         assert!(a.job.is_none(), "automatic retries must remain paused");
-        a.key(KeyEvent::new(KeyCode::Char('R'), KeyModifiers::NONE));
+        a.key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL));
         assert!(a.job.is_some(), "manual refresh must remain available");
     }
     #[test]
@@ -3462,6 +3952,8 @@ mod tests {
             label: "Inspection".into(),
             kind: JobKind::Inspection,
             discard: false,
+            started: Instant::now(),
+            toast_started: None,
         });
         assert!(a.key(KeyEvent::new(KeyCode::Char('q'), KeyModifiers::NONE)));
         a.searching = true;
