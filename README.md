@@ -89,10 +89,16 @@ mean the source is committed or published.
 | `e` in Files | Edit native source; Ctrl+S reviews changes; F2 expands/restores the editor |
 | Space in Git, `v` | Stage/unstage; multi-select Git paths |
 | `c` in Git, `P`, `L`, `F` | Commit, push, pull, fetch |
+| `t` in Files | Toggle tracked (Managed) / all files in `~` |
+| `s` in Files | Assign OS and machines in Details → Rules |
 | `/`, `f` | Search; All/Managed/Changed |
 | `[`, `]`, `z` | Previous/next tab in the focused section; expand focused panel |
 | `:`, `?`, Esc | All actions, help, back/cancel |
 | Ctrl+R | Refresh the workspace |
+
+Help (`?`) groups shortcuts into General, Files and Git tabs, opening on the
+current section. Use `1`–`3`, Tab or the tab labels to switch topics; arrows,
+Page Up/Down and the mouse wheel scroll. Enter or Esc closes Help.
 
 Only left mouse clicks move focus between panels; hovering and scrolling keep
 keyboard focus in place. The wheel scrolls the panel under the pointer.
@@ -106,6 +112,26 @@ Each section shows its tabs in the border: Status (Overview/Paths), Files
 (All/Managed/Changed), Git (Changes/Commits), Machines (Local/Reports), Details
 (Diff/Source/Rules/Activity), and Activity (Recent/All). Click a tab or use `[`/`]`
 in that section. Each section keeps its own active tab; Tab still changes focus.
+
+In **Files**, choose a tracked file or folder and press **s** to open
+**Details → Rules**. Click **All / Darwin / Linux** and **All machines / This
+machine / Choose…**, or use **o** to cycle OS, **m** to toggle all/this machine,
+and **M** to enter comma-separated hostnames. **s** reviews the assignment;
+Enter or **y** confirms it. **u** resets unsaved edits. Capture untracked files
+before assigning them.
+Previously assigned hostnames also appear as clickable choices; click to add or
+remove a machine from the selection.
+
+Assignments are saved as native conditions in a marked `.chezmoiignore` block
+(or the existing `.tmpl` variant), so ordinary chezmoi commands enforce them
+on every machine. Machine assignments use chezmoi's short hostname, independently
+of dot's display label; pasted names such as `laptop.local` become `laptop`.
+Folder restrictions include descendants and combine with parent assignments.
+Existing custom rules stay intact; conflicting native `!` exceptions must be
+resolved before saving. Commit and push the rule change to share assignments.
+Excluded saved copies remain visible with **OFF**, including missing originals,
+so their assignments can be changed again. Assigning a file keeps original and
+source content unchanged. Reviewed assignment changes support Recovery.
 
 File previews, source editing, and review/Git diffs use bundled Tree-sitter
 syntax highlighting. Shell startup files, TOML, JSON/JSONC, YAML, INI (including

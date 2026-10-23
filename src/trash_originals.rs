@@ -26,6 +26,7 @@ pub fn prepare(c: &Config, snapshot: &Snapshot, paths: &[String]) -> Result<(Vec
         if snapshot
             .managed
             .keys()
+            .chain(snapshot.scoped_out.keys())
             .chain(snapshot.managed_directories.iter())
             .chain(c.enabled.iter())
             .any(|managed| managed == &relative || managed.starts_with(&prefix))

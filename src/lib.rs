@@ -1,7 +1,10 @@
+mod assignment_screen;
+pub mod assignments;
 pub mod backend;
 pub mod config;
 mod dialog;
 pub mod git;
+mod help;
 pub mod ignores;
 pub mod migration;
 pub mod onboarding;

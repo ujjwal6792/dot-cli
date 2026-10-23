@@ -34,6 +34,7 @@ pub enum Action {
     Push,
     EditSource,
     Setting,
+    Assign,
 }
 impl Action {
     pub fn label(self) -> &'static str {
@@ -55,6 +56,7 @@ impl Action {
             Self::Pull => "Pull fast-forward",
             Self::Push => "Push configuration commits",
             Self::Setting => "Change shared/OS/machine setting",
+            Self::Assign => "Assign OS and machines",
             Self::EditSource => "Edit source",
         }
     }
@@ -288,6 +290,14 @@ pub fn plan(
         }
     }
     let preview = match action {
+        Action::Assign => {
+            let scope =
+                serde_json::from_str(payload.as_deref().context("File assignment missing")?)?;
+            let change = crate::assignments::prepare(c, &targets, &scope)?;
+            let preview = change.preview.clone();
+            payload = Some(serde_json::to_string(&change)?);
+            preview
+        }
         Action::Trash => crate::trash_originals::preview(c, &targets)?,
         Action::Apply | Action::Restore => backend::preview(c, &targets, false)?,
         Action::Capture => {
@@ -493,6 +503,7 @@ fn execute_with_trash(
             | Action::Setting
             | Action::Ignore
             | Action::IgnoreDefaults
+            | Action::Assign
     ) {
         backup_source(c, &dir.join("source"))?
     } else {
@@ -663,6 +674,12 @@ fn execute_with_trash(
 }
 fn execute_group(c: &mut Config, config_path: &Path, p: &Plan) -> Result<String> {
     let mut args = match p.action {
+        Action::Assign => {
+            return crate::assignments::apply(
+                c,
+                p.payload.as_deref().context("File assignment missing")?,
+            );
+        }
         Action::Ignore | Action::IgnoreDefaults => {
             return crate::ignores::apply(
                 c,
@@ -781,6 +798,7 @@ pub fn recover(c: &Config, id: &str) -> Result<String> {
             | Action::Setting
             | Action::Ignore
             | Action::IgnoreDefaults
+            | Action::Assign
     ) {
         bail!("This operation requires Git or scope recovery; file restore is not applicable");
     }

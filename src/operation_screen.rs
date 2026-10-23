@@ -73,6 +73,7 @@ fn name(action: Action) -> &'static str {
         Action::Push => "Push",
         Action::EditSource => "Edit saved settings",
         Action::Setting => "Change setting",
+        Action::Assign => "Assign OS and machines",
     }
 }
 
@@ -244,7 +245,7 @@ pub fn review(f: &mut Frame, area: Rect, c: &Config, plan: &Plan, view: &View) -
         Action::Trash => "Trash",
         Action::Enable => "Enable",
         Action::Disable => "Disable",
-        Action::EditSource | Action::Setting => "Save",
+        Action::EditSource | Action::Setting | Action::Assign => "Save",
         Action::IgnoreDefaults => "Defaults",
         action => name(action),
     };

@@ -21,6 +21,13 @@ pub struct Managed {
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct Snapshot {
     pub managed: BTreeMap<String, Managed>,
+    /// Saved copies excluded by dot's OS/machine rules remain inspectable in dot.
+    #[serde(default)]
+    pub scoped_out: BTreeMap<String, Managed>,
+    #[serde(default)]
+    pub assignments: BTreeMap<String, crate::assignments::Scope>,
+    #[serde(default)]
+    pub identity: crate::assignments::Identity,
     #[serde(default)]
     pub managed_directories: BTreeSet<String>,
     /// Native-approved immediate entries, inspected in background workers only.
@@ -116,7 +123,7 @@ pub fn snapshot(c: &Config) -> Result<Snapshot> {
             bail!("Managed source outside configured repository: {path}");
         }
     }
-    let managed_directories = chez(
+    let mut managed_directories: BTreeSet<String> = chez(
         c,
         &["managed", "--path-style=relative", "--include=dirs", "-0"],
     )?
@@ -124,6 +131,38 @@ pub fn snapshot(c: &Config) -> Result<Snapshot> {
     .filter(|p| !p.is_empty())
     .map(str::to_owned)
     .collect();
+    let assignments = crate::assignments::read(c)?;
+    let identity = crate::assignments::identity(c)?;
+    let mut scoped_out = BTreeMap::new();
+    if !assignments.is_empty() {
+        let inventory: BTreeMap<String, Managed> = serde_json::from_str(&chez(
+            c,
+            &[
+                "--override-data",
+                crate::assignments::INVENTORY,
+                "managed",
+                "--format=json",
+                "--path-style=all",
+                "--include=files,symlinks",
+            ],
+        )?)?;
+        for (path, item) in inventory {
+            clean_relative(Path::new(&path))?;
+            if !Path::new(&item.source_absolute).starts_with(&c.source) {
+                bail!("Managed source outside configured repository: {path}");
+            }
+            if !managed.contains_key(&path)
+                && !crate::assignments::applies(&assignments, &path, &identity)
+            {
+                let mut parent = Path::new(&path).parent();
+                while let Some(p) = parent.filter(|p| !p.as_os_str().is_empty()) {
+                    managed_directories.insert(p.to_string_lossy().into_owned());
+                    parent = p.parent();
+                }
+                scoped_out.insert(path, item);
+            }
+        }
+    }
     let changes = parse_status(&chez(c, &["status", "--path-style=relative"])?);
     let git = git::status(c).unwrap_or_else(|e| GitState {
         error: Some(e.to_string()),
@@ -131,6 +170,9 @@ pub fn snapshot(c: &Config) -> Result<Snapshot> {
     });
     let mut snapshot = Snapshot {
         managed,
+        scoped_out,
+        assignments,
+        identity,
         managed_directories,
         directory_entries: BTreeMap::new(),
         changes,
@@ -194,7 +236,10 @@ pub fn inspect_directory(c: &Config, s: &mut Snapshot, directory: &str) -> Resul
             {
                 continue;
             }
-            if s.managed.contains_key(&path) || s.managed_directories.contains(&path) {
+            if s.managed.contains_key(&path)
+                || s.scoped_out.contains_key(&path)
+                || s.managed_directories.contains(&path)
+            {
                 visible.insert(path);
             } else {
                 candidates.push(path);
@@ -259,7 +304,7 @@ pub fn rows(
     } else {
         format!("{directory}/")
     };
-    for path in s.managed.keys() {
+    for path in s.managed.keys().chain(s.scoped_out.keys()) {
         if let Some(rel) = path.strip_prefix(&prefix)
             && let Some(n) = rel.split('/').next()
         {
@@ -274,8 +319,13 @@ pub fn rows(
         if (inspected.is_some_and(|visible| !visible.contains(&path))
             || inspected.is_none() && !s.observed_at.is_empty())
             && !s.managed.contains_key(&path)
+            && !s.scoped_out.contains_key(&path)
             && !s.managed_directories.contains(&path)
-            && !s.managed.keys().any(|p| p.starts_with(&format!("{path}/")))
+            && !s
+                .managed
+                .keys()
+                .chain(s.scoped_out.keys())
+                .any(|p| p.starts_with(&format!("{path}/")))
         {
             continue;
         }
@@ -283,16 +333,19 @@ pub fn rows(
         let descendants: Vec<_> = s
             .managed
             .iter()
+            .chain(s.scoped_out.iter())
             .filter(|(p, _)| p.starts_with(&child_prefix))
             .collect();
         let directory = !descendants.is_empty()
             || fs::symlink_metadata(c.home.join(&path)).is_ok_and(|m| m.is_dir());
-        let managed = s.managed.contains_key(&path) || !descendants.is_empty();
+        let managed = s.managed.contains_key(&path)
+            || s.scoped_out.contains_key(&path)
+            || !descendants.is_empty();
         let changed = s
             .changes
             .keys()
             .any(|p| p == &path || p.starts_with(&child_prefix))
-            || s.managed.iter().any(|(p, m)| {
+            || s.managed.iter().chain(s.scoped_out.iter()).any(|(p, m)| {
                 (p == &path || p.starts_with(&child_prefix))
                     && git_changed.contains(m.source_relative.as_str())
             });
@@ -303,7 +356,14 @@ pub fn rows(
             continue;
         }
         let status = s.changes.get(&path).cloned().unwrap_or_else(|| {
-            if changed {
+            if s.scoped_out.contains_key(&path)
+                || !descendants.is_empty()
+                    && descendants
+                        .iter()
+                        .all(|(p, _)| s.scoped_out.contains_key(*p))
+            {
+                "OFF"
+            } else if changed {
                 "M"
             } else if managed {
                 "="

@@ -1,4 +1,5 @@
 use dot_cli::{
+    assignments::{self, Os, Scope},
     backend,
     config::Config,
     git,
@@ -6,6 +7,250 @@ use dot_cli::{
     sync,
 };
 use std::{fs, path::Path};
+
+fn assign(f: &mut Fixture, path: &str, scope: &Scope) -> operations::Plan {
+    let plan = operations::plan(
+        &f.c,
+        Action::Assign,
+        &[path.into()],
+        Some(serde_json::to_string(scope).unwrap()),
+    )
+    .unwrap();
+    let outcome = operations::execute(&mut f.c, &f.config, &plan, &plan.id).unwrap();
+    assert!(outcome.failed.is_none(), "{}", outcome.message);
+    plan
+}
+
+fn managed_as(f: &Fixture, os: &str, hostname: &str) -> Vec<String> {
+    let data = serde_json::json!({"chezmoi":{"os":os,"hostname":hostname}}).to_string();
+    backend::chez(
+        &f.c,
+        &[
+            "--override-data",
+            &data,
+            "managed",
+            "--path-style=relative",
+            "--include=files,symlinks",
+            "-0",
+        ],
+    )
+    .unwrap()
+    .split('\0')
+    .filter(|p| !p.is_empty())
+    .map(str::to_owned)
+    .collect()
+}
+
+#[test]
+fn file_assignments_use_native_os_and_host_rules_preserve_copies_index_and_recover() {
+    let mut f = Fixture::new();
+    f.write(".one", "original");
+    f.write(".two", "unrelated");
+    f.do_action(Action::Capture, &[".one", ".two"]);
+    f.commit();
+    f.write(".two", "staged edit");
+    f.do_action(Action::Capture, &[".two"]);
+    f.do_action(Action::Stage, &["dot_two"]);
+    let index = fs::read(f.c.source.join(".git/index")).unwrap();
+    let scope = Scope {
+        os: Os::Darwin,
+        machines: ["dot-test-workstation".into(), "dot-test-desktop".into()].into(),
+    };
+    let plan = operations::plan(
+        &f.c,
+        Action::Assign,
+        &[".one".into()],
+        Some(serde_json::to_string(&scope).unwrap()),
+    )
+    .unwrap();
+    assert!(
+        !f.c.source.join(".chezmoiignore").exists(),
+        "planning modified source"
+    );
+    assert!(plan.preview.contains("OS: All → Darwin"));
+    let outcome = operations::execute(&mut f.c, &f.config, &plan, &plan.id).unwrap();
+    assert!(outcome.failed.is_none(), "{}", outcome.message);
+    for (os, hostname, allowed) in [
+        ("darwin", "dot-test-workstation", true),
+        ("darwin", "dot-test-desktop", true),
+        ("linux", "dot-test-workstation", false),
+        ("darwin", "unassigned", false),
+        ("windows", "dot-test-workstation", false),
+    ] {
+        let managed = managed_as(&f, os, hostname);
+        assert_eq!(managed.contains(&".one".into()), allowed, "{os}/{hostname}");
+        assert!(managed.contains(&".two".into()));
+    }
+    assert_eq!(fs::read(f.c.source.join(".git/index")).unwrap(), index);
+    assert_eq!(
+        fs::read_to_string(f.c.source.join("dot_one")).unwrap(),
+        "original"
+    );
+    assert_eq!(
+        fs::read_to_string(f.c.home.join(".one")).unwrap(),
+        "original"
+    );
+    let snapshot = backend::snapshot(&f.c).unwrap();
+    assert!(snapshot.scoped_out.contains_key(".one"));
+    let rows = backend::rows(&f.c, &snapshot, "", backend::Filter::Managed, "").unwrap();
+    let row = rows.iter().find(|r| r.path == ".one").unwrap();
+    assert!(row.managed);
+    assert_eq!(row.status, "OFF");
+    for action in [
+        Action::Apply,
+        Action::Restore,
+        Action::Capture,
+        Action::Trash,
+    ] {
+        assert!(
+            operations::plan(&f.c, action, &[".one".into()], None).is_err(),
+            "{action:?}"
+        );
+    }
+    let reset = assign(&mut f, ".one", &Scope::default());
+    assert!(managed_as(&f, "linux", "any-machine").contains(&".one".into()));
+    operations::recover(&f.c, &reset.id).unwrap();
+    assert_eq!(assignments::read(&f.c).unwrap()[".one"], scope);
+    assert!(!managed_as(&f, "linux", "any-machine").contains(&".one".into()));
+    assert_eq!(fs::read(f.c.source.join(".git/index")).unwrap(), index);
+}
+
+#[test]
+fn folder_assignments_handle_source_roots_attributes_templates_and_literal_names() {
+    let mut f = Fixture::new();
+    fs::create_dir(f.c.source.join("settings")).unwrap();
+    fs::write(f.c.source.join(".chezmoiroot"), "settings\n").unwrap();
+    let source =
+        f.c.source
+            .join("settings/private_dot_config/private_app[dev]");
+    fs::create_dir_all(&source).unwrap();
+    fs::write(
+        source.join("private_space name.conf.tmpl"),
+        "{{ .chezmoi.os }}\n",
+    )
+    .unwrap();
+    fs::write(
+        f.c.source.join("settings/.chezmoiignore.tmpl"),
+        "# keep custom rules\nother/**\n",
+    )
+    .unwrap();
+    let scope = Scope {
+        os: Os::Linux,
+        ..Default::default()
+    };
+    assign(&mut f, ".config/app[dev]", &scope);
+    let rule = fs::read_to_string(f.c.source.join("settings/.chezmoiignore.tmpl")).unwrap();
+    assert!(rule.starts_with("# keep custom rules\nother/**\n"));
+    assert!(!f.c.source.join(".chezmoiignore").exists());
+    let target = ".config/app[dev]/space name.conf";
+    assert!(managed_as(&f, "linux", "laptop").contains(&target.into()));
+    assert!(!managed_as(&f, "darwin", "laptop").contains(&target.into()));
+    assert_eq!(
+        fs::read_to_string(source.join("private_space name.conf.tmpl")).unwrap(),
+        "{{ .chezmoi.os }}\n"
+    );
+    // A more-specific rule adds a restriction; clearing it preserves the parent rule.
+    assign(
+        &mut f,
+        target,
+        &Scope {
+            machines: ["workstation".into()].into(),
+            ..Default::default()
+        },
+    );
+    assert!(!managed_as(&f, "linux", "laptop").contains(&target.into()));
+    assert!(managed_as(&f, "linux", "workstation").contains(&target.into()));
+    assign(&mut f, target, &Scope::default());
+    assert!(managed_as(&f, "linux", "laptop").contains(&target.into()));
+    assert!(!managed_as(&f, "darwin", "laptop").contains(&target.into()));
+}
+
+#[test]
+fn assignments_refuse_native_include_conflicts_and_stale_reviews_without_writes() {
+    let mut f = Fixture::new();
+    f.write(".one", "original");
+    f.do_action(Action::Capture, &[".one"]);
+    let path = f.c.source.join(".chezmoiignore");
+    fs::write(&path, "# custom\n!.one\n").unwrap();
+    let scope = Scope {
+        os: Os::Darwin,
+        ..Default::default()
+    };
+    let error = operations::plan(
+        &f.c,
+        Action::Assign,
+        &[".one".into()],
+        Some(serde_json::to_string(&scope).unwrap()),
+    )
+    .unwrap_err();
+    assert!(error.to_string().contains("include (!)"), "{error:#}");
+    assert_eq!(fs::read_to_string(&path).unwrap(), "# custom\n!.one\n");
+    fs::write(&path, "# custom\n").unwrap();
+    let plan = operations::plan(
+        &f.c,
+        Action::Assign,
+        &[".one".into()],
+        Some(serde_json::to_string(&scope).unwrap()),
+    )
+    .unwrap();
+    fs::write(&path, "# external change\n").unwrap();
+    assert!(operations::execute(&mut f.c, &f.config, &plan, &plan.id).is_err());
+    assert_eq!(fs::read_to_string(&path).unwrap(), "# external change\n");
+    assert_eq!(
+        fs::read_to_string(f.c.home.join(".one")).unwrap(),
+        "original"
+    );
+}
+
+#[test]
+fn assignments_preserve_symlink_controls_and_manually_edited_blocks() {
+    let mut f = Fixture::new();
+    f.write(".one", "original");
+    f.do_action(Action::Capture, &[".one"]);
+    let outside = f._dir.path().join("external-ignore");
+    fs::write(&outside, "# keep this file\n").unwrap();
+    let control = f.c.source.join(".chezmoiignore");
+    std::os::unix::fs::symlink(&outside, &control).unwrap();
+    let scope = Scope {
+        os: Os::Darwin,
+        ..Default::default()
+    };
+    assert!(
+        operations::plan(
+            &f.c,
+            Action::Assign,
+            &[".one".into()],
+            Some(serde_json::to_string(&scope).unwrap())
+        )
+        .is_err()
+    );
+    assert_eq!(fs::read_to_string(&outside).unwrap(), "# keep this file\n");
+    assert!(
+        fs::symlink_metadata(&control)
+            .unwrap()
+            .file_type()
+            .is_symlink()
+    );
+    fs::remove_file(&control).unwrap();
+    assign(&mut f, ".one", &scope);
+    let edited = fs::read_to_string(&control)
+        .unwrap()
+        .replace("ne .chezmoi.os \"darwin\"", "ne .chezmoi.os \"linux\"");
+    fs::write(&control, &edited).unwrap();
+    assert!(
+        assignments::read(&f.c)
+            .unwrap_err()
+            .to_string()
+            .contains("edited manually")
+    );
+    assert_eq!(fs::read_to_string(&control).unwrap(), edited);
+    assert_eq!(
+        Scope::parse_machines("laptop.local, desktop.company, laptop").unwrap(),
+        ["laptop".into(), "desktop".into()].into()
+    );
+    assert!(Scope::parse_machines("{{ bad }}").is_err());
+    assert!(Scope::parse_machines("laptop,,desktop").is_err());
+}
 
 struct Fixture {
     _dir: tempfile::TempDir,
@@ -373,6 +618,50 @@ fn real_fast_forward_sync_updates_only_enabled_files() {
         fs::read_to_string(f.c.home.join(".two")).unwrap(),
         "other\n"
     );
+    // An intentional assignment exclusion skips an enabled file, including when HOME lacks it.
+    assign(
+        &mut f,
+        ".two",
+        &Scope {
+            machines: ["dot-test-other-machine".into()].into(),
+            ..Default::default()
+        },
+    );
+    f.commit();
+    git::run(&f.c, &["push"]).unwrap();
+    f.c.enabled.insert(".two".into());
+    f.c.trusted = true;
+    f.c.save(&f.config).unwrap();
+    fs::remove_file(f.c.home.join(".two")).unwrap();
+    let result = sync::once(&mut f.c, &f.config).unwrap();
+    assert_eq!(result.outcome, "succeeded", "{}", result.message);
+    assert!(!f.c.home.join(".two").exists());
+    // If a remote change makes it apply here again, first application needs a review.
+    git::run(&peer, &["pull", "--ff-only"]).unwrap();
+    let plan = operations::plan(
+        &peer,
+        Action::Assign,
+        &[".two".into()],
+        Some(serde_json::to_string(&Scope::default()).unwrap()),
+    )
+    .unwrap();
+    assert!(
+        operations::execute(&mut peer, &f.config, &plan, &plan.id)
+            .unwrap()
+            .failed
+            .is_none()
+    );
+    git::run(&peer, &["add", "--all"]).unwrap();
+    git::run(&peer, &["commit", "-m", "share file with all machines"]).unwrap();
+    git::run(&peer, &["push"]).unwrap();
+    let result = sync::once(&mut f.c, &f.config).unwrap();
+    assert_eq!(result.outcome, "paused");
+    assert!(
+        result.message.contains("now applies to this machine"),
+        "{}",
+        result.message
+    );
+    assert!(!f.c.home.join(".two").exists());
 }
 
 #[test]

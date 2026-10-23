@@ -199,6 +199,9 @@ fn sync_inner(c: &mut Config, config_path: &Path) -> Result<usize> {
         bail!("Source has local changes; automatic pull paused");
     }
     for p in &c.enabled {
+        if before.scoped_out.contains_key(p) {
+            continue;
+        }
         if !c.target(p)?.is_file() {
             bail!("New/missing or non-file target requires review: {p}");
         }
@@ -216,6 +219,12 @@ fn sync_inner(c: &mut Config, config_path: &Path) -> Result<usize> {
     }
     let after = backend::snapshot(c)?;
     for path in &c.enabled {
+        if after.scoped_out.contains_key(path) {
+            continue;
+        }
+        if before.scoped_out.contains_key(path) && after.managed.contains_key(path) {
+            bail!("File now applies to this machine; review before automatic application: {path}");
+        }
         if !after.managed.contains_key(path) {
             bail!("Enabled source removed; review deletion: {path}");
         }

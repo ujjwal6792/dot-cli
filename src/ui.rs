@@ -1,7 +1,9 @@
 use crate::{
+    assignment_screen::{self, Command as AssignmentCommand},
+    assignments,
     backend::{self, Filter, Row, Snapshot},
     config::{Config, atomic_write},
-    dialog, git, migration,
+    dialog, git, help, migration,
     onboarding::{self, SetupKind, SetupReport},
     operation_screen::{self, View as OperationView},
     operations::{self, Action, Outcome, Plan},
@@ -17,7 +19,7 @@ use crossterm::{
 };
 use ratatui::{prelude::*, widgets::*};
 use std::{
-    collections::BTreeSet,
+    collections::{BTreeMap, BTreeSet},
     fs,
     path::{Path, PathBuf},
     sync::mpsc::{self, Receiver},
@@ -58,6 +60,7 @@ impl Pane {
 }
 #[derive(Clone, Debug)]
 enum Purpose {
+    AssignmentMachines(String),
     Setting(crate::settings::Scope),
     Repo,
     Commit,
@@ -76,6 +79,7 @@ enum Control {
 }
 #[derive(Clone, Debug)]
 enum Modal {
+    Help(help::View),
     Setup,
     Busy {
         label: String,
@@ -161,6 +165,8 @@ struct Areas {
     modal_controls: Vec<(Rect, KeyCode)>,
     modal_body: Rect,
     operation: operation_screen::Areas,
+    help: help::Areas,
+    assignment: assignment_screen::Areas,
     toast: toast::Areas,
     tabs: Vec<(Rect, Pane, usize)>,
 }
@@ -206,6 +212,7 @@ pub struct App {
     input_cursor: usize,
     external: bool,
     editor_expanded: bool,
+    assignment_drafts: BTreeMap<String, assignments::Scope>,
 }
 impl App {
     pub fn new(config: Config, path: PathBuf) -> Self {
@@ -250,6 +257,7 @@ impl App {
             input_cursor: 0,
             external: false,
             editor_expanded: false,
+            assignment_drafts: BTreeMap::new(),
         };
         // Local browsing must not depend on a successful chezmoi/Git inspection.
         // The native snapshot enriches these rows when it becomes available.
@@ -367,6 +375,9 @@ impl App {
                         });
                     }
                     Ok(Work::Snapshot(s)) => {
+                        self.assignment_drafts.retain(|path, draft| {
+                            s.assignments.get(path).cloned().unwrap_or_default() != *draft
+                        });
                         self.snapshot = s;
                         self.rebuild();
                         self.preview_key.clear();
@@ -411,6 +422,7 @@ impl App {
                     Ok(Work::ConfigMessage(c, t)) => {
                         if self.config.source != c.source {
                             self.directory.clear();
+                            self.assignment_drafts.clear();
                         }
                         self.config = c;
                         self.notice = t.clone();
@@ -513,6 +525,9 @@ impl App {
                 let mut s = self.snapshot.clone();
                 let pane = self.context();
                 let tab = self.detail_tab;
+                if pane == Pane::Files && tab == 2 {
+                    return;
+                }
                 let selected = self.rows.get(self.cursor).cloned();
                 let gf = self.snapshot.git.files.get(self.git_cursor).cloned();
                 let hist = self.history_view;
@@ -521,9 +536,7 @@ impl App {
                     else if pane==Pane::Status{format!("Machine: {}\nHOME: {}\nSource: {}\nObserved: {}\n\nGit: {}\nUpstream: {}\n↑{} outgoing · ↓{} incoming (last fetched)\n{}\n\nHOME differences: {}\nSource changes: {}\nAutomatic sync: {}\nReports: {}",c.machine,c.home.display(),c.source.display(),s.observed_at,s.git.branch,s.git.upstream,s.git.ahead,s.git.behind,s.git.error.clone().unwrap_or_default(),s.changes.len(),s.git.files.len(),c.sync_enabled,c.reporting)}
                     else if pane==Pane::Activity{serde_json::to_string_pretty(&operations::history(&c)?)?}
                     else if pane==Pane::Git{if hist{s.git.commits.join("\n")}else if let Some(f)=gf{format!("Source ↔ Git · {}\n\nUNSTAGED\n{}\nSTAGED\n{}",f.path,git::diff(&c,std::slice::from_ref(&f.path),false)?,git::diff(&c,std::slice::from_ref(&f.path),true)?)}else{"No source changes. Commit history: press h in Git.".into()}}
-                    else if let Some(row)=selected{if row.directory{backend::inspect_directory(&c,&mut s,&row.path)?;let rows=backend::rows(&c,&s,&row.path,Filter::All,"")?;format!("~/{} · {} managed descendants\n\n{}",row.path,row.children,rows.iter().map(|r|format!("{} {}{}",r.status,r.name,if r.directory{"/"}else{""})).collect::<Vec<_>>().join("\n"))}
-                        else if let Some(m)=s.managed.get(&row.path){match tab{1=>format!("SOURCE {}\n\n{}",m.source_relative,fs::read_to_string(&m.source_absolute).unwrap_or_else(|_|"Binary or unavailable source".into())),2=>format!("HOME: {}\nSource: {}\nAutomatic updates here: {}\nNative chezmoi source semantics apply.\n\nUse Edit source for templates and shared/OS/machine settings.",m.absolute,m.source_relative,c.enabled.contains(&row.path)),3=>serde_json::to_string_pretty(&operations::history(&c)?.into_iter().filter(|e|e.paths.contains(&row.path)).collect::<Vec<_>>())?,_=>{let d=backend::preview(&c,std::slice::from_ref(&row.path),false)?;format!("SOURCE → HOME · {}\n\n{}",row.path,if d.is_empty(){"HOME matches rendered source. Check Git for unpublished changes.".into()}else{d})}}}
-                        else if crate::ignores::eligible(&c, std::slice::from_ref(&row.path))?.is_empty(){format!("IGNORED ~/{}\n\nCapture skips this file because of .chezmoiignore. Edit that file to change the rule.\n\nPress i to add an explicit ignore rule to both chezmoi and Git.",row.path)}else{format!("UNTRACKED ~/{}\n\nSelect with Space, then Capture to add through chezmoi.\n\n{}",row.path,fs::read_to_string(c.home.join(&row.path)).unwrap_or_else(|_|"Binary or unavailable file".into()))}}
+                    else if let Some(row)=selected{file_detail(&c, &mut s, &row, tab)?}
                     else{"Select a file or source change.".into()};Ok(Work::Preview{key,text})
                 });
             }
@@ -535,6 +548,105 @@ impl App {
         } else {
             self.pane
         }
+    }
+    fn assignment_scope(&self, path: &str) -> assignments::Scope {
+        self.assignment_drafts
+            .get(path)
+            .or_else(|| self.snapshot.assignments.get(path))
+            .cloned()
+            .unwrap_or_default()
+    }
+    fn open_assignment(&mut self) {
+        if self.context() != Pane::Files {
+            self.notice = "Choose a file or folder in Files to assign".into();
+            return;
+        }
+        self.pane = Pane::Details;
+        self.detail_owner = Pane::Files;
+        self.set_tab(Pane::Details, 2);
+        self.scroll = 0;
+    }
+    fn assignment_command(&mut self, command: AssignmentCommand) {
+        let Some(row) = self.rows.get(self.cursor).cloned() else {
+            return;
+        };
+        self.pane = Pane::Details;
+        self.detail_owner = Pane::Files;
+        if !row.managed {
+            self.notice = "Capture this file or folder before assigning it".into();
+            return;
+        }
+        if self.snapshot.identity.hostname.is_empty() {
+            self.notice = "Wait for machine inspection to finish".into();
+            return;
+        }
+        let mut scope = self.assignment_scope(&row.path);
+        match command {
+            AssignmentCommand::Os(os) => scope.os = os,
+            AssignmentCommand::AllMachines => scope.machines.clear(),
+            AssignmentCommand::ToggleMachine(name) => {
+                if !scope.machines.remove(&name) {
+                    scope.machines.insert(name);
+                }
+            }
+            AssignmentCommand::ThisMachine => {
+                scope.machines = BTreeSet::from([self.snapshot.identity.hostname.clone()])
+            }
+            AssignmentCommand::CustomMachines => {
+                let text = scope
+                    .machines
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                self.input_cursor = text.chars().count();
+                self.modal = Some(Modal::Input {
+                    purpose: Purpose::AssignmentMachines(row.path),
+                    text,
+                });
+                return;
+            }
+            AssignmentCommand::Reset => {
+                self.assignment_drafts.remove(&row.path);
+                self.notice = "Assignment edits reset".into();
+                return;
+            }
+            AssignmentCommand::Review => {
+                if scope
+                    == self
+                        .snapshot
+                        .assignments
+                        .get(&row.path)
+                        .cloned()
+                        .unwrap_or_default()
+                {
+                    self.notice = "This assignment is already saved".into();
+                    return;
+                }
+                if self.job.is_some() {
+                    self.notice = "Wait for the current operation to finish".into();
+                    return;
+                }
+                let c = self.config.clone();
+                let paths = vec![row.path];
+                self.launch_job(
+                    JobKind::Preparation,
+                    "Reviewing OS and machine assignments",
+                    move || {
+                        operations::plan(
+                            &c,
+                            Action::Assign,
+                            &paths,
+                            Some(serde_json::to_string(&scope)?),
+                        )
+                        .map(Work::Plan)
+                    },
+                );
+                return;
+            }
+        }
+        self.assignment_drafts.insert(row.path, scope);
+        self.notice = "Assignment edited · s review and save · u reset".into();
     }
     fn current_key(&self) -> String {
         format!(
@@ -745,7 +857,8 @@ impl App {
                 && matches!(
                     self.modal,
                     Some(
-                        Modal::Text { .. }
+                        Modal::Help(_)
+                            | Modal::Text { .. }
                             | Modal::Report { .. }
                             | Modal::Setup
                             | Modal::Welcome { .. }
@@ -784,6 +897,29 @@ impl App {
             self.rebuild();
             return false;
         }
+        if self.pane == Pane::Details && self.context() == Pane::Files && self.detail_tab == 2 {
+            let command = match key.code {
+                KeyCode::Char('o') => self
+                    .rows
+                    .get(self.cursor)
+                    .map(|row| AssignmentCommand::Os(self.assignment_scope(&row.path).os.next())),
+                KeyCode::Char('m') => self.rows.get(self.cursor).map(|row| {
+                    if self.assignment_scope(&row.path).machines.is_empty() {
+                        AssignmentCommand::ThisMachine
+                    } else {
+                        AssignmentCommand::AllMachines
+                    }
+                }),
+                KeyCode::Char('M') => Some(AssignmentCommand::CustomMachines),
+                KeyCode::Char('s') => Some(AssignmentCommand::Review),
+                KeyCode::Char('u') => Some(AssignmentCommand::Reset),
+                _ => None,
+            };
+            if let Some(command) = command {
+                self.assignment_command(command);
+                return false;
+            }
+        }
         match key.code {
             KeyCode::Char('q') => {
                 return self.request_quit();
@@ -795,16 +931,17 @@ impl App {
             KeyCode::Char('0') => self.pane = Pane::Details,
             KeyCode::Tab => self.pane = self.pane.next(),
             KeyCode::Char('z') => self.expanded = !self.expanded,
+            KeyCode::Char('s') if self.context() == Pane::Files => self.open_assignment(),
             KeyCode::Esc => {
                 self.expanded = false;
                 self.pane = Pane::Files;
             }
             KeyCode::Char('?') => {
-                self.modal = Some(Modal::Text {
-                    title: "Keyboard and pointer help".into(),
-                    text: HELP.into(),
-                    scroll: 0,
-                })
+                self.modal = Some(Modal::Help(help::View::new(match self.context() {
+                    Pane::Files => 1,
+                    Pane::Git => 2,
+                    _ => 0,
+                })))
             }
             KeyCode::Char(':') => self.modal = Some(Modal::Menu(0)),
             KeyCode::Char('r') if key.modifiers.contains(KeyModifiers::CONTROL) => self.refresh(),
@@ -814,6 +951,10 @@ impl App {
             }
             KeyCode::Char('f') if self.pane == Pane::Files => {
                 self.cycle_tab(1);
+            }
+            KeyCode::Char('t') if self.pane == Pane::Files => {
+                let index = usize::from(self.filter != Filter::Managed);
+                self.set_tab(Pane::Files, index);
             }
             KeyCode::Down | KeyCode::Char('j') => self.move_cursor(1),
             KeyCode::Up | KeyCode::Char('k') => self.move_cursor(-1),
@@ -992,6 +1133,24 @@ impl App {
                         && key.modifiers.contains(KeyModifiers::CONTROL));
                 if submit {
                     match purpose {
+                        Purpose::AssignmentMachines(path) => {
+                            match assignments::Scope::parse_machines(&text) {
+                                Ok(machines) => {
+                                    let mut scope = self.assignment_scope(&path);
+                                    scope.machines = machines;
+                                    self.assignment_drafts.insert(path, scope);
+                                    self.notice =
+                                        "Machine choices updated · s review and save".into();
+                                }
+                                Err(e) => {
+                                    self.notice = e.to_string();
+                                    self.modal = Some(Modal::Input {
+                                        purpose: Purpose::AssignmentMachines(path),
+                                        text,
+                                    });
+                                }
+                            }
+                        }
                         Purpose::Setting(scope) => match text.split_once('=') {
                             Some((key, value)) => {
                                 match crate::settings::identity(&self.config, scope) {
@@ -1116,6 +1275,11 @@ impl App {
                     _ => view.key(key.code, self.areas.operation.max_scroll),
                 }
                 self.modal = Some(Modal::Outcome { outcome, view });
+            }
+            Modal::Help(mut view) => {
+                if !view.key(key.code, &self.areas.help) {
+                    self.modal = Some(Modal::Help(view));
+                }
             }
             Modal::Text { .. } | Modal::Report { .. } => {
                 let report = matches!(modal, Modal::Report { .. });
@@ -1279,6 +1443,7 @@ impl App {
             32 => self.action(Action::Ignore, None),
             33 => self.action(Action::IgnoreDefaults, None),
             34 => self.action(Action::Trash, None),
+            35 => self.open_assignment(),
             29..=31 => {
                 self.modal = Some(Modal::Input {
                     purpose: Purpose::Setting(match i {
@@ -1444,6 +1609,18 @@ impl App {
             return;
         }
         if mouse.kind == MouseEventKind::Down(event::MouseButton::Left)
+            && let Some((_, command)) = self
+                .areas
+                .assignment
+                .controls
+                .iter()
+                .find(|(r, _)| r.contains(pos))
+                .cloned()
+        {
+            self.assignment_command(command);
+            return;
+        }
+        if mouse.kind == MouseEventKind::Down(event::MouseButton::Left)
             && let Some((_, pane, index)) = self
                 .areas
                 .tabs
@@ -1591,11 +1768,23 @@ impl App {
                 ("d Trash", KeyCode::Char('d')),
                 ("R Restore", KeyCode::Char('R')),
                 ("c Capture", KeyCode::Char('c')),
-                ("i Ignore", KeyCode::Char('i')),
+                ("s Assign", KeyCode::Char('s')),
                 ("a Apply", KeyCode::Char('a')),
-                ("f Filter", KeyCode::Char('f')),
+                ("t Tracked/All", KeyCode::Char('t')),
                 (": Actions", KeyCode::Char(':')),
                 ("? Help", KeyCode::Char('?')),
+            ]
+        } else if self.pane == Pane::Details
+            && self.context() == Pane::Files
+            && self.detail_tab == 2
+        {
+            vec![
+                ("o OS", KeyCode::Char('o')),
+                ("m Machine", KeyCode::Char('m')),
+                ("M Choose", KeyCode::Char('M')),
+                ("s Save", KeyCode::Char('s')),
+                ("u Reset", KeyCode::Char('u')),
+                ("z Expand", KeyCode::Char('z')),
             ]
         } else if self.pane == Pane::Git && !self.history_view {
             vec![
@@ -1703,6 +1892,7 @@ impl App {
         };
         let area = f.area();
         let bounds = match &modal {
+            Modal::Help(_) => dialog::bounds(area, 92, 36),
             Modal::Setup => workspace,
             Modal::Welcome { .. } => unreachable!("Welcome is a startup screen"),
             Modal::Review { .. }
@@ -1720,6 +1910,10 @@ impl App {
                     dialog::operation_bounds(area)
                 }
             }
+            Modal::Input {
+                purpose: Purpose::AssignmentMachines(_),
+                ..
+            } => dialog::bounds(area, 76, 12),
             Modal::Input { .. } => dialog::bounds(area, 72, 8),
             Modal::Confirm { text, .. } => {
                 let width = dialog::bounds(area, 72, 20).width.saturating_sub(2);
@@ -1748,6 +1942,7 @@ impl App {
             _ => String::new(),
         };
         let title = match &modal {
+            Modal::Help(_) => "Help · Keyboard shortcuts",
             Modal::Setup => "Welcome to dot · Save and reuse your app settings",
             Modal::Review { .. } => "Review operation",
             Modal::Outcome { .. } => "Operation result",
@@ -1757,6 +1952,7 @@ impl App {
             Modal::Menu(_) => "Actions · Enter activate · Esc cancel",
             Modal::Input { purpose, .. } => match purpose {
                 Purpose::Setting(_) => "Setting key=value",
+                Purpose::AssignmentMachines(_) => "Assign machines · comma-separated hostnames",
                 Purpose::Repo => "Repository URL",
                 Purpose::Commit => "Commit message",
                 Purpose::Source(_) => &editor_title,
@@ -1772,6 +1968,11 @@ impl App {
                 .split(inner);
         self.areas.modal_body = regions[0];
         match modal {
+            Modal::Help(view) => {
+                self.areas.help = help::draw(f, inner, &view);
+                self.areas.modal_body = self.areas.help.body;
+                self.areas.modal_controls = self.areas.help.controls.clone();
+            }
             Modal::Welcome { .. } => unreachable!(),
             Modal::Review { plan, view } => {
                 self.areas.operation =
@@ -1887,6 +2088,28 @@ impl App {
             }
             Modal::Input { purpose, text } => {
                 let source = matches!(purpose, Purpose::Source(_));
+                let machine_assignment = matches!(purpose, Purpose::AssignmentMachines(_));
+                let mut input_area = regions[0];
+                if machine_assignment {
+                    let known: BTreeSet<_> = self
+                        .snapshot
+                        .assignments
+                        .values()
+                        .flat_map(|scope| scope.machines.iter().cloned())
+                        .chain(std::iter::once(self.snapshot.identity.hostname.clone()))
+                        .collect();
+                    let hint = Paragraph::new(format!(
+                        "Use commas for several machines. Empty means all machines.\nThis machine: {}\nKnown: {}",
+                        self.snapshot.identity.hostname, known.iter().take(6).cloned().collect::<Vec<_>>().join(", ")
+                    )).fg(UNTRACKED_TEXT).wrap(Wrap { trim: false });
+                    let height = (hint.line_count(input_area.width) as u16)
+                        .min(input_area.height.saturating_sub(1));
+                    let sections =
+                        Layout::vertical([Constraint::Length(height), Constraint::Min(1)])
+                            .split(input_area);
+                    f.render_widget(hint, sections[0]);
+                    input_area = sections[1];
+                }
                 let byte = text
                     .char_indices()
                     .nth(self.input_cursor)
@@ -1904,18 +2127,20 @@ impl App {
                 let prefix = &display[..byte + '▏'.len_utf8()];
                 let cursor_rows = Paragraph::new(prefix)
                     .wrap(Wrap { trim: false })
-                    .line_count(regions[0].width);
+                    .line_count(input_area.width);
                 let offset = cursor_rows
-                    .saturating_sub(regions[0].height as usize)
+                    .saturating_sub(input_area.height as usize)
                     .min(u16::MAX as usize) as u16;
                 f.render_widget(
                     Paragraph::new(styled)
                         .scroll((offset, 0))
                         .wrap(Wrap { trim: false }),
-                    regions[0],
+                    input_area,
                 );
                 let submit = if source {
                     ("Ctrl+S Review", KeyCode::Char('s'))
+                } else if machine_assignment {
+                    ("Enter Use machines", KeyCode::Enter)
                 } else {
                     ("Enter Continue", KeyCode::Enter)
                 };
@@ -2070,7 +2295,9 @@ impl App {
                     if row.directory { "/" } else { "" },
                     row.status
                 ))
-                .style(Style::default().fg(if row.changed {
+                .style(Style::default().fg(if row.status == "OFF" {
+                    UNTRACKED_TEXT
+                } else if row.changed {
                     Color::Yellow
                 } else if !row.managed {
                     UNTRACKED_TEXT
@@ -2175,6 +2402,27 @@ impl App {
     fn draw_detail(&mut self, f: &mut Frame, r: Rect) {
         self.areas.details = r;
         let block = self.tab_block(r, Pane::Details, "0 Details · ");
+        if self.context() == Pane::Files && self.detail_tab == 2 {
+            let inner = block.inner(r);
+            f.render_widget(block, r);
+            let row = self.rows.get(self.cursor);
+            let scope = row
+                .map(|row| self.assignment_scope(&row.path))
+                .unwrap_or_default();
+            let dirty = row.is_some_and(|row| {
+                scope
+                    != self
+                        .snapshot
+                        .assignments
+                        .get(&row.path)
+                        .cloned()
+                        .unwrap_or_default()
+            });
+            self.areas.assignment =
+                assignment_screen::draw(f, inner, row, &self.snapshot, &scope, dirty, self.scroll);
+            self.scroll = self.scroll.min(self.areas.assignment.max_scroll);
+            return;
+        }
         f.render_widget(
             Paragraph::new(syntax::preview(&self.detail))
                 .block(block)
@@ -2204,6 +2452,76 @@ impl App {
             r,
         );
     }
+}
+fn file_detail(c: &Config, snapshot: &mut Snapshot, row: &Row, tab: usize) -> Result<String> {
+    if tab == 3 {
+        return Ok(serde_json::to_string_pretty(
+            &operations::history(c)?
+                .into_iter()
+                .filter(|event| event.paths.contains(&row.path))
+                .collect::<Vec<_>>(),
+        )?);
+    }
+    if row.directory {
+        backend::inspect_directory(c, snapshot, &row.path)?;
+        let rows = backend::rows(c, snapshot, &row.path, Filter::All, "")?;
+        return Ok(format!(
+            "~/{} · {} managed descendants\n\n{}",
+            row.path,
+            row.children,
+            rows.iter()
+                .map(|r| format!(
+                    "{} {}{}",
+                    r.status,
+                    r.name,
+                    if r.directory { "/" } else { "" }
+                ))
+                .collect::<Vec<_>>()
+                .join("\n")
+        ));
+    }
+    if let Some(saved) = snapshot
+        .managed
+        .get(&row.path)
+        .or_else(|| snapshot.scoped_out.get(&row.path))
+    {
+        if tab == 1 {
+            return Ok(format!(
+                "SOURCE {}\n\n{}",
+                saved.source_relative,
+                fs::read_to_string(&saved.source_absolute)
+                    .unwrap_or_else(|_| "Binary or unavailable source".into())
+            ));
+        }
+        if snapshot.scoped_out.contains_key(&row.path) {
+            return Ok(format!(
+                "NOT APPLIED HERE · ~/{}\n\nThis saved copy is assigned to other operating systems or machines.\n\nPress s to change the assignment in Details → Rules.\nOriginal files stay unchanged.",
+                row.path
+            ));
+        }
+        let diff = backend::preview(c, std::slice::from_ref(&row.path), false)?;
+        return Ok(format!(
+            "SOURCE → HOME · {}\n\n{}",
+            row.path,
+            if diff.is_empty() {
+                "HOME matches rendered source. Check Git for unpublished changes.".into()
+            } else {
+                diff
+            }
+        ));
+    }
+    if crate::ignores::eligible(c, std::slice::from_ref(&row.path))?.is_empty() {
+        return Ok(format!(
+            "IGNORED ~/{}\n\nCapture skips this file because of .chezmoiignore. Edit that file to change the rule.\n\nPress i to add an explicit ignore rule to both chezmoi and Git.",
+            row.path
+        ));
+    }
+    Ok(format!(
+        "UNTRACKED ~/{}\n\nSelect with Space, then Capture to add through chezmoi.\n\n{}",
+        row.path,
+        fs::read_to_string(c.home.join(&row.path))
+            .unwrap_or_else(|_| "Binary or unavailable file".into())
+    ))
 }
 fn pane_tabs(pane: Pane) -> &'static [&'static str] {
     match pane {
@@ -2264,8 +2582,8 @@ const MENU: &[&str] = &[
     "Ignore selected files in chezmoi and Git",
     "Add developer ignore defaults to both files",
     "Delete untracked originals · move to system Trash",
+    "Assign file OS and machines · Details / Rules",
 ];
-const HELP: &str = "1 Status · 2 Files · 3 Git · 4 Machines · 0 Details\nTab focus next pane · z expand focused pane · Esc return\n↑/↓ or j/k move · PgUp/PgDn scroll\nFiles: →/l enter folder · ←/h parent · Space select · / filter · f All/Managed/Changed\nFiles: c capture HOME → source · a apply · R restore · e edit source\nFiles / Git: i ignore in both chezmoi and Git; review then Enter or y\nCapture skips .DS_Store, node_modules, target, Python caches and .venv by default.\nFiles: r remove saved copies (originals stay) · d / Delete move untracked originals to Trash\nGit: Space stage/unstage · v multi-select · c commit · d discard source → HEAD\nGit: h changes/history · F fetch · L pull · P push\n[/] previous/next tab in focused section · click tab labels · Enter focus details\n: all actions, Settings, Machines, Activity, Recovery, Packages\nCtrl+R refresh · ? help · q quit when idle\nMouse: click panes/rows/footer hints · wheel scroll pane\nText fields receive all character keys before global commands. Paste supported.\nNative chezmoi previews may evaluate repository templates/hooks.\nHOME changes, source changes, staged changes and unpublished commits are distinct.";
 
 struct TerminalGuard;
 impl Drop for TerminalGuard {
@@ -2547,11 +2865,7 @@ mod tests {
                 text: "Start the service?".into(),
                 scroll: 0,
             },
-            Modal::Text {
-                title: "Help".into(),
-                text: HELP.into(),
-                scroll: 0,
-            },
+            Modal::Help(help::View::default()),
             Modal::Review {
                 plan,
                 view: OperationView::default(),
@@ -3967,10 +4281,11 @@ mod tests {
     fn search_owns_q_digits_and_shortcuts() {
         let (_t, mut a) = app();
         a.key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE));
-        for c in "q2Wconfig".chars() {
+        for c in "q2Wtconfig".chars() {
             assert!(!a.key(KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)));
         }
-        assert_eq!(a.query, "q2Wconfig");
+        assert_eq!(a.query, "q2Wtconfig");
+        assert_eq!(a.filter, Filter::All);
         assert_eq!(a.pane, Pane::Files);
     }
     #[test]
@@ -4005,7 +4320,7 @@ mod tests {
             .areas
             .footer
             .iter()
-            .find(|(_, k)| *k == KeyCode::Char('f'))
+            .find(|(_, k)| *k == KeyCode::Char('t'))
             .unwrap()
             .0;
         a.mouse(event::MouseEvent {
@@ -4015,7 +4330,273 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         });
         assert_eq!(a.filter, Filter::Managed);
+        assert!(a.rows.iter().all(|row| row.managed));
+        assert!(!a.rows.iter().any(|row| row.path == ".untracked"));
+        a.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(a.filter, Filter::All);
+        assert!(a.rows.iter().any(|row| row.path == ".untracked"));
+        a.set_tab(Pane::Files, 2);
+        a.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(a.filter, Filter::Managed);
+        a.pane = Pane::Git;
+        a.key(KeyEvent::new(KeyCode::Char('t'), KeyModifiers::NONE));
+        assert_eq!(a.filter, Filter::Managed);
     }
+    #[test]
+    fn details_assignments_support_clicks_forms_review_cancel_and_save() {
+        let (_temp, mut a) = app();
+        initialize(&a.config, &a.config_path, None).unwrap();
+        let capture =
+            operations::plan(&a.config, Action::Capture, &[".untracked".into()], None).unwrap();
+        operations::execute(&mut a.config, &a.config_path, &capture, &capture.id).unwrap();
+        a.snapshot = backend::snapshot(&a.config).unwrap();
+        a.rebuild();
+        a.cursor = a
+            .rows
+            .iter()
+            .position(|row| row.path == ".untracked")
+            .unwrap();
+        a.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+        assert_eq!((a.pane, a.detail_tab), (Pane::Details, 2));
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 35)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let os = if a.snapshot.identity.os == "darwin" {
+            assignments::Os::Linux
+        } else {
+            assignments::Os::Darwin
+        };
+        let button = a
+            .areas
+            .assignment
+            .controls
+            .iter()
+            .find(|(_, command)| matches!(command, AssignmentCommand::Os(value) if *value == os))
+            .unwrap()
+            .0;
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: button.x,
+            row: button.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        a.key(KeyEvent::new(KeyCode::Char('m'), KeyModifiers::NONE));
+        assert!(
+            a.assignment_scope(".untracked")
+                .machines
+                .contains(&a.snapshot.identity.hostname)
+        );
+        a.key(KeyEvent::new(KeyCode::Char('M'), KeyModifiers::NONE));
+        assert!(matches!(
+            a.modal,
+            Some(Modal::Input {
+                purpose: Purpose::AssignmentMachines(_),
+                ..
+            })
+        ));
+        if let Some(Modal::Input { text, .. }) = &mut a.modal {
+            *text = "laptop.local, desktop.company".into();
+        }
+        a.key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert_eq!(
+            a.assignment_scope(".untracked").machines,
+            BTreeSet::from(["laptop".into(), "desktop".into()])
+        );
+        for selected in [true, false] {
+            term.draw(|f| a.draw(f)).unwrap();
+            let button = a.areas.assignment.controls.iter().find(|(_, command)|
+                matches!(command, AssignmentCommand::ToggleMachine(name) if name == &a.snapshot.identity.hostname)).unwrap().0;
+            a.mouse(event::MouseEvent {
+                kind: MouseEventKind::Down(event::MouseButton::Left),
+                column: button.x,
+                row: button.y,
+                modifiers: KeyModifiers::NONE,
+            });
+            assert_eq!(
+                a.assignment_scope(".untracked")
+                    .machines
+                    .contains(&a.snapshot.identity.hostname),
+                selected
+            );
+        }
+        let mut renders = Vec::new();
+        for (width, height) in [(120, 35), (80, 24), (45, 14), (20, 8), (8, 4), (1, 1)] {
+            let mut terminal =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            a.scroll = 0;
+            terminal.draw(|f| a.draw(f)).unwrap();
+            for (rect, _) in &a.areas.assignment.controls {
+                assert!(a.areas.details.contains(Position::new(rect.x, rect.y)));
+                assert!(rect.right() <= a.areas.details.right());
+            }
+            if width >= 20 {
+                let text = terminal
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(width as usize)
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("Rules"));
+                renders.push(format!("{width}×{height}\n{text}"));
+            }
+            a.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+            terminal.draw(|f| a.draw(f)).unwrap();
+            assert_eq!(a.scroll, a.areas.assignment.max_scroll);
+        }
+        if let Ok(path) = std::env::var("DOT_ASSIGNMENT_RENDER") {
+            fs::write(path, renders.join("\n\n")).unwrap();
+        }
+        let before = fs::read(a.config.source.join(".chezmoiignore")).unwrap();
+        for confirm in [false, true] {
+            a.key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE));
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(a.modal, Some(Modal::Review { .. })) && Instant::now() < deadline {
+                if let Some(job) = &mut a.job {
+                    job.toast_started = Some(Instant::now() - TOAST_MIN_VISIBLE);
+                }
+                a.pump();
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                matches!(a.modal, Some(Modal::Review { ref plan, .. }) if plan.action == Action::Assign && plan.paths == [".untracked"]),
+                "review missing: {:?}",
+                a.modal
+            );
+            assert_eq!(
+                fs::read(a.config.source.join(".chezmoiignore")).unwrap(),
+                before
+            );
+            a.key(KeyEvent::new(
+                if confirm {
+                    KeyCode::Enter
+                } else {
+                    KeyCode::Esc
+                },
+                KeyModifiers::NONE,
+            ));
+            if confirm {
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while !matches!(a.modal, Some(Modal::Outcome { .. })) && Instant::now() < deadline {
+                    a.pump();
+                    std::thread::sleep(Duration::from_millis(5));
+                }
+                assert!(
+                    matches!(a.modal, Some(Modal::Outcome { ref outcome, .. }) if outcome.failed.is_none())
+                );
+            } else {
+                assert!(a.modal.is_none());
+            }
+        }
+        let saved = assignments::read(&a.config).unwrap();
+        assert_eq!(saved[".untracked"].os, os);
+        assert_eq!(
+            saved[".untracked"].machines,
+            BTreeSet::from(["laptop".into(), "desktop".into()])
+        );
+        assert_eq!(
+            fs::read_to_string(a.config.home.join(".untracked")).unwrap(),
+            "untracked"
+        );
+    }
+
+    #[test]
+    fn help_topics_render_resize_scroll_and_handle_pointer_controls() {
+        let (_t, mut a) = app();
+        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(a.modal, Some(Modal::Help(ref view)) if view.tab == 1));
+        let mut artifacts = Vec::new();
+        for (width, height) in [(120, 40), (80, 24), (60, 20), (40, 12), (20, 8)] {
+            let mut term =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            for topic in ['1', '2', '3'] {
+                a.key(KeyEvent::new(KeyCode::Char(topic), KeyModifiers::NONE));
+                term.draw(|f| a.draw(f)).unwrap();
+                let text = term
+                    .backend()
+                    .buffer()
+                    .content
+                    .chunks(width as usize)
+                    .map(|row| row.iter().map(|cell| cell.symbol()).collect::<String>())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(text.contains("Help"));
+                assert!(text.contains("Close"));
+                if width >= 40 {
+                    assert!(text.contains("General"));
+                    assert!(text.contains("Files"));
+                    assert!(text.contains("Git"));
+                }
+                artifacts.push(format!("{width}×{height} · topic {topic}\n{text}"));
+                a.key(KeyEvent::new(KeyCode::End, KeyModifiers::NONE));
+                term.draw(|f| a.draw(f)).unwrap();
+                let text = term
+                    .backend()
+                    .buffer()
+                    .content
+                    .iter()
+                    .map(|cell| cell.symbol())
+                    .collect::<String>();
+                let last_word = match topic {
+                    '1' => "supported.",
+                    '2' => "hooks.",
+                    _ => "published.",
+                };
+                assert!(
+                    text.contains(last_word),
+                    "unreachable end of topic {topic} at {width}×{height}"
+                );
+                let before = a.areas.help.max_scroll;
+                assert!(matches!(a.modal, Some(Modal::Help(_))));
+                if before > 0 {
+                    // Scrolling remains in Help and reaches the final content.
+                    let body = a.areas.help.body;
+                    a.mouse(event::MouseEvent {
+                        kind: MouseEventKind::ScrollUp,
+                        column: body.x,
+                        row: body.y,
+                        modifiers: KeyModifiers::NONE,
+                    });
+                    assert!(matches!(a.modal, Some(Modal::Help(_))));
+                }
+            }
+        }
+        // A resize while scrolled must clamp the viewport and remain navigable.
+        let mut term = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        term.draw(|f| a.draw(f)).unwrap();
+        let tab = a
+            .areas
+            .modal_controls
+            .iter()
+            .find(|(_, key)| *key == KeyCode::Char('2'))
+            .unwrap()
+            .0;
+        a.mouse(event::MouseEvent {
+            kind: MouseEventKind::Down(event::MouseButton::Left),
+            column: tab.x,
+            row: tab.y,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(matches!(a.modal, Some(Modal::Help(ref view)) if view.tab == 1));
+        a.key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE));
+        assert!(matches!(a.modal, Some(Modal::Help(ref view)) if view.tab == 2));
+        a.key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE));
+        assert!(a.modal.is_none());
+        assert_eq!(a.pane, Pane::Files);
+        a.pane = Pane::Git;
+        a.key(KeyEvent::new(KeyCode::Char('?'), KeyModifiers::NONE));
+        assert!(matches!(a.modal, Some(Modal::Help(ref view)) if view.tab == 2));
+        for (width, height) in [(8, 4), (1, 1)] {
+            let mut tiny =
+                Terminal::new(ratatui::backend::TestBackend::new(width, height)).unwrap();
+            tiny.draw(|f| a.draw(f)).unwrap();
+        }
+        if let Ok(path) = std::env::var("DOT_HELP_RENDER") {
+            fs::write(path, artifacts.join("\n\n")).unwrap();
+        }
+    }
+
     #[test]
     fn render_review_artifact() {
         let (_t, mut a) = app();
