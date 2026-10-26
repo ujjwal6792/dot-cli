@@ -112,6 +112,7 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     };
     let (text, style) = match &app.message {
         Some(m) => (format!(" {m}"), Style::default().fg(Color::Yellow)),
+        None if app.actions_busy() => (" working…".to_string(), Style::default().fg(Color::Yellow)),
         None => (hint.to_string(), Style::default().fg(Color::DarkGray)),
     };
     f.render_widget(Paragraph::new(text).style(style), footer);
