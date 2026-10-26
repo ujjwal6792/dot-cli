@@ -446,3 +446,44 @@ include = ["machine:nobody"]
     got.sort();
     assert_eq!(got, [".a1b", ".starx"]);
 }
+
+#[test]
+fn an_ambiguous_variant_blocks_only_that_file_with_keep_going() {
+    let s = Spike::new(&fleet());
+    s.home_src(".dotwarden/variants/a", "a\n");
+    s.home_src(".dotwarden/variants/b", "b\n");
+    let tmpl = |path: &str| {
+        format!(
+            "{{{{- $v := includeTemplate \"dotwarden/variant\" (dict \"data\" . \"path\" \"{path}\") | trim -}}}}\
+             {{{{- if $v }}}}{{{{ include (printf \".dotwarden/variants/%s\" $v) }}}}{{{{ end -}}}}"
+        )
+    };
+    s.home_src("dot_clash.tmpl", &tmpl(".clash"));
+    s.home_src("dot_fine.tmpl", &tmpl(".fine"));
+    s.home_src("dot_plain", "plain\n");
+    s.data(
+        r#"
+[[dotwarden.variants.".clash"]]
+target = "family:debian"
+file = "a"
+[[dotwarden.variants.".clash"]]
+target = "family:ubuntu-like"
+file = "b"
+[[dotwarden.variants.".fine"]]
+target = "family:debian"
+file = "a"
+"#,
+    );
+    s.become_machine("multi");
+    // Plain apply aborts as a whole...
+    assert!(s.store.chezmoi(&["apply"]).is_err());
+    // ...while --keep-going applies everything else and reports the one failure.
+    let err = s.store.chezmoi(&["apply", "--keep-going"]).unwrap_err();
+    assert!(format!("{err:#}").contains("ambiguous variants for .clash"));
+    assert_eq!(
+        fs::read_to_string(s.t.home.join(".plain")).unwrap(),
+        "plain\n"
+    );
+    assert_eq!(fs::read_to_string(s.t.home.join(".fine")).unwrap(), "a\n");
+    assert!(!s.t.home.join(".clash").exists());
+}

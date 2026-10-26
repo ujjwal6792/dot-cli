@@ -86,9 +86,150 @@ repo/
     dot_zshrc …                ordinary chezmoi source entries
 ```
 
-The exact template mechanics (helper names, how `include` resolves under
-`.chezmoiroot`) must be verified against the pinned chezmoi in ticket 1 and
-recorded here before later tickets depend on them.
+#### Verified mechanics
+
+Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
+`tests/spike.rs` (every item below has a test of the same topic) and
+`tests/isolation.rs`.
+
+1. **`.chezmoiroot`.** Dotwarden passes the *repository root* as `--source`;
+   chezmoi reads `.chezmoiroot` (`home`) and uses `repo/home` as the source state
+   root (`chezmoi source-path` prints `repo/home`). Files at the repository root
+   (`dotwarden.toml`, `hide`, `README.md`, even `dot_x`) are not source state and
+   never become targets.
+2. **Leading-dot entries under `home/` are not targets.** `.dotwarden/…`
+   (variants, vault), `.chezmoitemplates/`, `.chezmoidata/` and `.chezmoiignore`
+   are never listed by `chezmoi managed` and never written to HOME by `apply`.
+3. **`include` paths are relative to the `.chezmoiroot` directory (`home/`)**, not
+   the repository root: `{{ include ".dotwarden/variants/x" }}` works;
+   `{{ include "home/.dotwarden/variants/x" }}` fails with "no such file".
+4. **Machine data.** The generated chezmoi config exposes only the registry name:
+   `[data.dotwardenMachine] name = "<registry name>"`. Everything else (platform,
+   distribution, families) is looked up in the registry
+   (`.chezmoidata/dotwarden.toml`, key `dotwarden.machines`) by the `targets`
+   helper, so every plain-chezmoi evaluation agrees with the registry. An unknown
+   name fails with `machine "<name>" is not in the machine registry`; running
+   chezmoi without the generated config fails with a message naming
+   `dotwardenMachine`. chezmoi runs templates with `missingkey=error`, so
+   templates must read optional keys with `dig`/`get`/`hasKey`.
+5. **Assignments** live in `.chezmoidata/dotwarden.toml`, keyed by *target path*
+   (the HOME-relative path, e.g. `.config/app/.nested`, not the `dot_` source
+   name):
+   ```toml
+   [dotwarden.assignments.".zshrc"]
+   include = ["platform:linux", "machine:mac"]   # optional; union; absent = everywhere
+   exclude = ["distribution:cachyos"]            # optional; always wins
+   ```
+   The fixed `.chezmoiignore` (below) evaluates them for the current machine.
+   Verified: include union across all four target kinds, excludes win over
+   includes, no includes means every machine, and plain `chezmoi apply`
+   enforces the result. Assigning edits only data; `.chezmoiignore` is
+   byte-identical to the template shipped with dotwarden.
+   *Caveats found:* (a) `.chezmoiignore` lines are globs, so paths containing
+   `* ? [ ] { } \` must be escaped, which the template does
+   (`regexReplaceAll`); without that, an assignment for `.a[1]b` ignored
+   `.a1b` instead. (b) Ignoring every file of a directory leaves the empty
+   directory itself managed; to keep a directory off a machine, assign the
+   directory path.
+6. **Variant selection.** Variants are data, keyed by target path:
+   ```toml
+   [[dotwarden.variants.".gitconfig"]]
+   target = "family:arch-like"
+   file = "gitconfig/arch"          # under home/.dotwarden/variants/
+   ```
+   The `dotwarden/variant` helper prints the `file` of the most specific
+   matching variant (machine > distribution > family > platform) or nothing when
+   the default content applies. Two matches at the same specificity (for
+   example a machine in two families, each with a variant) fail with
+   `ambiguous variants for <path> at the same specificity: …`. A tracked file
+   using variants is a template such as `home/dot_gitconfig.tmpl`:
+   ```
+   {{- $v := includeTemplate "dotwarden/variant" (dict "data" . "path" ".gitconfig") | trim -}}
+   {{- if $v }}{{ include (printf ".dotwarden/variants/%s" $v) }}{{ else }}…default content…{{ end -}}
+   ```
+   An ambiguity is an error for that file only: `chezmoi apply` stops at the
+   first error, but `chezmoi apply --keep-going` writes every other file and
+   reports the failing one, so dotwarden must apply with `--keep-going` to
+   "block apply of that file only".
+7. **Isolation.** With explicit `--config/--source/--persistent-state/--cache/
+   --destination` and `CHEZMOI_*` stripped, a pre-existing `~/.config/chezmoi`
+   and `~/.local/share/chezmoi` are neither read (their data and source never
+   appear) nor modified (byte, size and mtime identical after init, status,
+   doctor, managed, status, apply, data); on a fresh HOME neither directory is
+   created.
+
+Exact template code (written once into every repository; the files in
+`assets/home/` are the source of truth and are embedded in the binary):
+
+`home/.chezmoiignore`
+```
+{{- /* Written once by dotwarden; never regenerated or hand-edited (ADR 0005).
+       Evaluates the assignments in .chezmoidata/dotwarden.toml for this machine:
+       a file applies when (no includes OR any include matches) AND no exclude
+       matches. Everything printed here is a target path that is NOT applied;
+       glob characters in paths are escaped so they match literally. */ -}}
+{{- $targets := includeTemplate "dotwarden/targets" . | fromJson -}}
+{{- range $path, $a := (dig "dotwarden" "assignments" (dict) .) -}}
+{{- $include := get $a "include" | default (list) -}}
+{{- $exclude := get $a "exclude" | default (list) -}}
+{{- $applies := not $include -}}
+{{- range $include }}{{ if has . $targets }}{{ $applies = true }}{{ end }}{{ end -}}
+{{- range $exclude }}{{ if has . $targets }}{{ $applies = false }}{{ end }}{{ end -}}
+{{- if not $applies }}
+{{ regexReplaceAll `([\\*?\[\]{}])` $path `\$1` }}
+{{- end }}
+{{ end -}}
+```
+
+`home/.chezmoitemplates/dotwarden/targets`
+```
+{{- /* JSON list of the targets the current machine matches, e.g.
+       ["platform:linux","distribution:cachyos","family:arch-like","machine:laptop"].
+       The machine's registry name comes from the generated chezmoi config
+       (data.dotwardenMachine.name); everything else from the registry. */ -}}
+{{- if not (hasKey . "dotwardenMachine") -}}
+{{- fail "dotwarden: chezmoi data 'dotwardenMachine' is missing; run chezmoi through dotwarden" -}}
+{{- end -}}
+{{- $name := .dotwardenMachine.name -}}
+{{- $machine := dict -}}
+{{- range (dig "dotwarden" "machines" (list) .) }}{{ if eq .name $name }}{{ $machine = . }}{{ end }}{{ end -}}
+{{- if not $machine -}}
+{{- fail (printf "dotwarden: machine %q is not in the machine registry" $name) -}}
+{{- end -}}
+{{- $targets := list (printf "platform:%s" $machine.platform) (printf "distribution:%s" $machine.distribution) (printf "machine:%s" $machine.name) -}}
+{{- range $machine.families }}{{ $targets = append $targets (printf "family:%s" .) }}{{ end -}}
+{{- toJson $targets -}}
+```
+
+`home/.chezmoitemplates/dotwarden/variant`
+```
+{{- /* Variant selection. Call with (dict "data" . "path" "<target path>").
+       Prints the `file` of the most specific matching variant of that target
+       (machine > distribution > family > platform), or nothing when no variant
+       matches and the default content applies. Two matches at the same
+       specificity are an error. */ -}}
+{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- $best := 0 -}}
+{{- $file := "" -}}
+{{- $ties := list -}}
+{{- range (dig "dotwarden" "variants" .path (list) .data) -}}
+{{- $parts := splitList ":" .target -}}
+{{- $level := 0 -}}
+{{- if eq (index $parts 0) "machine" }}{{ $level = 4 }}
+{{- else if eq (index $parts 0) "distribution" }}{{ $level = 3 }}
+{{- else if eq (index $parts 0) "family" }}{{ $level = 2 }}
+{{- else if eq (index $parts 0) "platform" }}{{ $level = 1 }}
+{{- else }}{{ fail (printf "dotwarden: unknown target kind in %q" .target) }}{{ end -}}
+{{- if has .target $targets -}}
+{{- if gt $level $best }}{{ $best = $level }}{{ $file = .file }}{{ $ties = list .target }}
+{{- else if eq $level $best }}{{ $ties = append $ties .target }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $ties) 1 -}}
+{{- fail (printf "dotwarden: ambiguous variants for %s at the same specificity: %s" .path (join ", " $ties)) -}}
+{{- end -}}
+{{- $file -}}
+```
 
 ## 4. Machines and targeting (ADR 0005)
 
