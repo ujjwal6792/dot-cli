@@ -450,11 +450,7 @@ fn staging_a_file_deleted_in_home_untracks_it_and_unstaging_brings_it_back() {
     t.dw_ok(&["stage", "--all"]);
     t.dw_ok(&["commit", "-m", "drop b"]);
     assert!(changes(&t).is_empty());
-    assert!(
-        !t.dw_json(&["ls", "-a"])
-            .to_string()
-            .contains("\"name\":\".b\",\"state\":\"tracked\"")
-    );
+    assert!(!repo(&t).join("home/dot_b").exists());
 }
 
 #[test]
