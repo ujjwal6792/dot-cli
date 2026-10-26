@@ -293,7 +293,7 @@ pub fn new_files(
 
 // ---- planning ----------------------------------------------------------
 
-fn refuse(message: String) -> anyhow::Error {
+pub(crate) fn refuse(message: String) -> anyhow::Error {
     DwError::new(Kind::Error, message).into()
 }
 
@@ -455,6 +455,11 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 );
             }
         }
+        Action::Discard { files, .. } => {
+            for f in files {
+                g.home.insert(f.clone(), home_fingerprint(&home.join(f)));
+            }
+        }
         Action::HideAdd { pattern } | Action::HideRemove { pattern } => {
             g.repo.insert(
                 format!("rule:{pattern}"),
@@ -568,7 +573,7 @@ fn preview_add(store: &Store, files: &[TrackFile]) -> Result<Vec<FileChange>> {
     Ok(out)
 }
 
-fn new_item(
+pub(crate) fn new_item(
     store: &Store,
     requester: &str,
     action: Action,
@@ -1096,7 +1101,7 @@ pub struct ItemResult {
     pub forgotten: Vec<String>,
 }
 
-fn git_literal(store: &Store, args: &[&OsStr]) -> Result<exec::Output> {
+pub(crate) fn git_literal(store: &Store, args: &[&OsStr]) -> Result<exec::Output> {
     let mut cmd = store.git_command(&store.repo());
     cmd.env("GIT_LITERAL_PATHSPECS", "1").args(args);
     exec::run_ok(cmd, None)
@@ -1126,7 +1131,7 @@ fn repo_changes(store: &Store) -> Result<Vec<(char, char, String)>> {
 }
 
 /// Paths changed in the working tree relative to the index (what is not staged).
-fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
+pub(crate) fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
     Ok(repo_changes(store)?
         .into_iter()
         .filter(|(x, y, _)| *y != ' ' || *x == '?')
@@ -1134,7 +1139,7 @@ fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-fn ensure_repo_clean(store: &Store) -> Result<()> {
+pub(crate) fn ensure_repo_clean(store: &Store) -> Result<()> {
     let dirty = unstaged(store)?;
     if dirty.is_empty() {
         return Ok(());
@@ -1149,7 +1154,7 @@ fn ensure_repo_clean(store: &Store) -> Result<()> {
     )))
 }
 
-fn stage(store: &Store, paths: &[String]) -> Result<()> {
+pub(crate) fn stage(store: &Store, paths: &[String]) -> Result<()> {
     for chunk in paths.chunks(CHUNK) {
         let mut args: Vec<&OsStr> = vec!["add".as_ref(), "-A".as_ref(), "--".as_ref()];
         args.extend(chunk.iter().map(|p| OsStr::new(p.as_str())));
@@ -1158,7 +1163,7 @@ fn stage(store: &Store, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn index_tree(store: &Store) -> Result<String> {
+pub(crate) fn index_tree(store: &Store) -> Result<String> {
     Ok(git_literal(store, &["write-tree".as_ref()])?
         .stdout
         .trim()
@@ -1166,7 +1171,7 @@ fn index_tree(store: &Store) -> Result<String> {
 }
 
 /// Return index and working tree to `tree`, discarding whatever the failed item did.
-fn rollback(store: &Store, tree: &str) -> Result<()> {
+pub(crate) fn rollback(store: &Store, tree: &str) -> Result<()> {
     git_literal(store, &["add".as_ref(), "-A".as_ref()])?;
     git_literal(
         store,
@@ -1283,6 +1288,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             }
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
         }
+        Action::Discard { .. } => unreachable!("discards are run by apply_items"),
         Action::HideAdd { pattern } => {
             hide::add_rule(&repo, pattern)?;
             verify_and_stage(store, &BTreeSet::from([hide::HIDE_FILE.to_string()]), &[])
@@ -1294,7 +1300,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
     }
 }
 
-fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
+pub(crate) fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
     match fs::read(store.dirs.chezmoi_state()) {
         Ok(b) => Ok(Some(b)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1304,7 +1310,7 @@ fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
 
 /// Put chezmoi's persistent state back as it was before a failed track: `add`
 /// records last-written state for every file it touched.
-fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()> {
+pub(crate) fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()> {
     let _guard = store.chezmoi_guard()?;
     let path = store.dirs.chezmoi_state();
     match backup {
@@ -1340,9 +1346,21 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
         let tree = index_tree(store)?;
         let tracks = matches!(item.action, Action::Track { .. });
         let backup = if tracks { state_backup(store)? } else { None };
-        match exec_item(store, &ctx, item) {
-            Ok(staged) => {
-                let mut r = result(Outcome::Applied, None, staged);
+        let outcome = match &item.action {
+            Action::Discard { files, .. } => {
+                crate::changes::discard_files(store, files, &item.requester).map(|snap| {
+                    let note = match snap {
+                        Some(id) => format!("snapshot {id} taken first"),
+                        None => "nothing to snapshot (file was deleted)".to_string(),
+                    };
+                    (Vec::new(), Some(note))
+                })
+            }
+            _ => exec_item(store, &ctx, item).map(|staged| (staged, None)),
+        };
+        match outcome {
+            Ok((staged, note)) => {
+                let mut r = result(Outcome::Applied, note, staged);
                 if let Action::Untrack { files, .. } = &item.action {
                     r.forgotten = files.clone();
                 }

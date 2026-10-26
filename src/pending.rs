@@ -50,6 +50,13 @@ pub enum Action {
         #[serde(default)]
         assignments: Vec<String>,
     },
+    /// Write the committed version of local changes back to HOME (after a snapshot).
+    Discard {
+        /// The requested path (relative to HOME): a file or folder.
+        path: String,
+        /// Files with local changes that are overwritten.
+        files: Vec<String>,
+    },
     HideAdd {
         pattern: String,
     },
@@ -63,15 +70,24 @@ impl Action {
         match self {
             Action::Track { .. } => "track",
             Action::Untrack { .. } => "untrack",
+            Action::Discard { .. } => "discard",
             Action::HideAdd { .. } => "hide_add",
             Action::HideRemove { .. } => "hide_remove",
         }
     }
 
+    /// Whether only a human may apply this item (spec §8): agents cannot approve
+    /// their own requests. Push and the like join discard here.
+    pub fn needs_approval(&self) -> bool {
+        matches!(self, Action::Discard { .. })
+    }
+
     /// Two items with the same key request the same thing.
     pub fn key(&self) -> (&'static str, &str) {
         let what = match self {
-            Action::Track { path, .. } | Action::Untrack { path, .. } => path,
+            Action::Track { path, .. }
+            | Action::Untrack { path, .. }
+            | Action::Discard { path, .. } => path,
             Action::HideAdd { pattern } | Action::HideRemove { pattern } => pattern,
         };
         (self.kind_name(), what)

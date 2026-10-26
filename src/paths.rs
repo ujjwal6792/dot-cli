@@ -84,6 +84,10 @@ impl Dirs {
     pub fn chezmoi_lock_file(&self) -> PathBuf {
         self.state_dir().join("chezmoi.lock")
     }
+    /// Snapshots of HOME files taken before an overwrite (0700).
+    pub fn snapshots_dir(&self) -> PathBuf {
+        self.state_dir().join("snapshots")
+    }
     /// The pending list, shared by the CLI and the TUI.
     pub fn pending_file(&self) -> PathBuf {
         self.state_dir().join("pending.json")

@@ -19,6 +19,7 @@ name = "dw"
 path = "src/bin/dw.rs"
 
 [dependencies]
+ansi-to-tui = "8.0.1"
 anyhow = "1.0.104"
 clap = { version = "4.6.7", features = ["derive", "wrap_help"] }
 crossterm = "0.29.0"
@@ -26,6 +27,8 @@ ignore = "0.4.33"
 ratatui = "0.30.2"
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
+sha2 = "0.11.1"
+similar = "3.2.1"
 toml = "1.1.8"
 toml_edit = "0.25.17"
 

@@ -83,14 +83,34 @@ impl Drain {
 /// Run `cmd` to completion, capturing output. When `cancel` fires the child is
 /// killed and an error is returned. stdin is closed. Returns shortly after the
 /// child exits even if a grandchild keeps its output pipes open.
-pub fn run(mut cmd: Command, cancel: Option<&CancelToken>) -> Result<Output> {
+pub fn run(cmd: Command, cancel: Option<&CancelToken>) -> Result<Output> {
+    run_with_input(cmd, None, cancel)
+}
+
+/// Like [`run`] but feeds `input` to the child's stdin (from its own thread, so
+/// a child that writes before it has read everything cannot deadlock).
+pub fn run_with_input(
+    mut cmd: Command,
+    input: Option<Vec<u8>>,
+    cancel: Option<&CancelToken>,
+) -> Result<Output> {
     let desc = format!("{:?}", cmd.get_program());
     let mut child = cmd
-        .stdin(Stdio::null())
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
         .with_context(|| format!("starting {desc}"))?;
+    if let (Some(bytes), Some(mut stdin)) = (input, child.stdin.take()) {
+        thread::spawn(move || {
+            use std::io::Write;
+            let _ = stdin.write_all(&bytes);
+        });
+    }
     let out = drain(child.stdout.take().expect("piped"));
     let err = drain(child.stderr.take().expect("piped"));
     let status = loop {

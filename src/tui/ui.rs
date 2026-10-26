@@ -6,7 +6,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap};
 
-use super::app::{App, Dialog, Load, Panel};
+use super::app::{App, Dialog, Load, Panel, TABS};
 use crate::paths::tilde;
 use crate::source::TrackState;
 use crate::track::Outcome;
@@ -38,6 +38,15 @@ const HELP: &[(&str, &str)] = &[
         "i",
         "Files: hide (or un-hide) the path through a pending hide item",
     ),
+    (
+        "Space/a (Changes)",
+        "stage or unstage the change / all; [ ] switch tab",
+    ),
+    (
+        "c A d (Changes)",
+        "commit, amend (Ctrl+J: new line), discard",
+    ),
+    ("Enter (Changes)", "show the diff of the change (delta)"),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
     ("Enter (Pending)", "review and apply all checked items"),
@@ -135,7 +144,7 @@ fn draw_left(f: &mut Frame, app: &mut App, area: Rect) {
             if *p == app.focus {
                 Constraint::Min(5)
             } else if *p == Panel::Status {
-                Constraint::Length(5)
+                Constraint::Length(6)
             } else {
                 Constraint::Length(3)
             }
@@ -159,11 +168,9 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
             f.render_widget(Paragraph::new(status_lines(app)).block(block), area);
         }
         Panel::Pending => draw_pending_list(f, app, block, area),
+        Panel::Changes => draw_changes(f, app, block, area, expanded),
         other => {
             let text = match other {
-                Panel::Changes => {
-                    "Local · Staged · Incoming · Conflicts\n(arrives with the change model)"
-                }
                 Panel::Git => "Commits · Branches · Remotes · Stash\n(arrives with git support)",
                 _ => "Registry · assignments · preview as\n(arrives with machine management)",
             };
@@ -211,9 +218,78 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
                 Line::from(machine),
                 Line::from(git),
                 Line::from(format!("vault: {} · pending: {}", s.vault, s.pending)),
+                Line::from(counts_text(app)),
             ]
         }
     }
+}
+
+/// `local 2 · staged 1 · incoming 0 · conflicts 0` (New files count as local).
+fn counts_text(app: &App) -> String {
+    let n = app.change_counts();
+    format!(
+        "local {} · staged {} · incoming {} · conflicts {}",
+        n[0], n[1], n[2], n[3]
+    )
+}
+
+fn draw_changes(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect, expanded: bool) {
+    if !expanded {
+        let n = app.change_counts();
+        let text = format!("L{} S{} I{} C{}", n[0], n[1], n[2], n[3]);
+        return f.render_widget(Paragraph::new(text).block(block), area);
+    }
+    let counts = app.change_counts();
+    let mut tabs = Vec::new();
+    for (i, name) in TABS.iter().enumerate() {
+        let style = if i == app.changes_tab {
+            Style::default().add_modifier(Modifier::BOLD | Modifier::REVERSED)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        tabs.push(Span::styled(format!(" {name} {} ", counts[i]), style));
+    }
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+    let [head, body] = Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(inner);
+    f.render_widget(Paragraph::new(Line::from(tabs)), head);
+    let items: Vec<ListItem> = app
+        .change_rows()
+        .iter()
+        .map(|c| {
+            let (mark, colour) = match (c.state, c.kind) {
+                (_, "deleted" | "removed") => ("-", Color::Red),
+                (_, "new") => ("+", Color::Green),
+                (_, "repo") => ("#", Color::Blue),
+                _ => ("~", Color::Yellow),
+            };
+            let name = if c.kind == "repo" {
+                format!("repo:{}", c.path)
+            } else {
+                format!("~/{}", c.path)
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{mark} "), Style::default().fg(colour)),
+                Span::raw(name),
+            ]))
+        })
+        .collect();
+    if items.is_empty() {
+        let msg = match app.status {
+            Load::Loading => "loading…",
+            _ => "nothing here",
+        };
+        return f.render_widget(
+            Paragraph::new(msg).style(Style::default().fg(Color::DarkGray)),
+            body,
+        );
+    }
+    let mut state = ListState::default().with_selected(Some(app.changes_selected));
+    f.render_stateful_widget(
+        List::new(items).highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        body,
+        &mut state,
+    );
 }
 
 fn draw_files(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect) {
@@ -317,6 +393,18 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border(false))
         .title(title);
+    if app.focus == Panel::Changes {
+        let body = match &app.diff {
+            Load::Loading => ratatui::text::Text::from("loading…"),
+            Load::Failed(e) => ratatui::text::Text::from(e.clone()),
+            Load::Ready(t) if t.lines.is_empty() => ratatui::text::Text::from("No change selected"),
+            Load::Ready(t) => t.clone(),
+        };
+        let title = app
+            .selected_change()
+            .map_or(" Diff ".to_string(), |c| format!(" {} ", c.path));
+        return f.render_widget(Paragraph::new(body).block(block.title(title)), area);
+    }
     let text: String = match app.focus {
         Panel::Files => {
             let head = app
@@ -334,7 +422,7 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
             .selected_item()
             .map_or_else(|| "No pending actions".to_string(), |i| i.render()),
         Panel::Status => "Machine, branch and sync state of this computer.".into(),
-        Panel::Changes => "Diffs of the selected change will appear here (delta).".into(),
+        Panel::Changes => String::new(),
         Panel::Git => "Commit and branch details will appear here.".into(),
         Panel::Machines => "Assignments of the selected machine will appear here.".into(),
     };
@@ -459,6 +547,41 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             ));
             (" Result ", l)
         }
+        Dialog::Commit(b) => {
+            let mut l: Vec<Line> = b
+                .text
+                .split('\n')
+                .map(|t| Line::from(t.to_string()))
+                .collect();
+            if let Some(last) = l.last_mut() {
+                last.spans
+                    .push(Span::styled("█", Style::default().fg(Color::Yellow)));
+            }
+            l.push(Line::from(""));
+            l.push(Line::styled(
+                "Enter commits · Ctrl+J / Alt+Enter new line · Esc cancels",
+                Style::default().fg(Color::DarkGray),
+            ));
+            (if b.amend { " Amend " } else { " Commit " }, l)
+        }
+        Dialog::ConfirmDiscard(paths) => (
+            " Discard ",
+            vec![
+                Line::from(format!(
+                    "Overwrite {} with the committed version?",
+                    if paths.len() == 1 {
+                        format!("~/{}", paths[0])
+                    } else {
+                        format!("{} files", paths.len())
+                    }
+                )),
+                Line::from("A snapshot is taken first."),
+                Line::styled(
+                    "y discards · n / Esc cancels",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        ),
     };
     let w = area.width.saturating_sub(4).min(90);
     let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));

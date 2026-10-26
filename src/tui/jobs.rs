@@ -25,6 +25,7 @@ pub const KEY_TRACKED: &str = "tracked";
 pub const KEY_PENDING: &str = "pending";
 pub const KEY_HIDE: &str = "hide";
 /// Mutations never supersede one another: every one runs, in the order requested.
+pub const KEY_DIFF: &str = "diff";
 pub const KEY_ACTION: &str = "action";
 
 /// The outcome of a mutation (toggle, drop, apply).
@@ -33,6 +34,8 @@ pub struct ActionReport {
     pub message: String,
     /// Per-item results of an apply.
     pub results: Option<Vec<ItemResult>>,
+    /// The last commit message, to open the amend box with.
+    pub amend_message: Option<String>,
 }
 
 #[derive(Debug)]
@@ -50,6 +53,8 @@ pub enum Payload {
     /// The hide rules as loaded, with the change marker of the `hide` file.
     Hide(Result<(Box<HideRules>, HideStamp), String>),
     Pending(Result<Box<List>, String>),
+    /// The diff of the selected change, styled by delta when available.
+    Diff(Result<ratatui::text::Text<'static>, String>),
     Action(Result<ActionReport, String>),
 }
 

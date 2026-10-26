@@ -120,8 +120,105 @@ pub enum Command {
         #[arg(long, short = 'a')]
         all: bool,
     },
+    /// Stage local changes and new files: copy their HOME content into the repository.
+    ///
+    /// Paths are HOME paths; a folder stages every change below it. Staging a
+    /// new file inside a tracked folder starts tracking it. Incoming changes,
+    /// conflicts, deleted files and templates are refused.
+    Stage {
+        /// Files or folders to stage.
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
+        /// Stage every change that can be staged.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Show what would be staged without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Unstage changes: put the committed version back in the repository.
+    ///
+    /// HOME is not touched; the file shows as a local change again.
+    Unstage {
+        /// Files or folders to unstage.
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
+        /// Unstage everything.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Show what would be unstaged without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Commit the staged changes.
+    ///
+    /// Without -m an editor ($VISUAL or $EDITOR) opens when run in a terminal.
+    /// Commits made with DOTWARDEN_AGENT set carry an `Agent: <name>` trailer.
+    Commit {
+        /// Commit message; repeat for further paragraphs.
+        #[arg(short, long = "message")]
+        messages: Vec<String>,
+        /// Replace the last commit (refused once it is on a remote branch).
+        #[arg(long)]
+        amend: bool,
+        /// Show what would be committed without committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show local, new and staged changes as unified diffs.
+    ///
+    /// In a terminal the diff goes through the bundled delta; --no-pager and
+    /// --json (or a pipe) give plain unified diff.
+    Diff {
+        /// A HOME file or folder; everything when omitted.
+        path: Option<String>,
+        /// Print plain unified diff even in a terminal.
+        #[arg(long)]
+        no_pager: bool,
+    },
+    /// Discard local changes: write the committed version back to HOME.
+    ///
+    /// A snapshot of the current files is taken first (`dw snapshot list`).
+    /// Needs a human: from an agent (DOTWARDEN_AGENT) or without a terminal and
+    /// without --yes the request goes to the pending list and the exit code is 3;
+    /// approve it with `dw pending apply`.
+    Discard {
+        /// Files or folders with local changes.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would be overwritten without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List or restore snapshots of HOME files taken before they were overwritten.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
     /// Open the terminal UI (the default when no command is given).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SnapshotCmd {
+    /// List snapshots, newest first.
+    List {
+        /// Only snapshots holding this HOME path.
+        path: Option<String>,
+    },
+    /// Put snapshotted files back in HOME; what is there now is snapshotted first.
+    Restore {
+        /// Snapshot id from `dw snapshot list`.
+        id: String,
+        /// Only these files or folders (default: everything in the snapshot).
+        paths: Vec<String>,
+        /// Show what would be restored without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,6 +254,9 @@ pub enum PendingCmd {
         /// Show what would be applied (and which items are stale) without applying.
         #[arg(long)]
         dry_run: bool,
+        /// Approve items that need a human without asking (never for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -191,6 +291,7 @@ pub enum HideCmd {
 }
 
 pub fn main(bin_name: &'static str) -> ExitCode {
+    quiet_broken_pipe();
     let json = std::env::args_os().any(|a| a == "--json");
     let matches = match Cli::command().name(bin_name).try_get_matches() {
         Ok(m) => m,
@@ -215,6 +316,24 @@ pub fn main(bin_name: &'static str) -> ExitCode {
             report(kind, &message, json)
         }
     }
+}
+
+/// Rust ignores SIGPIPE, so printing into a closed pipe (`dw status | head`)
+/// panics; exit quietly with the conventional 128+SIGPIPE status instead.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let text = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if text.contains("Broken pipe") {
+            std::process::exit(141);
+        }
+        default(info);
+    }));
 }
 
 fn report(kind: error::Kind, message: &str, json: bool) -> ExitCode {
@@ -280,9 +399,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 PendingCmd::Drop { ids, all, dry_run } => {
                     cmds::pending_drop(&store, &ids, all, dry_run, json)
                 }
-                PendingCmd::Apply { ids, all, dry_run } => {
-                    cmds::pending_apply(&store, &ids, all, dry_run, json)
-                }
+                PendingCmd::Apply {
+                    ids,
+                    all,
+                    dry_run,
+                    yes,
+                } => cmds::pending_apply(&store, &ids, all, dry_run, yes, json),
             };
         }
         Command::Hide { action } => {
@@ -298,6 +420,37 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     apply,
                     dry_run,
                 } => cmds::hide_cmd(&store, false, &patterns, apply, dry_run, json),
+            };
+        }
+        Command::Stage {
+            paths,
+            all,
+            dry_run,
+        } => return cmds::stage_cmd(&store, true, &paths, all, dry_run, json),
+        Command::Unstage {
+            paths,
+            all,
+            dry_run,
+        } => return cmds::stage_cmd(&store, false, &paths, all, dry_run, json),
+        Command::Commit {
+            messages,
+            amend,
+            dry_run,
+        } => return cmds::commit_cmd(&store, messages, amend, dry_run, json),
+        Command::Diff { path, no_pager } => {
+            return cmds::diff_cmd(&store, path.as_deref(), no_pager, json);
+        }
+        Command::Discard {
+            paths,
+            yes,
+            dry_run,
+        } => return cmds::discard_cmd(&store, &paths, yes, dry_run, json),
+        Command::Snapshot { action } => {
+            return match action {
+                SnapshotCmd::List { path } => cmds::snapshot_list(&store, path.as_deref(), json),
+                SnapshotCmd::Restore { id, paths, dry_run } => {
+                    cmds::snapshot_restore(&store, &id, &paths, dry_run, json)
+                }
             };
         }
         Command::Ls { path, all } => return cmds::ls_cmd(&store, path.as_deref(), all, json),

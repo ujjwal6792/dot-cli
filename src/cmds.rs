@@ -7,8 +7,10 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
 
-use crate::error::{DwError, Kind};
+use crate::changes::{self, CommitOpts};
+use crate::error::{self, DwError, Kind};
 use crate::pending::{self, Item};
+use crate::snapshot;
 use crate::store::Store;
 use crate::track::{self, Ctx, ItemResult, Outcome, Plan};
 
@@ -42,6 +44,11 @@ fn print_results(results: &[ItemResult]) {
     for r in results {
         let id = r.id.map_or(String::new(), |i| format!("#{i} "));
         match r.status {
+            Outcome::Applied if r.kind == "discard" => println!(
+                "applied {id}{} ({})",
+                r.summary,
+                r.message.as_deref().unwrap_or("done")
+            ),
             Outcome::Applied => println!(
                 "applied {id}{} (staged {} path(s); not committed)",
                 r.summary,
@@ -300,11 +307,21 @@ pub fn pending_apply(
     ids: &[u64],
     all: bool,
     dry_run: bool,
+    yes: bool,
     json: bool,
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     if ids.is_empty() && !all {
         return Err(no_ids("apply", store));
+    }
+    if !dry_run {
+        let list = pending::load(store)?;
+        let chosen: Vec<&Item> = if all {
+            list.items.iter().collect()
+        } else {
+            ids.iter().filter_map(|i| list.get(*i)).collect()
+        };
+        approval_gate(store, &chosen, yes, json)?;
     }
     if dry_run {
         let list = pending::load(store)?;
@@ -378,6 +395,271 @@ pub fn ls_cmd(store: &Store, path: Option<&str>, all: bool, json: bool) -> Resul
                 e.pending
                     .map_or(String::new(), |p| format!("  [pending {p}]"))
             );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn home_selectors(
+    store: &Store,
+    paths: &[String],
+    all: bool,
+    verb: &str,
+) -> Result<Option<Vec<String>>> {
+    require_initialised(store)?;
+    if all {
+        return Ok(None);
+    }
+    if paths.is_empty() {
+        return Err(DwError::usage(format!("name the paths to {verb}, or pass --all")).into());
+    }
+    let cwd = cwd()?;
+    paths
+        .iter()
+        .map(|p| Ok(track::resolve_home_path(store, p, &cwd)?.rel))
+        .collect::<Result<_>>()
+        .map(Some)
+}
+
+pub fn stage_cmd(
+    store: &Store,
+    stage: bool,
+    paths: &[String],
+    all: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let verb = if stage { "stage" } else { "unstage" };
+    let sel = home_selectors(store, paths, all, verb)?;
+    let done = if stage {
+        changes::stage(store, sel.as_deref(), dry_run)?
+    } else {
+        changes::unstage(store, sel.as_deref(), dry_run)?
+    };
+    if json {
+        print_json(&done)?;
+    } else {
+        let tense = match (dry_run, stage) {
+            (true, true) => "would stage",
+            (true, false) => "would unstage",
+            (false, true) => "staged",
+            (false, false) => "unstaged",
+        };
+        for p in &done.paths {
+            println!("{tense} {p}");
+        }
+        for s in &done.skipped {
+            println!("skipped {}: {}", s.path, s.reason);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn commit_cmd(
+    store: &Store,
+    messages: Vec<String>,
+    amend: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    use std::io::IsTerminal;
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let done = changes::commit(
+        store,
+        &CommitOpts {
+            messages,
+            amend,
+            dry_run,
+            interactive,
+        },
+    )?;
+    if json {
+        print_json(&done)?;
+    } else {
+        println!(
+            "{} {} ({} file(s)){}",
+            if dry_run {
+                "would commit"
+            } else if amend {
+                "amended"
+            } else {
+                "committed"
+            },
+            done.commit.as_deref().unwrap_or(&done.subject),
+            done.files,
+            done.agent
+                .as_ref()
+                .map_or(String::new(), |a| format!(", Agent: {a}"))
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn diff_cmd(store: &Store, path: Option<&str>, no_pager: bool, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let sel = match path {
+        Some(p) => Some(vec![track::resolve_home_path(store, p, &cwd()?)?.rel]),
+        None => None,
+    };
+    let diffs = changes::diff(store, sel.as_deref())?;
+    if json {
+        return print_json(&diffs).map(|_| ExitCode::SUCCESS);
+    }
+    let text: String = diffs.iter().map(|d| d.diff.as_str()).collect();
+    use std::io::{IsTerminal, Write};
+    if !no_pager && !text.is_empty() && std::io::stdout().is_terminal() {
+        let mut child = std::process::Command::new(store.tools.delta())
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait()?;
+    } else {
+        print!("{text}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn discard_cmd(
+    store: &Store,
+    paths: &[String],
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let agent = changes::agent(store);
+    let requester = agent.clone().unwrap_or_else(|| "human".into());
+    let cwd = cwd()?;
+    let mut items = Vec::new();
+    for p in paths {
+        let hp = track::resolve_home_path(store, p, &cwd)?;
+        items.push(changes::plan_discard(store, &hp.rel, &requester)?);
+    }
+    if dry_run {
+        return submit(store, items, false, true, json);
+    }
+    let refs: Vec<&Item> = items.iter().collect();
+    if let Err(e) = approval_gate(store, &refs, yes, json) {
+        if error::classify(&e).0 != Kind::NeedsApproval {
+            return Err(e);
+        }
+        submit(store, items, false, false, json)?;
+        if !json {
+            println!("Discarding needs a human: approve it with `dw pending apply`.");
+        }
+        return Ok(ExitCode::from(Kind::NeedsApproval.code()));
+    }
+    let results = track::apply_now(store, &items)?;
+    if json {
+        print_json(&json!({"dry_run": false, "applied": results}))?;
+    } else {
+        print_results(&results);
+    }
+    Ok(results_exit(&results))
+}
+
+/// The one place that decides who may apply approval-required items (discard,
+/// later push and the like): never an agent, and without a terminal only with
+/// `--yes`. A human on a terminal without `--yes` confirms the list.
+pub fn approval_gate(store: &Store, items: &[&Item], yes: bool, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let needing: Vec<&&Item> = items.iter().filter(|i| i.action.needs_approval()).collect();
+    if needing.is_empty() {
+        return Ok(());
+    }
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !json;
+    if changes::agent(store).is_some() || (!tty && !yes) {
+        return Err(DwError::new(
+            Kind::NeedsApproval,
+            "needs a human: approve in the TUI or an interactive terminal",
+        )
+        .into());
+    }
+    if !yes && !confirm(&needing)? {
+        return Err(anyhow::anyhow!("cancelled; nothing was applied"));
+    }
+    Ok(())
+}
+
+fn confirm(items: &[&&Item]) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    for i in items {
+        println!("{}: {}", i.label(), i.summary);
+    }
+    print!(
+        "Apply these approval-required items? A snapshot is taken first where files are overwritten. [y/N] "
+    );
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+pub fn snapshot_list(store: &Store, path: Option<&str>, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let snaps = match path {
+        Some(p) => {
+            let hp = track::resolve_home_path(store, p, &cwd()?)?;
+            snapshot::list_for(store, &hp.rel)?
+        }
+        None => snapshot::list(store)?,
+    };
+    if json {
+        print_json(&snaps)?;
+    } else {
+        for s in &snaps {
+            let names: Vec<_> = s.files.iter().map(|f| format!("~/{}", f.path)).collect();
+            println!(
+                "{}  {}  {:<8} {:<8} {}",
+                s.id,
+                s.created,
+                s.reason,
+                s.actor,
+                names.join(" ")
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn snapshot_restore(
+    store: &Store,
+    id: &str,
+    paths: &[String],
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let cwd = cwd()?;
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|p| Ok(track::resolve_home_path(store, p, &cwd)?.rel))
+        .collect::<Result<_>>()?;
+    if dry_run {
+        let plan = snapshot::plan_restore(store, &snapshot::find(store, id)?, &rels)?;
+        if json {
+            print_json(&json!({"dry_run": true, "files": plan}))?;
+        } else {
+            for p in &plan {
+                println!("would restore ~/{}", p.path);
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let _lock = store.lock()?;
+    let actor = changes::agent(store).unwrap_or_else(|| "human".into());
+    let (restored, safety) = snapshot::restore(store, id, &rels, &actor)?;
+    if json {
+        print_json(&json!({"restored": restored, "safety_snapshot": safety}))?;
+    } else {
+        for r in &restored {
+            println!("restored ~/{r}");
+        }
+        if let Some(s) = safety {
+            println!("what was there before is in snapshot {s}");
         }
     }
     Ok(ExitCode::SUCCESS)
