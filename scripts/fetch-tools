@@ -1,0 +1,97 @@
+#!/bin/sh
+# Download and SHA-256-verify the pinned chezmoi, git (dugite-native) and delta
+# into a local libexec/ directory laid out like a release bundle:
+#
+#   <dest>/chezmoi          <dest>/git/{bin,libexec,share,...}          <dest>/delta
+#
+# Usage: scripts/fetch-tools [--platform darwin-arm64|linux-arm64|linux-amd64]
+#                            [--dest DIR]
+# Defaults: the current platform, and <repo>/libexec (git-ignored).
+# Pins live in toolchain/pins.env. Downloads are cached under <dest>/.cache.
+set -eu
+
+root=$(CDPATH= cd -- "$(dirname -- "$0")/.." && pwd)
+platform=""
+dest="$root/libexec"
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --platform) platform=$2; shift 2 ;;
+    --dest) dest=$2; shift 2 ;;
+    -h|--help) sed -n '2,12p' "$0"; exit 0 ;;
+    *) echo "fetch-tools: unknown argument: $1" >&2; exit 2 ;;
+  esac
+done
+
+if [ -z "$platform" ]; then
+  case "$(uname -s)-$(uname -m)" in
+    Darwin-arm64) platform=darwin-arm64 ;;
+    Linux-aarch64|Linux-arm64) platform=linux-arm64 ;;
+    Linux-x86_64) platform=linux-amd64 ;;
+    *) echo "fetch-tools: unsupported platform $(uname -s)-$(uname -m)" >&2; exit 1 ;;
+  esac
+fi
+key=$(printf '%s' "$platform" | tr '-' '_')
+
+# shellcheck disable=SC1091
+. "$root/toolchain/pins.env"
+
+sha256_of() {
+  if command -v sha256sum >/dev/null 2>&1; then sha256sum "$1" | cut -d' ' -f1
+  else shasum -a 256 "$1" | cut -d' ' -f1; fi
+}
+
+get() { eval "printf '%s' \"\${$1}\""; }
+
+mkdir -p "$dest" "$dest/.cache"
+dest=$(CDPATH= cd -- "$dest" && pwd)
+
+fetch() { # name
+  name=$1
+  file=$(get "${name}_FILE_${key}")
+  want=$(get "${name}_SHA256_${key}")
+  base=$(get "${name}_URL_BASE")
+  [ -n "$file" ] && [ -n "$want" ] || { echo "fetch-tools: no pin for $name on $platform" >&2; exit 1; }
+  archive="$dest/.cache/$file"
+  if [ ! -f "$archive" ] || [ "$(sha256_of "$archive")" != "$want" ]; then
+    echo "fetch-tools: downloading $file"
+    curl -fsSL --retry 3 -o "$archive.part" "$base/$file"
+    mv "$archive.part" "$archive"
+  fi
+  got=$(sha256_of "$archive")
+  if [ "$got" != "$want" ]; then
+    echo "fetch-tools: CHECKSUM MISMATCH for $file" >&2
+    echo "  expected $want" >&2
+    echo "  actual   $got" >&2
+    rm -f "$archive"
+    exit 1
+  fi
+  echo "fetch-tools: verified $file"
+}
+
+fetch CHEZMOI
+fetch GIT
+fetch DELTA
+
+tmp=$(mktemp -d "${TMPDIR:-/tmp}/dw-fetch.XXXXXX")
+trap 'rm -rf "$tmp"' EXIT
+
+# chezmoi: archive holds the binary at top level.
+mkdir "$tmp/chezmoi"
+tar -xzf "$dest/.cache/$(get "CHEZMOI_FILE_${key}")" -C "$tmp/chezmoi"
+install -m 0755 "$tmp/chezmoi/chezmoi" "$dest/chezmoi.new"
+mv -f "$dest/chezmoi.new" "$dest/chezmoi"
+
+# git: the dugite-native archive is the git tree itself (bin/, libexec/, share/ ...).
+rm -rf "$dest/git"
+mkdir "$dest/git"
+tar -xzf "$dest/.cache/$(get "GIT_FILE_${key}")" -C "$dest/git"
+
+# delta: archive holds a delta-<ver>-<triple>/ directory.
+mkdir "$tmp/delta"
+tar -xzf "$dest/.cache/$(get "DELTA_FILE_${key}")" -C "$tmp/delta"
+install -m 0755 "$tmp"/delta/*/delta "$dest/delta.new"
+mv -f "$dest/delta.new" "$dest/delta"
+
+echo "$platform" > "$dest/.platform"
+echo "fetch-tools: done ($platform) -> $dest"
