@@ -208,8 +208,9 @@ impl App {
             KeyCode::Char('k') | KeyCode::Up => self.files.move_by(-1),
             KeyCode::PageDown => self.files.move_by(10),
             KeyCode::PageUp => self.files.move_by(-10),
-            KeyCode::Char('g') | KeyCode::Home => self.files.select_first(),
-            KeyCode::Char('G') | KeyCode::End => self.files.select_last(),
+            // lazygit's top/bottom keys; `G` is reserved for the lazygit handoff.
+            KeyCode::Char('<') | KeyCode::Home => self.files.select_first(),
+            KeyCode::Char('>') | KeyCode::End => self.files.select_last(),
             KeyCode::Char('.') => self.files.toggle_hidden(),
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                 if self.files.enter() {

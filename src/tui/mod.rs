@@ -46,7 +46,8 @@ pub fn run_loop<B: Backend>(
 
 pub fn run(store: Store) -> Result<()> {
     let store = Arc::new(store);
-    let rules = HideRules::load(&store.dirs.home, &store.repo())?;
+    let rules =
+        HideRules::load(&store.dirs.home, &store.repo())?.always_hide(store.dirs.own_dirs());
     let (tx, rx) = channel();
     let stop = Arc::new(AtomicBool::new(false));
     let input = event::spawn_input(tx.clone(), Arc::clone(&stop));

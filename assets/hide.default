@@ -29,5 +29,12 @@ __pycache__/
 .zcompdump*
 .DS_Store
 
-# macOS Library is mostly application state; un-hide specific paths explicitly
-/Library/*
+# macOS Library is application state: hidden entirely, except paths that are
+# explicitly un-hidden below. Un-hiding a path also shows the folders leading
+# to it; everything else beside it stays hidden.
+/Library/
+!/Library/Application Support/Code/
+!/Library/Application Support/Cursor/
+!/Library/Application Support/Zed/
+!/Library/Application Support/iTerm2/
+!/Library/Application Support/Rectangle/

@@ -29,7 +29,7 @@ const HELP: &[(&str, &str)] = &[
         "h / ← / Backspace",
         "leave folder (Files); other panels: previous panel",
     ),
-    ("g / G", "first / last item"),
+    ("< / >, Home / End", "first / last item"),
     (".", "show or hide items matched by hide rules"),
     ("r", "refresh status and folder"),
     ("?", "toggle this help"),

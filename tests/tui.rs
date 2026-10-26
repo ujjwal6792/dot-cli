@@ -171,11 +171,108 @@ fn arrow_and_vim_keys_move_the_selection() {
     app.handle_event(ch('k'));
     app.handle_event(key(KeyCode::Up));
     assert_eq!(app.files.selected_entry().unwrap().display(), first);
-    app.handle_event(ch('G'));
+    // lazygit's top/bottom keys; `G` is reserved for the lazygit handoff.
+    app.handle_event(ch('>'));
     assert_eq!(app.files.selected, app.files.visible().len() - 1);
-    app.handle_event(ch('g'));
+    app.handle_event(ch('<'));
     assert_eq!(app.files.selected, 0);
+    app.handle_event(key(KeyCode::End));
+    assert_eq!(app.files.selected, app.files.visible().len() - 1);
+    app.handle_event(key(KeyCode::Home));
+    assert_eq!(app.files.selected, 0);
+    for reserved in ['G', 'g'] {
+        app.handle_event(ch('j'));
+        let at = app.files.selected;
+        app.handle_event(ch(reserved));
+        assert_eq!(
+            app.files.selected, at,
+            "{reserved} must not move the selection"
+        );
+    }
     drive(&mut app, &rx);
+    app.handle_event(ch('?'));
+    let screen = render(&mut app, 80, 24);
+    assert!(
+        screen.contains("first / last item") && screen.contains("< / >"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn library_is_hidden_except_explicitly_unhidden_paths() {
+    let (d, mut app, rx, _tx) = started(80);
+    let home = app.files.root.clone();
+    for p in [
+        "Library/Caches",
+        "Library/Preferences",
+        "Library/Application Support/Code/User",
+        "Library/Application Support/Slack",
+    ] {
+        fs::create_dir_all(home.join(p)).unwrap();
+    }
+    let names = |app: &App| {
+        app.files
+            .visible()
+            .iter()
+            .map(|e| e.display())
+            .collect::<Vec<_>>()
+    };
+    app.handle_event(ch('r'));
+    drive(&mut app, &rx);
+    // Library is reachable only because an app inside it is un-hidden.
+    let idx = names(&app)
+        .iter()
+        .position(|n| n == "Library")
+        .expect("Library shown");
+    app.files.selected = idx;
+    app.handle_event(ch('l'));
+    drive(&mut app, &rx);
+    assert_eq!(names(&app), ["Application Support"]);
+    app.handle_event(ch('l'));
+    drive(&mut app, &rx);
+    assert_eq!(names(&app), ["Code"]);
+    // `.` reveals the rest.
+    app.handle_event(ch('.'));
+    assert_eq!(names(&app), ["Code", "Slack"]);
+    drop(d);
+}
+
+#[test]
+fn dotwardens_own_directories_are_hidden_wherever_xdg_puts_them() {
+    let dir = tempfile::tempdir().unwrap();
+    let home = dir.path().canonicalize().unwrap();
+    fs::create_dir_all(home.join("xdg/data/dotwarden/repo")).unwrap();
+    fs::create_dir_all(home.join("xdg/data/other")).unwrap();
+    fs::create_dir_all(home.join("xdg-state/dotwarden")).unwrap();
+    let mut env = Env::new();
+    env.insert("HOME".into(), home.clone().into());
+    env.insert("XDG_DATA_HOME".into(), home.join("xdg/data").into());
+    env.insert("XDG_STATE_HOME".into(), home.join("xdg-state").into());
+    let dirs = Dirs::from_env(&env).unwrap();
+    let rules = HideRules::defaults(&home)
+        .unwrap()
+        .always_hide(dirs.own_dirs());
+    let store = Arc::new(Store::new(dirs, Toolchain::at("/nonexistent"), env));
+    let (tx, rx) = channel();
+    let mut app = App::new(store, rules, tx);
+    app.start();
+    drive(&mut app, &rx);
+    let names = |app: &App| {
+        app.files
+            .visible()
+            .iter()
+            .map(|e| e.display())
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(names(&app), ["xdg", "xdg-state"]);
+    app.files.selected = 0;
+    app.handle_event(ch('l'));
+    drive(&mut app, &rx);
+    app.handle_event(ch('l'));
+    drive(&mut app, &rx);
+    assert_eq!(names(&app), ["other"], "dotwarden's data dir is hidden");
+    app.handle_event(ch('.'));
+    assert!(names(&app).contains(&"dotwarden".to_string()));
 }
 
 #[test]
