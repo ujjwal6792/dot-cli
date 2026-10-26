@@ -893,8 +893,9 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                         .unwrap_or_else(|| "discard failed".into())
                 );
             }
+            let note = results[0].message.clone().unwrap_or_default();
             Ok(report(format!(
-                "Discarded {} (snapshot taken; see `dw snapshot list`)",
+                "Discarded {} ({note})",
                 if paths.len() == 1 {
                     track::tilde(&paths[0])
                 } else {

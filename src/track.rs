@@ -1288,10 +1288,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             }
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
         }
-        Action::Discard { files, .. } => {
-            crate::changes::discard_files(store, files, &item.requester)?;
-            Ok(Vec::new())
-        }
+        Action::Discard { .. } => unreachable!("discards are run by apply_items"),
         Action::HideAdd { pattern } => {
             hide::add_rule(&repo, pattern)?;
             verify_and_stage(store, &BTreeSet::from([hide::HIDE_FILE.to_string()]), &[])
@@ -1349,9 +1346,21 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
         let tree = index_tree(store)?;
         let tracks = matches!(item.action, Action::Track { .. });
         let backup = if tracks { state_backup(store)? } else { None };
-        match exec_item(store, &ctx, item) {
-            Ok(staged) => {
-                let mut r = result(Outcome::Applied, None, staged);
+        let outcome = match &item.action {
+            Action::Discard { files, .. } => {
+                crate::changes::discard_files(store, files, &item.requester).map(|snap| {
+                    let note = match snap {
+                        Some(id) => format!("snapshot {id} taken first"),
+                        None => "nothing to snapshot (file was deleted)".to_string(),
+                    };
+                    (Vec::new(), Some(note))
+                })
+            }
+            _ => exec_item(store, &ctx, item).map(|staged| (staged, None)),
+        };
+        match outcome {
+            Ok((staged, note)) => {
+                let mut r = result(Outcome::Applied, note, staged);
                 if let Action::Untrack { files, .. } = &item.action {
                     r.forgotten = files.clone();
                 }

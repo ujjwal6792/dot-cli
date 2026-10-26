@@ -76,6 +76,12 @@ impl Action {
         }
     }
 
+    /// Whether only a human may apply this item (spec §8): agents cannot approve
+    /// their own requests. Push and the like join discard here.
+    pub fn needs_approval(&self) -> bool {
+        matches!(self, Action::Discard { .. })
+    }
+
     /// Two items with the same key request the same thing.
     pub fn key(&self) -> (&'static str, &str) {
         let what = match self {

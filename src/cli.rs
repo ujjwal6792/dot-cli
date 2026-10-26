@@ -254,6 +254,9 @@ pub enum PendingCmd {
         /// Show what would be applied (and which items are stale) without applying.
         #[arg(long)]
         dry_run: bool,
+        /// Approve items that need a human without asking (never for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
     },
 }
 
@@ -288,6 +291,7 @@ pub enum HideCmd {
 }
 
 pub fn main(bin_name: &'static str) -> ExitCode {
+    quiet_broken_pipe();
     let json = std::env::args_os().any(|a| a == "--json");
     let matches = match Cli::command().name(bin_name).try_get_matches() {
         Ok(m) => m,
@@ -312,6 +316,24 @@ pub fn main(bin_name: &'static str) -> ExitCode {
             report(kind, &message, json)
         }
     }
+}
+
+/// Rust ignores SIGPIPE, so printing into a closed pipe (`dw status | head`)
+/// panics; exit quietly with the conventional 128+SIGPIPE status instead.
+fn quiet_broken_pipe() {
+    let default = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let text = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if text.contains("Broken pipe") {
+            std::process::exit(141);
+        }
+        default(info);
+    }));
 }
 
 fn report(kind: error::Kind, message: &str, json: bool) -> ExitCode {
@@ -377,9 +399,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 PendingCmd::Drop { ids, all, dry_run } => {
                     cmds::pending_drop(&store, &ids, all, dry_run, json)
                 }
-                PendingCmd::Apply { ids, all, dry_run } => {
-                    cmds::pending_apply(&store, &ids, all, dry_run, json)
-                }
+                PendingCmd::Apply {
+                    ids,
+                    all,
+                    dry_run,
+                    yes,
+                } => cmds::pending_apply(&store, &ids, all, dry_run, yes, json),
             };
         }
         Command::Hide { action } => {

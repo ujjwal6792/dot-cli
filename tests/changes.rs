@@ -409,7 +409,7 @@ fn an_agent_or_a_script_without_yes_cannot_discard_but_a_human_can_approve_it() 
     assert_eq!(p["items"][0]["requester"], "claude");
     assert!(snapshots(&t).is_empty());
 
-    t.dw_ok(&["pending", "apply", "--all"]);
+    t.dw_ok(&["pending", "apply", "--all", "--yes"]);
     assert_eq!(fs::read_to_string(t.home.join(".a")).unwrap(), "one\n");
     assert_eq!(snapshots(&t)[0]["actor"], "claude");
 
@@ -478,4 +478,79 @@ fn snapshot_retention_keeps_recent_ones_and_the_five_newest_per_file() {
         dotwarden::snapshot::list_for(&store, ".b").unwrap().len(),
         1
     );
+}
+
+#[test]
+fn only_a_human_can_apply_approval_required_items() {
+    let t = setup();
+    write(&t, ".a", "edit\n");
+    assert_eq!(dw_agent(&t, &["discard", ".a"]).code, 3);
+    let pending_len = |t: &TestEnv| {
+        t.dw_json(&["pending", "list"])["items"]
+            .as_array()
+            .unwrap()
+            .len()
+    };
+
+    // The agent cannot approve its own request, with or without --yes.
+    for args in [
+        &["pending", "apply", "--all"][..],
+        &["pending", "apply", "--all", "--yes"][..],
+    ] {
+        let r = dw_agent(&t, args);
+        assert_eq!(r.code, 3, "{}", r.err);
+        assert!(r.err.contains("needs a human"), "{}", r.err);
+    }
+    // No terminal and no --yes: refused too. Nothing was touched.
+    let r = dw(&t, &["pending", "apply", "--all"]);
+    assert_eq!(r.code, 3, "{}", r.err);
+    assert_eq!(fs::read_to_string(t.home.join(".a")).unwrap(), "edit\n");
+    assert_eq!(pending_len(&t), 1);
+
+    // Track items stay applicable by agents.
+    write(&t, ".c", "c\n");
+    assert_eq!(dw_agent(&t, &["track", ".c"]).code, 0);
+    let items = t.dw_json(&["pending", "list"])["items"].clone();
+    let id = items
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["kind"] == "track")
+        .unwrap()["id"]
+        .to_string();
+    assert_eq!(dw_agent(&t, &["pending", "apply", &id]).code, 0);
+}
+
+#[test]
+fn a_closed_pipe_ends_a_command_quietly() {
+    let t = setup();
+    let mut child = std::process::Command::new(env!("CARGO_BIN_EXE_dotwarden"))
+        .args(["status", "--json"])
+        .env_clear()
+        .envs(&t.env)
+        .current_dir(&t.home)
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    drop(child.stdout.take());
+    let out = child.wait_with_output().unwrap();
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        !err.contains("panicked") && !err.contains("Broken pipe"),
+        "{err}"
+    );
+    assert_eq!(out.status.code(), Some(141));
+}
+
+#[test]
+fn discarding_a_deleted_file_does_not_claim_a_snapshot() {
+    let t = setup();
+    fs::remove_file(t.home.join(".b")).unwrap();
+    let out = t.dw_ok(&["discard", ".b", "--yes"]);
+    assert!(out.contains("nothing to snapshot"), "{out}");
+    assert!(!out.contains("snapshot taken"), "{out}");
+    assert!(snapshots(&t).is_empty());
+    assert_eq!(fs::read_to_string(t.home.join(".b")).unwrap(), "bee\n");
 }

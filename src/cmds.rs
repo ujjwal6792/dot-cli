@@ -8,7 +8,7 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::changes::{self, CommitOpts};
-use crate::error::{DwError, Kind};
+use crate::error::{self, DwError, Kind};
 use crate::pending::{self, Item};
 use crate::snapshot;
 use crate::store::Store;
@@ -44,9 +44,11 @@ fn print_results(results: &[ItemResult]) {
     for r in results {
         let id = r.id.map_or(String::new(), |i| format!("#{i} "));
         match r.status {
-            Outcome::Applied if r.kind == "discard" => {
-                println!("applied {id}{} (snapshot taken first)", r.summary)
-            }
+            Outcome::Applied if r.kind == "discard" => println!(
+                "applied {id}{} ({})",
+                r.summary,
+                r.message.as_deref().unwrap_or("done")
+            ),
             Outcome::Applied => println!(
                 "applied {id}{} (staged {} path(s); not committed)",
                 r.summary,
@@ -305,11 +307,21 @@ pub fn pending_apply(
     ids: &[u64],
     all: bool,
     dry_run: bool,
+    yes: bool,
     json: bool,
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     if ids.is_empty() && !all {
         return Err(no_ids("apply", store));
+    }
+    if !dry_run {
+        let list = pending::load(store)?;
+        let chosen: Vec<&Item> = if all {
+            list.items.iter().collect()
+        } else {
+            ids.iter().filter_map(|i| list.get(*i)).collect()
+        };
+        approval_gate(store, &chosen, yes, json)?;
     }
     if dry_run {
         let list = pending::load(store)?;
@@ -518,7 +530,6 @@ pub fn discard_cmd(
     json: bool,
 ) -> Result<ExitCode> {
     require_initialised(store)?;
-    use std::io::IsTerminal;
     let agent = changes::agent(store);
     let requester = agent.clone().unwrap_or_else(|| "human".into());
     let cwd = cwd()?;
@@ -530,11 +541,10 @@ pub fn discard_cmd(
     if dry_run {
         return submit(store, items, false, true, json);
     }
-    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
-    let approved = agent.is_none() && (yes || (interactive && confirm(&items)?));
-    if !approved {
-        if agent.is_none() && interactive {
-            return Err(anyhow::anyhow!("cancelled; nothing was discarded"));
+    let refs: Vec<&Item> = items.iter().collect();
+    if let Err(e) = approval_gate(store, &refs, yes, json) {
+        if error::classify(&e).0 != Kind::NeedsApproval {
+            return Err(e);
         }
         submit(store, items, false, false, json)?;
         if !json {
@@ -551,12 +561,37 @@ pub fn discard_cmd(
     Ok(results_exit(&results))
 }
 
-fn confirm(items: &[Item]) -> Result<bool> {
+/// The one place that decides who may apply approval-required items (discard,
+/// later push and the like): never an agent, and without a terminal only with
+/// `--yes`. A human on a terminal without `--yes` confirms the list.
+pub fn approval_gate(store: &Store, items: &[&Item], yes: bool, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    let needing: Vec<&&Item> = items.iter().filter(|i| i.action.needs_approval()).collect();
+    if needing.is_empty() {
+        return Ok(());
+    }
+    let tty = std::io::stdin().is_terminal() && std::io::stdout().is_terminal() && !json;
+    if changes::agent(store).is_some() || (!tty && !yes) {
+        return Err(DwError::new(
+            Kind::NeedsApproval,
+            "needs a human: approve in the TUI or an interactive terminal",
+        )
+        .into());
+    }
+    if !yes && !confirm(&needing)? {
+        return Err(anyhow::anyhow!("cancelled; nothing was applied"));
+    }
+    Ok(())
+}
+
+fn confirm(items: &[&&Item]) -> Result<bool> {
     use std::io::{BufRead, Write};
     for i in items {
-        println!("{}", i.summary);
+        println!("{}: {}", i.label(), i.summary);
     }
-    print!("Overwrite them with the committed version? A snapshot is taken first. [y/N] ");
+    print!(
+        "Apply these approval-required items? A snapshot is taken first where files are overwritten. [y/N] "
+    );
     std::io::stdout().flush()?;
     let mut line = String::new();
     std::io::stdin().lock().read_line(&mut line)?;

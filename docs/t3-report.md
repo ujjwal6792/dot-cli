@@ -60,3 +60,9 @@ Hand-broken once: Local classified as Conflict (11 tests failed); stage without 
 - `dw diff` in a terminal still pipes straight to delta (its own pager); the TUI path captures output.
 - Commit box has no cursor movement (append/backspace only). Mouse and `v` range select in Changes not done.
 - Linux not run.
+
+### Review fixes
+
+1. **Self-approval.** `Action::needs_approval()` (discard) plus one `cmds::approval_gate`: an agent, or no terminal without `--yes`, gets exit 3 "needs a human…" and the item stays; a human terminal confirms y/N. `pending apply` gained `--yes`; track/untrack/hide items are unaffected. Test: `only_a_human_can_apply_approval_required_items`.
+2. **Broken pipe.** A panic hook exits 141 quietly on "Broken pipe" for every command. Test: `a_closed_pipe_ends_a_command_quietly`.
+3. **Discard of a deleted file** reports "nothing to snapshot (file was deleted)" (the result message now carries the snapshot id or that note, also in the TUI). Test: `discarding_a_deleted_file_does_not_claim_a_snapshot`.
