@@ -238,9 +238,7 @@ impl Tracked {
         let exact = self.files.get_key_value(rel);
         let lo = format!("{rel}/");
         let hi = format!("{rel}0"); // '0' follows '/'
-        exact
-            .into_iter()
-            .chain(self.files.range(lo..hi))
+        exact.into_iter().chain(self.files.range(lo..hi))
     }
 
     pub fn is_tracked(&self, rel: &str) -> bool {

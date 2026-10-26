@@ -135,6 +135,17 @@ impl FilesState {
         self.visible().get(self.selected).copied()
     }
 
+    /// Path of `e` relative to HOME, `/`-separated.
+    pub fn rel_of(&self, e: &Entry) -> String {
+        let dir = self.cwd.strip_prefix(&self.root).unwrap_or(Path::new(""));
+        let dir = dir.to_string_lossy();
+        if dir.is_empty() {
+            e.display()
+        } else {
+            format!("{dir}/{}", e.display())
+        }
+    }
+
     pub fn selected_path(&self) -> Option<PathBuf> {
         self.selected_entry().map(|e| self.cwd.join(&e.name))
     }

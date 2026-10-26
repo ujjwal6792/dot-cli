@@ -11,12 +11,27 @@ use std::thread;
 use super::event::Event;
 use super::files::Entry;
 use crate::exec::CancelToken;
+use crate::pending::List;
+use crate::source::Tracked;
 use crate::status::Status;
+use crate::track::ItemResult;
 
 /// Job keys; at most one job per key is current.
 pub const KEY_STATUS: &str = "status";
 pub const KEY_LISTING: &str = "listing";
 pub const KEY_PREVIEW: &str = "preview";
+pub const KEY_TRACKED: &str = "tracked";
+pub const KEY_PENDING: &str = "pending";
+/// Mutations never supersede one another: every one runs, in the order requested.
+pub const KEY_ACTION: &str = "action";
+
+/// The outcome of a mutation (toggle, drop, apply).
+#[derive(Debug)]
+pub struct ActionReport {
+    pub message: String,
+    /// Per-item results of an apply.
+    pub results: Option<Vec<ItemResult>>,
+}
 
 #[derive(Debug)]
 pub enum Payload {
@@ -29,6 +44,9 @@ pub enum Payload {
         path: PathBuf,
         text: Result<String, String>,
     },
+    Tracked(Result<Box<Tracked>, String>),
+    Pending(Result<Box<List>, String>),
+    Action(Result<ActionReport, String>),
 }
 
 #[derive(Debug)]
@@ -60,10 +78,25 @@ impl Jobs {
     where
         F: FnOnce(&CancelToken) -> Payload + Send + 'static,
     {
+        self.start(key, work, true)
+    }
+
+    /// Start `work` without superseding or being superseded by any other job.
+    pub fn spawn_detached<F>(&mut self, key: &'static str, work: F) -> u64
+    where
+        F: FnOnce(&CancelToken) -> Payload + Send + 'static,
+    {
+        self.start(key, work, false)
+    }
+
+    fn start<F>(&mut self, key: &'static str, work: F, supersede: bool) -> u64
+    where
+        F: FnOnce(&CancelToken) -> Payload + Send + 'static,
+    {
         self.next_id += 1;
         let id = self.next_id;
         let token = CancelToken::new();
-        if let Some((_, old)) = self.current.insert(key, (id, token.clone())) {
+        if supersede && let Some((_, old)) = self.current.insert(key, (id, token.clone())) {
             old.cancel();
         }
         let tx = self.tx.clone();
@@ -81,7 +114,7 @@ impl Jobs {
 
     /// Whether `id` is still the newest job for `key` (otherwise its result is stale).
     pub fn is_current(&self, key: &str, id: u64) -> bool {
-        self.current.get(key).is_some_and(|(cur, _)| *cur == id)
+        key == KEY_ACTION || self.current.get(key).is_some_and(|(cur, _)| *cur == id)
     }
 
     /// Jobs whose worker has not returned yet.
