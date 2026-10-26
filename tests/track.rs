@@ -351,7 +351,8 @@ fn tracking_a_folder_records_it_tracks_current_files_and_new_files_appear_as_new
     assert_eq!(s["tracked_folders"], 1);
     let human = ok(&t, &["status"]).out;
     assert!(
-        human.contains("New files:  1") && human.contains("~/.config/app/new.conf"),
+        human.contains("New (untracked, in tracked folders): 1")
+            && human.contains("~/.config/app/new.conf"),
         "{human}"
     );
     let ls = ok(&t, &["ls", ".config/app", "--json"]).json();

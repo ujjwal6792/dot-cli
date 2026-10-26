@@ -40,6 +40,8 @@ pub struct Status {
     pub tracked_folders: usize,
     /// Untracked, unhidden files inside tracked folders (relative to HOME).
     pub new_files: Vec<String>,
+    /// Local, new, staged, incoming and conflicting changes.
+    pub changes: Vec<crate::changes::Change>,
     pub vault: &'static str,
 }
 
@@ -61,6 +63,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             tracked_files: 0,
             tracked_folders: 0,
             new_files: Vec::new(),
+            changes: Vec::new(),
             vault: "none",
         });
     }
@@ -110,6 +113,12 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
     let tracked = crate::source::load(&store.repo())?;
     let rules = crate::hide::HideRules::for_store(store)?;
     let new_files = crate::track::new_files(&store.dirs.home, &tracked, &rules, cancel)?;
+    // chezmoi needs the generated config (and so a registered machine) to render targets.
+    let changes = if machine.is_some() && store.dirs.chezmoi_config().exists() {
+        crate::changes::classify(store)?
+    } else {
+        Vec::new()
+    };
     Ok(Status {
         initialised: true,
         repo_path,
@@ -127,6 +136,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         tracked_files: tracked.files.len(),
         tracked_folders: tracked.folders.len(),
         new_files,
+        changes,
         vault: "none",
     })
 }
@@ -183,16 +193,29 @@ impl Status {
             "Tracked:    {} files, {} folders\n",
             self.tracked_files, self.tracked_folders
         ));
-        if !self.new_files.is_empty() {
-            s.push_str(&format!(
-                "New files:  {} (in tracked folders)\n",
-                self.new_files.len()
-            ));
-            for f in self.new_files.iter().take(20) {
-                s.push_str(&format!("  ? ~/{f}\n"));
+        use crate::changes::State;
+        for (state, title) in [
+            (State::Staged, "Staged"),
+            (State::Local, "Local"),
+            (State::New, "New (untracked, in tracked folders)"),
+            (State::Incoming, "Incoming"),
+            (State::Conflict, "Conflicts"),
+        ] {
+            let list: Vec<_> = self.changes.iter().filter(|c| c.state == state).collect();
+            if list.is_empty() {
+                continue;
             }
-            if self.new_files.len() > 20 {
-                s.push_str(&format!("  … and {} more\n", self.new_files.len() - 20));
+            s.push_str(&format!("{title}: {}\n", list.len()));
+            for c in list.iter().take(20) {
+                let shown = if c.kind == "repo" {
+                    format!("repo:{}", c.path)
+                } else {
+                    format!("~/{}", c.path)
+                };
+                s.push_str(&format!("  {:<9} {shown}\n", c.kind));
+            }
+            if list.len() > 20 {
+                s.push_str(&format!("  … and {} more\n", list.len() - 20));
             }
         }
         s.push_str(&format!("Vault:      {}\n", self.vault));

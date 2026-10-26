@@ -7,6 +7,7 @@ use anyhow::Result;
 use serde::Serialize;
 use serde_json::json;
 
+use crate::changes::{self, CommitOpts};
 use crate::error::{DwError, Kind};
 use crate::pending::{self, Item};
 use crate::store::Store;
@@ -379,6 +380,128 @@ pub fn ls_cmd(store: &Store, path: Option<&str>, all: bool, json: bool) -> Resul
                     .map_or(String::new(), |p| format!("  [pending {p}]"))
             );
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn home_selectors(
+    store: &Store,
+    paths: &[String],
+    all: bool,
+    verb: &str,
+) -> Result<Option<Vec<String>>> {
+    require_initialised(store)?;
+    if all {
+        return Ok(None);
+    }
+    if paths.is_empty() {
+        return Err(DwError::usage(format!("name the paths to {verb}, or pass --all")).into());
+    }
+    let cwd = cwd()?;
+    paths
+        .iter()
+        .map(|p| Ok(track::resolve_home_path(store, p, &cwd)?.rel))
+        .collect::<Result<_>>()
+        .map(Some)
+}
+
+pub fn stage_cmd(
+    store: &Store,
+    stage: bool,
+    paths: &[String],
+    all: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let verb = if stage { "stage" } else { "unstage" };
+    let sel = home_selectors(store, paths, all, verb)?;
+    let done = if stage {
+        changes::stage(store, sel.as_deref(), dry_run)?
+    } else {
+        changes::unstage(store, sel.as_deref(), dry_run)?
+    };
+    if json {
+        print_json(&done)?;
+    } else {
+        let tense = match (dry_run, stage) {
+            (true, true) => "would stage",
+            (true, false) => "would unstage",
+            (false, true) => "staged",
+            (false, false) => "unstaged",
+        };
+        for p in &done.paths {
+            println!("{tense} {p}");
+        }
+        for s in &done.skipped {
+            println!("skipped {}: {}", s.path, s.reason);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn commit_cmd(
+    store: &Store,
+    messages: Vec<String>,
+    amend: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    use std::io::IsTerminal;
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let done = changes::commit(
+        store,
+        &CommitOpts {
+            messages,
+            amend,
+            dry_run,
+            interactive,
+        },
+    )?;
+    if json {
+        print_json(&done)?;
+    } else {
+        println!(
+            "{} {} ({} file(s)){}",
+            if dry_run {
+                "would commit"
+            } else if amend {
+                "amended"
+            } else {
+                "committed"
+            },
+            done.commit.as_deref().unwrap_or(&done.subject),
+            done.files,
+            done.agent
+                .as_ref()
+                .map_or(String::new(), |a| format!(", Agent: {a}"))
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn diff_cmd(store: &Store, path: Option<&str>, no_pager: bool, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let sel = match path {
+        Some(p) => Some(vec![track::resolve_home_path(store, p, &cwd()?)?.rel]),
+        None => None,
+    };
+    let diffs = changes::diff(store, sel.as_deref())?;
+    if json {
+        return print_json(&diffs).map(|_| ExitCode::SUCCESS);
+    }
+    let text: String = diffs.iter().map(|d| d.diff.as_str()).collect();
+    use std::io::{IsTerminal, Write};
+    if !no_pager && !text.is_empty() && std::io::stdout().is_terminal() {
+        let mut child = std::process::Command::new(store.tools.delta())
+            .stdin(std::process::Stdio::piped())
+            .spawn()?;
+        if let Some(mut stdin) = child.stdin.take() {
+            let _ = stdin.write_all(text.as_bytes());
+        }
+        child.wait()?;
+    } else {
+        print!("{text}");
     }
     Ok(ExitCode::SUCCESS)
 }

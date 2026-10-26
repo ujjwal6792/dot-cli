@@ -1,6 +1,7 @@
 //! Dotwarden: dotfiles, secrets and variables in sync across machines.
 
 pub mod assign;
+pub mod changes;
 pub mod cli;
 pub mod cmds;
 pub mod doctor;

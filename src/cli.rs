@@ -120,6 +120,62 @@ pub enum Command {
         #[arg(long, short = 'a')]
         all: bool,
     },
+    /// Stage local changes and new files: copy their HOME content into the repository.
+    ///
+    /// Paths are HOME paths; a folder stages every change below it. Staging a
+    /// new file inside a tracked folder starts tracking it. Incoming changes,
+    /// conflicts, deleted files and templates are refused.
+    Stage {
+        /// Files or folders to stage.
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
+        /// Stage every change that can be staged.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Show what would be staged without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Unstage changes: put the committed version back in the repository.
+    ///
+    /// HOME is not touched; the file shows as a local change again.
+    Unstage {
+        /// Files or folders to unstage.
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
+        /// Unstage everything.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Show what would be unstaged without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Commit the staged changes.
+    ///
+    /// Without -m an editor ($VISUAL or $EDITOR) opens when run in a terminal.
+    /// Commits made with DOTWARDEN_AGENT set carry an `Agent: <name>` trailer.
+    Commit {
+        /// Commit message; repeat for further paragraphs.
+        #[arg(short, long = "message")]
+        messages: Vec<String>,
+        /// Replace the last commit (refused once it is on a remote branch).
+        #[arg(long)]
+        amend: bool,
+        /// Show what would be committed without committing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show local, new and staged changes as unified diffs.
+    ///
+    /// In a terminal the diff goes through the bundled delta; --no-pager and
+    /// --json (or a pipe) give plain unified diff.
+    Diff {
+        /// A HOME file or folder; everything when omitted.
+        path: Option<String>,
+        /// Print plain unified diff even in a terminal.
+        #[arg(long)]
+        no_pager: bool,
+    },
     /// Open the terminal UI (the default when no command is given).
     Tui,
 }
@@ -299,6 +355,24 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     dry_run,
                 } => cmds::hide_cmd(&store, false, &patterns, apply, dry_run, json),
             };
+        }
+        Command::Stage {
+            paths,
+            all,
+            dry_run,
+        } => return cmds::stage_cmd(&store, true, &paths, all, dry_run, json),
+        Command::Unstage {
+            paths,
+            all,
+            dry_run,
+        } => return cmds::stage_cmd(&store, false, &paths, all, dry_run, json),
+        Command::Commit {
+            messages,
+            amend,
+            dry_run,
+        } => return cmds::commit_cmd(&store, messages, amend, dry_run, json),
+        Command::Diff { path, no_pager } => {
+            return cmds::diff_cmd(&store, path.as_deref(), no_pager, json);
         }
         Command::Ls { path, all } => return cmds::ls_cmd(&store, path.as_deref(), all, json),
         Command::Tui => {

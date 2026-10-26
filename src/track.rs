@@ -293,7 +293,7 @@ pub fn new_files(
 
 // ---- planning ----------------------------------------------------------
 
-fn refuse(message: String) -> anyhow::Error {
+pub(crate) fn refuse(message: String) -> anyhow::Error {
     DwError::new(Kind::Error, message).into()
 }
 
@@ -1096,7 +1096,7 @@ pub struct ItemResult {
     pub forgotten: Vec<String>,
 }
 
-fn git_literal(store: &Store, args: &[&OsStr]) -> Result<exec::Output> {
+pub(crate) fn git_literal(store: &Store, args: &[&OsStr]) -> Result<exec::Output> {
     let mut cmd = store.git_command(&store.repo());
     cmd.env("GIT_LITERAL_PATHSPECS", "1").args(args);
     exec::run_ok(cmd, None)
@@ -1126,7 +1126,7 @@ fn repo_changes(store: &Store) -> Result<Vec<(char, char, String)>> {
 }
 
 /// Paths changed in the working tree relative to the index (what is not staged).
-fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
+pub(crate) fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
     Ok(repo_changes(store)?
         .into_iter()
         .filter(|(x, y, _)| *y != ' ' || *x == '?')
@@ -1134,7 +1134,7 @@ fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
         .collect())
 }
 
-fn ensure_repo_clean(store: &Store) -> Result<()> {
+pub(crate) fn ensure_repo_clean(store: &Store) -> Result<()> {
     let dirty = unstaged(store)?;
     if dirty.is_empty() {
         return Ok(());
@@ -1149,7 +1149,7 @@ fn ensure_repo_clean(store: &Store) -> Result<()> {
     )))
 }
 
-fn stage(store: &Store, paths: &[String]) -> Result<()> {
+pub(crate) fn stage(store: &Store, paths: &[String]) -> Result<()> {
     for chunk in paths.chunks(CHUNK) {
         let mut args: Vec<&OsStr> = vec!["add".as_ref(), "-A".as_ref(), "--".as_ref()];
         args.extend(chunk.iter().map(|p| OsStr::new(p.as_str())));
@@ -1158,7 +1158,7 @@ fn stage(store: &Store, paths: &[String]) -> Result<()> {
     Ok(())
 }
 
-fn index_tree(store: &Store) -> Result<String> {
+pub(crate) fn index_tree(store: &Store) -> Result<String> {
     Ok(git_literal(store, &["write-tree".as_ref()])?
         .stdout
         .trim()
@@ -1166,7 +1166,7 @@ fn index_tree(store: &Store) -> Result<String> {
 }
 
 /// Return index and working tree to `tree`, discarding whatever the failed item did.
-fn rollback(store: &Store, tree: &str) -> Result<()> {
+pub(crate) fn rollback(store: &Store, tree: &str) -> Result<()> {
     git_literal(store, &["add".as_ref(), "-A".as_ref()])?;
     git_literal(
         store,
@@ -1294,7 +1294,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
     }
 }
 
-fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
+pub(crate) fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
     match fs::read(store.dirs.chezmoi_state()) {
         Ok(b) => Ok(Some(b)),
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -1304,7 +1304,7 @@ fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
 
 /// Put chezmoi's persistent state back as it was before a failed track: `add`
 /// records last-written state for every file it touched.
-fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()> {
+pub(crate) fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()> {
     let _guard = store.chezmoi_guard()?;
     let path = store.dirs.chezmoi_state();
     match backup {
