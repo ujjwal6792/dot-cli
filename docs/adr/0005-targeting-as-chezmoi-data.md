@@ -1,0 +1,3 @@
+# Machine registry, assignments and values as chezmoi data
+
+Machines are named in a shared registry independent of hostname. Assignments, variants and values are stored as chezmoi data and evaluated by fixed templates (a constant `.chezmoiignore` and helper templates) that dotwarden writes once. Plain chezmoi therefore enforces the same result, and dotwarden never regenerates or byte-compares rule blocks. v1's hostname-keyed generated block broke when an agent edited it, and its behaviour changed silently when macOS hostnames changed. Targets are platform, distribution, distribution family and machine; includes are a union, excludes win, and the most specific match selects variants and values.

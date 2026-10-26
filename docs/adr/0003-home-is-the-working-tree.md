@@ -1,0 +1,3 @@
+# HOME is the working tree; the repository mirrors the index
+
+To match lazygit's mental model, dotwarden treats HOME as git's working tree: an edited tracked file is a change, staging copies it into the repository and runs `git add`, and discard writes the committed version back. The repository's own working tree is kept identical to the index, so there is no separate "capture" step and chezmoi's source directory becomes an implementation detail. Incoming changes and conflicts are derived from chezmoi's last-written state. v1 instead showed HOME drift and repository changes as separate layers.
