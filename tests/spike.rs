@@ -282,13 +282,104 @@ fn assignments_are_enforced_by_plain_apply() {
 }
 
 #[test]
-fn assigning_never_rewrites_chezmoiignore() {
+fn assigning_changes_the_data_file_and_the_managed_set_but_never_chezmoiignore() {
     let s = Spike::new(&fleet());
-    let ignore = s.store.repo().join("home/.chezmoiignore");
-    let before = fs::read(&ignore).unwrap();
-    assert_eq!(before, dotwarden::templates::CHEZMOIIGNORE.as_bytes());
-    s.data("[dotwarden.assignments.\".x\"]\ninclude = [\"machine:mac\"]\n");
-    assert_eq!(fs::read(&ignore).unwrap(), before);
+    s.home_src("dot_x", "x\n");
+    let repo = s.store.repo();
+    let commit = |msg: &str| {
+        s.store.git(&["add", "-A"]).unwrap();
+        s.store.git(&["commit", "--quiet", "-m", msg]).unwrap();
+    };
+    commit("baseline");
+    assert!(s.managed("mac").contains(&".x".to_string()));
+
+    dotwarden::assign::set_assignment(&repo, ".x", &["machine:ubu".into()], &[]).unwrap();
+
+    // Behaviour changed for the machines concerned ...
+    assert!(!s.managed("mac").contains(&".x".to_string()));
+    assert!(s.managed("ubu").contains(&".x".to_string()));
+    // ... and the only thing that changed in the repository is the data file.
+    let changed = s.store.git(&["diff", "--name-only"]).unwrap().stdout;
+    assert_eq!(changed.trim(), dotwarden::repo::DATA_FILE);
+
+    // Removing the assignment restores "everywhere", again by data alone.
+    dotwarden::assign::set_assignment(&repo, ".x", &[], &[]).unwrap();
+    assert!(s.managed("mac").contains(&".x".to_string()));
+    assert_eq!(
+        s.store
+            .git(&["status", "--porcelain"])
+            .unwrap()
+            .stdout
+            .trim(),
+        ""
+    );
+}
+
+#[test]
+fn unrepresentable_assignment_paths_are_refused_before_anything_is_written() {
+    let s = Spike::new(&fleet());
+    let data = s.store.repo().join(dotwarden::repo::DATA_FILE);
+    let before = fs::read_to_string(&data).unwrap();
+    for bad in ["a\nb", "a\rb", "/abs", "a/../b", "a\tb", ""] {
+        let e =
+            dotwarden::assign::set_assignment(&s.store.repo(), bad, &["machine:mac".into()], &[])
+                .unwrap_err();
+        assert_eq!(
+            dotwarden::error::classify(&e).0,
+            dotwarden::error::Kind::Usage,
+            "{bad:?}"
+        );
+    }
+    let e = dotwarden::assign::set_assignment(&s.store.repo(), "ok", &["bogus:thing".into()], &[])
+        .unwrap_err();
+    assert!(format!("{e:#}").contains("invalid target"));
+    assert_eq!(fs::read_to_string(&data).unwrap(), before);
+}
+
+/// `name` is excluded on `mac` by an assignment; `sibling` must stay managed.
+/// Each name is a hazard in `.chezmoiignore` syntax if written unescaped.
+fn exclusion_matches_literally(name: &str, sibling: &str) {
+    let s = Spike::new(&fleet());
+    s.home_src(name, "x\n");
+    s.home_src(sibling, "y\n");
+    s.home_src("zzz", "z\n");
+    dotwarden::assign::set_assignment(&s.store.repo(), name, &[], &["machine:mac".into()]).unwrap();
+    let mut got = s.managed("mac");
+    got.sort();
+    let mut want = vec![sibling.to_string(), "zzz".to_string()];
+    want.sort();
+    assert_eq!(got, want, "excluding {name:?}");
+    // Other machines still get it.
+    assert!(
+        s.managed("ubu").contains(&name.to_string()),
+        "{name:?} on ubu"
+    );
+}
+
+#[test]
+fn ignore_escaping_leading_hash_is_not_a_comment() {
+    exclusion_matches_literally("#x", "x");
+}
+
+#[test]
+fn ignore_escaping_leading_bang_is_not_a_negation() {
+    exclusion_matches_literally("!x", "x");
+}
+
+#[test]
+fn ignore_escaping_trailing_and_leading_spaces_survive_trimming() {
+    exclusion_matches_literally("a b ", "a b");
+    exclusion_matches_literally(" lead", "lead");
+    exclusion_matches_literally("a\u{a0}", "a");
+}
+
+#[test]
+fn ignore_escaping_brackets_star_and_question_mark_match_literally() {
+    exclusion_matches_literally("[1]", "1");
+    exclusion_matches_literally("*", "star");
+    exclusion_matches_literally("?", "q");
+    exclusion_matches_literally("{a,b}", "a");
+    exclusion_matches_literally("back\\slash", "backslash");
 }
 
 #[test]
@@ -486,4 +577,148 @@ file = "a"
     );
     assert_eq!(fs::read_to_string(s.t.home.join(".fine")).unwrap(), "a\n");
     assert!(!s.t.home.join(".clash").exists());
+}
+
+#[test]
+fn a_more_specific_match_beats_a_lower_level_tie() {
+    // `multi` is a mint machine in two families. The two family variants tie at
+    // family level, but the distribution variant is more specific and wins.
+    let s = Spike::new(&fleet());
+    for (id, body) in [
+        ("a", "family-debian\n"),
+        ("b", "family-ubuntu\n"),
+        ("c", "dist-mint\n"),
+        ("d", "machine\n"),
+    ] {
+        s.home_src(&format!(".dotwarden/variants/{id}"), body);
+    }
+    s.home_src("dot_pick.tmpl", &variant_template(".pick"));
+    s.data(
+        r#"
+[[dotwarden.variants.".pick"]]
+target = "family:debian"
+file = "a"
+[[dotwarden.variants.".pick"]]
+target = "family:ubuntu-like"
+file = "b"
+[[dotwarden.variants.".pick"]]
+target = "distribution:mint"
+file = "c"
+"#,
+    );
+    assert_eq!(s.rendered("multi", ".pick").unwrap(), "dist-mint\n");
+    // Without the more specific entry the tie is an error again.
+    let s2 = Spike::new(&fleet());
+    s2.home_src(".dotwarden/variants/a", "x\n");
+    s2.home_src("dot_pick.tmpl", &variant_template(".pick"));
+    s2.data(
+        r#"
+[[dotwarden.variants.".pick"]]
+target = "family:debian"
+file = "a"
+[[dotwarden.variants.".pick"]]
+target = "family:ubuntu-like"
+file = "a"
+"#,
+    );
+    assert!(
+        s2.rendered("multi", ".pick")
+            .unwrap_err()
+            .contains("ambiguous variants for .pick")
+    );
+    // A tie at the most specific level is still an error even with a lower winner.
+    let s3 = Spike::new(&fleet());
+    s3.home_src(".dotwarden/variants/a", "x\n");
+    s3.home_src("dot_pick.tmpl", &variant_template(".pick"));
+    s3.data(
+        r#"
+[[dotwarden.variants.".pick"]]
+target = "platform:linux"
+file = "a"
+[[dotwarden.variants.".pick"]]
+target = "machine:multi"
+file = "a"
+[[dotwarden.variants.".pick"]]
+target = "machine:multi"
+file = "a"
+"#,
+    );
+    assert!(
+        s3.rendered("multi", ".pick")
+            .unwrap_err()
+            .contains("ambiguous variants")
+    );
+}
+
+fn variant_template(path: &str) -> String {
+    format!(
+        "{{{{- $v := includeTemplate \"dotwarden/variant\" (dict \"data\" . \"path\" \"{path}\") | trim -}}}}\
+         {{{{- if $v }}}}{{{{ include (printf \".dotwarden/variants/%s\" $v) }}}}{{{{ else }}}}default\n{{{{ end -}}}}"
+    )
+}
+
+#[test]
+fn an_unknown_target_kind_in_one_entry_breaks_nothing_and_is_reported_by_doctor() {
+    let s = Spike::new(&fleet());
+    s.home_src(".dotwarden/variants/a", "known\n");
+    s.home_src(".dotwarden/variants/b", "weird\n");
+    s.home_src("dot_one.tmpl", &variant_template(".one"));
+    s.home_src("dot_two.tmpl", &variant_template(".two"));
+    s.home_src("dot_assigned", "x\n");
+    s.home_src("dot_other", "x\n");
+    s.data(
+        r#"
+[[dotwarden.variants.".one"]]
+target = "weird:thing"
+file = "b"
+[[dotwarden.variants.".one"]]
+target = "platform:linux"
+file = "a"
+[[dotwarden.variants.".two"]]
+target = "planet:mars"
+file = "b"
+[dotwarden.assignments.".assigned"]
+include = ["bogus:x", "machine:ubu"]
+[dotwarden.assignments.".other"]
+exclude = ["bogus:y"]
+"#,
+    );
+    // The unknown entry is ignored: the valid one still selects, the other file is plain.
+    assert_eq!(s.rendered("ubu", ".one").unwrap(), "known\n");
+    assert_eq!(s.rendered("ubu", ".two").unwrap(), "default\n");
+    assert_eq!(s.rendered("mac", ".one").unwrap(), "default\n");
+    // An unknown include never matches; an unknown exclude never excludes.
+    assert!(s.managed("ubu").contains(&".assigned".to_string()));
+    assert!(!s.managed("mac").contains(&".assigned".to_string()));
+    assert!(s.managed("mac").contains(&".other".to_string()));
+
+    // `dw doctor` surfaces them as warnings without failing.
+    s.store.write_local_machine("ubu").unwrap();
+    s.store.write_chezmoi_config("ubu").unwrap();
+    let report = dotwarden::doctor::run(&s.store);
+    let warn = report
+        .checks
+        .iter()
+        .find(|c| c.name == "targets")
+        .expect("a targets finding");
+    assert!(warn.warning && warn.ok);
+    for t in ["weird:thing", "planet:mars", "bogus:x", "bogus:y"] {
+        assert!(warn.detail.contains(t), "{t} not in {}", warn.detail);
+    }
+}
+
+#[test]
+fn retired_machines_have_no_targets() {
+    let mut fleet = fleet();
+    fleet.push(Machine {
+        retired: true,
+        ..machine("gone", "linux", "ubuntu", &["debian"])
+    });
+    let s = Spike::new(&fleet);
+    s.home_src("dot_x", "x\n");
+    s.become_machine("gone");
+    let err = format!("{:#}", s.store.chezmoi(&["managed"]).unwrap_err());
+    assert!(err.contains("machine \"gone\" is retired"), "{err}");
+    // Live machines are unaffected, including one that reuses nothing of it.
+    assert_eq!(s.managed("ubu"), [".x"]);
 }

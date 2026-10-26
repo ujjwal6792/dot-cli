@@ -79,10 +79,14 @@ impl Toolchain {
 
     /// Environment variables dugite's portable git needs, plus the isolation
     /// settings from spec §3. Applied on top of the scrubbed environment.
+    pub fn git_exec_path(&self) -> PathBuf {
+        self.git_root().join("libexec").join("git-core")
+    }
+
     pub fn git_env(&self) -> Vec<(&'static str, PathBuf)> {
         let root = self.git_root();
         let mut v = vec![
-            ("GIT_EXEC_PATH", root.join("libexec").join("git-core")),
+            ("GIT_EXEC_PATH", self.git_exec_path()),
             (
                 "GIT_TEMPLATE_DIR",
                 root.join("share").join("git-core").join("templates"),
@@ -113,6 +117,21 @@ const GIT_PASSTHROUGH: &[&str] = &[
 /// Whether `key` must be removed from the environment of a git invocation.
 pub fn is_scrubbed_for_git(key: &str) -> bool {
     key.starts_with("GIT_") && !GIT_PASSTHROUGH.contains(&key)
+}
+
+/// Whether a key of the user's global git configuration (as printed by
+/// `git config --null --get-regexp`: lowercase section and variable) is
+/// forwarded to dotwarden's git: identity and signing settings only.
+pub fn is_forwarded_git_key(key: &str) -> bool {
+    match key {
+        "user.name" | "user.email" | "user.signingkey" | "commit.gpgsign" | "gpg.format"
+        | "gpg.program" => true,
+        _ => matches!(
+            key.strip_prefix("gpg.")
+                .and_then(|r| r.strip_suffix(".program")),
+            Some("openpgp" | "x509" | "ssh")
+        ),
+    }
 }
 
 /// Whether `key` must be removed from the environment of a chezmoi invocation.
@@ -162,11 +181,42 @@ mod tests {
     }
 
     #[test]
+    fn forwarded_git_keys_are_identity_and_signing_only() {
+        for k in [
+            "user.name",
+            "user.email",
+            "user.signingkey",
+            "commit.gpgsign",
+            "gpg.format",
+            "gpg.program",
+            "gpg.ssh.program",
+            "gpg.openpgp.program",
+            "gpg.x509.program",
+        ] {
+            assert!(is_forwarded_git_key(k), "{k}");
+        }
+        for k in [
+            "core.hooksPath",
+            "core.fsmonitor",
+            "core.sshcommand",
+            "url.https://x/.insteadof",
+            "alias.st",
+            "gpg.ssh.allowedsignersfile",
+            "gpg.evil.program",
+            "user.useconfigonly",
+            "include.path",
+        ] {
+            assert!(!is_forwarded_git_key(k), "{k}");
+        }
+    }
+
+    #[test]
     fn scrubbing_rules() {
         assert!(is_scrubbed_for_git("GIT_DIR"));
         assert!(is_scrubbed_for_git("GIT_CONFIG_GLOBAL"));
         assert!(!is_scrubbed_for_git("GIT_SSH_COMMAND"));
         assert!(!is_scrubbed_for_git("PATH"));
+        assert!(is_scrubbed_for_git("GIT_CONFIG_COUNT"));
         assert!(is_scrubbed_for_chezmoi("CHEZMOI_SOURCE_DIR"));
         assert!(!is_scrubbed_for_chezmoi("HOME"));
     }

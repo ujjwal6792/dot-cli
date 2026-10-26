@@ -65,7 +65,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
     let branch = trimmed(store, &["rev-parse", "--abbrev-ref", "HEAD"], cancel);
     let head = trimmed(store, &["rev-parse", "--short", "HEAD"], cancel);
     let changed_paths = store
-        .git_cancellable(&["status", "--porcelain"], cancel)?
+        .git_cancellable(&["--no-optional-locks", "status", "--porcelain"], cancel)?
         .stdout
         .lines()
         .count();

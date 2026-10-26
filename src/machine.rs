@@ -117,10 +117,11 @@ pub fn validate_name(name: &str) -> Result<()> {
         && !name.starts_with('-')
         && !name.ends_with('-');
     if !ok {
-        bail!(
+        return Err(crate::error::DwError::usage(format!(
             "invalid machine name {name:?}: use 1-63 characters from a-z, 0-9 and '-', \
              not starting or ending with '-'"
-        );
+        ))
+        .into());
     }
     Ok(())
 }

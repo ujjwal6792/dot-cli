@@ -68,6 +68,18 @@ impl Dirs {
     pub fn chezmoi_cache(&self) -> PathBuf {
         self.cache.join("dotwarden").join("chezmoi")
     }
+    /// Dotwarden's own machine-local directories, wherever XDG puts them.
+    pub fn own_dirs(&self) -> Vec<PathBuf> {
+        vec![
+            self.data_dir(),
+            self.state_dir(),
+            self.cache.join("dotwarden"),
+        ]
+    }
+    /// The mutation lock file.
+    pub fn lock_file(&self) -> PathBuf {
+        self.state_dir().join("lock")
+    }
     /// This machine's registry name and local confirmations.
     pub fn machine_toml(&self) -> PathBuf {
         self.state_dir().join("machine.toml")

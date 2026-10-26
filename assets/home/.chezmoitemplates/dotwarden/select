@@ -1,0 +1,22 @@
+{{- /* Specificity selection shared by variants and values: machine >
+       distribution > family > platform. Call with
+       (dict "targets" <this machine's targets> "entries" <list of dicts with a
+       .target> "what" "<label for errors>"). Prints the winning entry as JSON,
+       or nothing when no entry matches. Two matches at the best level are an
+       error; ties at a lower level do not matter when a more specific entry
+       matches. An entry whose target kind is unknown never matches. */ -}}
+{{- $levels := dict "platform" 1 "family" 2 "distribution" 3 "machine" 4 -}}
+{{- $best := 0 -}}
+{{- $winner := dict -}}
+{{- $ties := list -}}
+{{- range .entries -}}
+{{- $level := get $levels (index (splitList ":" .target) 0) | default 0 -}}
+{{- if and (gt $level 0) (has .target $.targets) -}}
+{{- if gt $level $best }}{{ $best = $level }}{{ $winner = . }}{{ $ties = list .target }}
+{{- else if eq $level $best }}{{ $ties = append $ties .target }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $ties) 1 -}}
+{{- fail (printf "dotwarden: ambiguous %s at the same specificity: %s" .what (join ", " $ties)) -}}
+{{- end -}}
+{{- if $winner }}{{ toJson $winner }}{{ end -}}

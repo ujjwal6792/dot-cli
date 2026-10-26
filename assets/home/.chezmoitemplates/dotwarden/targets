@@ -1,13 +1,22 @@
 {{- /* JSON list of the targets the current machine matches, e.g.
        ["platform:linux","distribution:cachyos","family:arch-like","machine:laptop"].
        The machine's registry name comes from the generated chezmoi config
-       (data.dotwardenMachine.name); everything else from the registry. */ -}}
+       (data.dotwardenMachine.name); everything else from the registry.
+       Retired machines are not in any target: a retired machine is refused. */ -}}
 {{- if not (hasKey . "dotwardenMachine") -}}
 {{- fail "dotwarden: chezmoi data 'dotwardenMachine' is missing; run chezmoi through dotwarden" -}}
 {{- end -}}
 {{- $name := .dotwardenMachine.name -}}
 {{- $machine := dict -}}
-{{- range (dig "dotwarden" "machines" (list) .) }}{{ if eq .name $name }}{{ $machine = . }}{{ end }}{{ end -}}
+{{- $retired := false -}}
+{{- range (dig "dotwarden" "machines" (list) .) -}}
+{{- if eq .name $name -}}
+{{- if get . "retired" | default false }}{{ $retired = true }}{{ else }}{{ $machine = . }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- if $retired -}}
+{{- fail (printf "dotwarden: machine %q is retired and has no targets" $name) -}}
+{{- end -}}
 {{- if not $machine -}}
 {{- fail (printf "dotwarden: machine %q is not in the machine registry" $name) -}}
 {{- end -}}

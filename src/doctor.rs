@@ -2,6 +2,7 @@
 
 use serde::Serialize;
 
+use crate::assign;
 use crate::exec;
 use crate::paths::tilde;
 use crate::pins;
@@ -12,6 +13,8 @@ use crate::store::Store;
 pub struct Check {
     pub name: String,
     pub ok: bool,
+    /// A finding worth showing that does not make the report fail.
+    pub warning: bool,
     pub detail: String,
 }
 
@@ -25,6 +28,7 @@ fn check(name: &str, ok: bool, detail: impl Into<String>) -> Check {
     Check {
         name: name.into(),
         ok,
+        warning: false,
         detail: detail.into(),
     }
 }
@@ -90,12 +94,12 @@ pub fn run(store: &Store) -> Report {
         &t.delta(),
     ));
 
-    let name = store.git_global("user.name");
-    let email = store.git_global("user.email");
+    let name = store.git_identity_value("user.name");
+    let email = store.git_identity_value("user.email");
     checks.push(check(
         "git identity",
         name.is_some() && email.is_some(),
-        match (&name, &email) {
+        match (name, email) {
             (Some(n), Some(e)) => format!("{n} <{e}> (from the global git config)"),
             _ => "user.name/user.email missing from the global git config".into(),
         },
@@ -158,17 +162,48 @@ pub fn run(store: &Store) -> Report {
                         ),
                     ));
                 }
-                checks.push(match store.chezmoi(&["managed"]) {
-                    Ok(o) => check(
-                        "chezmoi templates",
-                        true,
-                        format!(
-                            "{} target(s) apply to this machine",
-                            o.stdout.lines().count()
+                let expected = s
+                    .machine
+                    .as_ref()
+                    .and_then(|m| Store::chezmoi_config_body(&m.name).ok());
+                let on_disk = std::fs::read_to_string(d.chezmoi_config()).ok();
+                let config_ok = expected.is_some() && expected == on_disk;
+                checks.push(check(
+                    "chezmoi config",
+                    config_ok,
+                    if config_ok {
+                        "matches the registered machine".to_string()
+                    } else {
+                        "missing or stale; it is regenerated when the machine is registered"
+                            .to_string()
+                    },
+                ));
+                match assign::unknown_targets(&store.repo()) {
+                    Ok(unknown) if !unknown.is_empty() => {
+                        let mut c = check(
+                            "targets",
+                            true,
+                            format!("unknown target kinds never match: {}", unknown.join("; ")),
+                        );
+                        c.warning = true;
+                        checks.push(c);
+                    }
+                    Ok(_) => {}
+                    Err(e) => checks.push(check("targets", false, format!("{e:#}"))),
+                }
+                if config_ok {
+                    checks.push(match store.chezmoi(&["managed"]) {
+                        Ok(o) => check(
+                            "chezmoi templates",
+                            true,
+                            format!(
+                                "{} target(s) apply to this machine",
+                                o.stdout.lines().count()
+                            ),
                         ),
-                    ),
-                    Err(e) => check("chezmoi templates", false, format!("{e:#}")),
-                });
+                        Err(e) => check("chezmoi templates", false, format!("{e:#}")),
+                    });
+                }
             }
             Err(e) => checks.push(check("repository state", false, format!("{e:#}"))),
         }

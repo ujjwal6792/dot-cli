@@ -139,36 +139,3 @@ fn a_fresh_home_gets_no_chezmoi_directories() {
             .exists()
     );
 }
-
-#[test]
-fn git_ignores_system_config_and_git_environment_but_reads_global_identity() {
-    let mut t = TestEnv::new();
-    t.set("GIT_DIR", "/nonexistent")
-        .set("GIT_WORK_TREE", "/nonexistent")
-        .set("GIT_CONFIG_GLOBAL", "/nonexistent");
-    let cmd = t.store().git_command(&t.home);
-    let envs: std::collections::HashMap<String, Option<String>> = cmd
-        .get_envs()
-        .map(|(k, v)| {
-            (
-                k.to_string_lossy().into(),
-                v.map(|v| v.to_string_lossy().into()),
-            )
-        })
-        .collect();
-    assert_eq!(
-        envs.get("GIT_CONFIG_NOSYSTEM"),
-        Some(&Some("1".to_string()))
-    );
-    for k in ["GIT_DIR", "GIT_WORK_TREE", "GIT_CONFIG_GLOBAL"] {
-        assert!(!envs.contains_key(k), "{k} leaked");
-    }
-    assert!(envs.contains_key("GIT_EXEC_PATH"));
-    // Identity still comes from ~/.gitconfig.
-    assert_eq!(
-        t.store().git_global("user.name").as_deref(),
-        Some("Test User")
-    );
-    // And init works even with those variables set in the caller's environment.
-    t.dw_ok(&["init", "--name", "scrub"]);
-}

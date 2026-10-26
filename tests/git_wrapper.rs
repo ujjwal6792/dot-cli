@@ -44,7 +44,7 @@ fn clone_over_file_url_and_plain_path() {
     }
 }
 
-/// Needs the network: set DOTWARDEN_NET_TESTS=1 (the Docker harness does).
+/// Needs the network: set DOTWARDEN_NET_TESTS=1.
 #[test]
 fn clone_over_https() {
     if std::env::var_os("DOTWARDEN_NET_TESTS").is_none() {

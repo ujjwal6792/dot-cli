@@ -24,12 +24,19 @@ pub struct Registration {
     pub created: bool,
 }
 
+/// Repository files `dw init` creates, relative to the repository root.
+pub fn layout_paths() -> Vec<String> {
+    let mut v: Vec<String> = [".chezmoiroot", "dotwarden.toml", "hide", DATA_FILE]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+    v.extend(templates::FILES.iter().map(|(rel, _)| rel.to_string()));
+    v
+}
+
 fn write(root: &Path, rel: &str, content: &str) -> Result<()> {
     let path = root.join(rel);
-    if let Some(parent) = path.parent() {
-        fs::create_dir_all(parent).with_context(|| format!("creating {}", parent.display()))?;
-    }
-    fs::write(&path, content).with_context(|| format!("writing {}", path.display()))
+    crate::fsutil::write_atomic(&path, content)
 }
 
 /// Write the §3 repository layout into `root` (which must exist).
@@ -47,11 +54,15 @@ pub fn write_layout(root: &Path, branch: &str) -> Result<()> {
     write(
         root,
         DATA_FILE,
-        &format!("[dotwarden]\nformat = {FORMAT_VERSION}\nmachines = []\n"),
+        &format!(
+            "# Machine registry, assignments, variants and values (see docs/spec.md §4).\n\
+             # Edited by dotwarden and by hand; comments and ordering are preserved.\n\
+             [dotwarden]\nformat = {FORMAT_VERSION}\n"
+        ),
     )
 }
 
-fn require_empty_repo_location(store: &Store) -> Result<()> {
+pub fn require_empty_repo_location(store: &Store) -> Result<()> {
     let repo = store.repo();
     let occupied = repo.exists()
         && (!repo.is_dir()
@@ -67,8 +78,10 @@ fn require_empty_repo_location(store: &Store) -> Result<()> {
     Ok(())
 }
 
-fn require_git_identity(store: &Store) -> Result<()> {
-    if store.git_global("user.name").is_none() || store.git_global("user.email").is_none() {
+pub fn require_git_identity(store: &Store) -> Result<()> {
+    if store.git_identity_value("user.name").is_none()
+        || store.git_identity_value("user.email").is_none()
+    {
         bail!(
             "git identity is not configured; run `git config --global user.name \"Your Name\"` \
              and `git config --global user.email you@example.com` (dotwarden reads ~/.gitconfig)"
@@ -152,16 +165,80 @@ pub fn read_registry(repo: &Path) -> Result<Vec<Machine>> {
     list.try_into().context("parsing the machine registry")
 }
 
-/// Replace the registry, preserving every other key of the data file.
-pub fn write_registry(repo: &Path, machines: &[Machine]) -> Result<()> {
-    let mut data = load_data(repo)?;
-    let dw = data
-        .entry("dotwarden")
-        .or_insert_with(|| toml::Value::Table(toml::Table::new()))
+/// Edit the data file as a TOML document: comments, ordering and formatting
+/// of everything not touched survive. The write is atomic.
+pub fn edit_data(
+    repo: &Path,
+    edit: impl FnOnce(&mut toml_edit::DocumentMut) -> Result<()>,
+) -> Result<()> {
+    let path = repo.join(DATA_FILE);
+    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+    let mut doc: toml_edit::DocumentMut = text
+        .parse()
+        .with_context(|| format!("parsing {}", path.display()))?;
+    edit(&mut doc)?;
+    crate::fsutil::write_atomic(&path, doc.to_string())
+}
+
+/// The `[dotwarden]` table of the data file, created if missing.
+pub fn dotwarden_table(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edit::Table> {
+    doc.entry("dotwarden")
+        .or_insert_with(|| toml_edit::Item::Table(toml_edit::Table::new()))
         .as_table_mut()
-        .context("`dotwarden` in the data file is not a table")?;
-    dw.insert("machines".into(), toml::Value::try_from(machines)?);
-    write(repo, DATA_FILE, &toml::to_string(&data)?)
+        .context("`dotwarden` in the data file is not a table")
+}
+
+fn set_str(t: &mut toml_edit::Table, key: &str, v: &str) {
+    if t.get(key).and_then(toml_edit::Item::as_str) != Some(v) {
+        t[key] = toml_edit::value(v);
+    }
+}
+
+/// Replace the registry (`[[dotwarden.machines]]`) in place, leaving every other
+/// key, comment and the order of the file untouched.
+pub fn write_registry(repo: &Path, machines: &[Machine]) -> Result<()> {
+    edit_data(repo, |doc| {
+        let dw = dotwarden_table(doc)?;
+        let item = dw
+            .entry("machines")
+            .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
+        if !item.is_array_of_tables() {
+            *item = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+        }
+        let list = item.as_array_of_tables_mut().expect("just ensured");
+        while list.len() > machines.len() {
+            list.remove(list.len() - 1);
+        }
+        for (i, m) in machines.iter().enumerate() {
+            if i >= list.len() {
+                list.push(toml_edit::Table::new());
+            }
+            let t = list.get_mut(i).expect("in range");
+            set_str(t, "name", &m.name);
+            set_str(t, "platform", &m.platform);
+            set_str(t, "distribution", &m.distribution);
+            let same = t
+                .get("families")
+                .and_then(toml_edit::Item::as_array)
+                .is_some_and(|a| {
+                    a.iter()
+                        .filter_map(toml_edit::Value::as_str)
+                        .eq(m.families.iter().map(String::as_str))
+                });
+            if !same {
+                t["families"] = toml_edit::value(
+                    m.families
+                        .iter()
+                        .map(String::as_str)
+                        .collect::<toml_edit::Array>(),
+                );
+            }
+            if t.get("retired").and_then(toml_edit::Item::as_bool) != Some(m.retired) {
+                t["retired"] = toml_edit::value(m.retired);
+            }
+        }
+        Ok(())
+    })
 }
 
 /// Register this computer under `name` (spec §4) and commit the registry.

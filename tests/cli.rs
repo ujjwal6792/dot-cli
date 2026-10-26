@@ -65,7 +65,7 @@ fn init_creates_the_spec_layout_and_registers_the_machine() {
 fn init_refuses_to_overwrite_and_rejects_bad_names() {
     let t = TestEnv::new();
     let bad = t.dw(&["init", "--name", "Bad Name"]);
-    assert_eq!(bad.status.code(), Some(1));
+    assert_eq!(bad.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&bad.stderr).contains("invalid machine name"));
     assert!(!t.dirs().repo().exists(), "no half-created repository");
 
@@ -79,7 +79,7 @@ fn init_refuses_to_overwrite_and_rejects_bad_names() {
 fn init_without_a_name_on_a_non_terminal_fails_clearly() {
     let t = TestEnv::new();
     let o = t.dw(&["init"]);
-    assert_eq!(o.status.code(), Some(1));
+    assert_eq!(o.status.code(), Some(2));
     assert!(String::from_utf8_lossy(&o.stderr).contains("--name"));
 }
 
@@ -241,4 +241,190 @@ fn the_dw_alias_is_the_same_program() {
         assert!(help.contains(sub), "{sub}");
     }
     t.dw_ok(&["--version"]);
+}
+
+// ---- spec §9: dry-run, lock, typed errors -------------------------------
+
+use common::snapshot;
+use std::time::{Duration, Instant};
+
+#[test]
+fn init_dry_run_reports_the_plan_and_changes_nothing() {
+    let t = TestEnv::new();
+    let before = snapshot(&t.root.path().canonicalize().unwrap());
+    let plan = t.dw_json(&["init", "--dry-run", "--name", "drybox"]);
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["command"], "init");
+    assert_eq!(plan["machine"]["name"], "drybox");
+    let files: Vec<_> = plan["files"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|f| f.as_str().unwrap())
+        .collect();
+    for f in [
+        ".chezmoiroot",
+        "hide",
+        "home/.chezmoiignore",
+        "home/.chezmoitemplates/dotwarden/select",
+    ] {
+        assert!(files.contains(&f), "{f} missing from {files:?}");
+    }
+    let human = t.dw_ok(&["init", "--dry-run", "--name", "drybox"]);
+    assert!(
+        human.contains("Dry run") && human.contains("register machine drybox"),
+        "{human}"
+    );
+    // A name is not needed (and not prompted for) in a dry run.
+    let unnamed = t.dw_json(&["init", "--dry-run"]);
+    assert_eq!(unnamed["machine"], serde_json::Value::Null);
+    assert_eq!(
+        snapshot(&t.root.path().canonicalize().unwrap()),
+        before,
+        "dry run wrote something"
+    );
+    assert!(!t.dirs().repo().exists() && !t.dirs().state_dir().exists());
+
+    // It fails the same way the real command would.
+    t.dw_ok(&["init", "--name", "real"]);
+    let again = t.dw(&["init", "--dry-run", "--name", "x"]);
+    assert_eq!(again.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&again.stderr).contains("already exists"));
+    let bad = t.dw(&["init", "--dry-run", "--name", "Bad"]);
+    assert_eq!(bad.status.code(), Some(2));
+}
+
+#[test]
+fn clone_dry_run_reports_the_plan_without_touching_the_network_or_disk() {
+    let t = TestEnv::new();
+    let before = snapshot(&t.root.path().canonicalize().unwrap());
+    let plan = t.dw_json(&[
+        "clone",
+        "https://example.invalid/never-contacted.git",
+        "--dry-run",
+        "--name",
+        "c",
+    ]);
+    assert_eq!(plan["dry_run"], true);
+    assert_eq!(plan["command"], "clone");
+    assert_eq!(plan["url"], "https://example.invalid/never-contacted.git");
+    assert_eq!(plan["machine"]["name"], "c");
+    let human = t.dw_ok(&["clone", "x", "--dry-run", "--name", "c", "--adopt"]);
+    assert!(
+        human.contains("Dry run") && human.contains("adopting"),
+        "{human}"
+    );
+    assert_eq!(snapshot(&t.root.path().canonicalize().unwrap()), before);
+}
+
+#[test]
+fn mutations_wait_for_the_lock_and_read_only_commands_do_not_take_it() {
+    let mut t = TestEnv::new();
+    t.set(dotwarden::lock::WAIT_ENV, "400");
+    let lock_file = t.dirs().lock_file();
+    let held = dotwarden::lock::acquire(&lock_file, Duration::from_secs(1)).unwrap();
+
+    // Read-only commands and dry runs go straight through.
+    let start = Instant::now();
+    t.dw_ok(&["status"]);
+    t.dw_ok(&["doctor"]);
+    t.dw_ok(&["init", "--dry-run", "--name", "x"]);
+    assert!(start.elapsed() < Duration::from_secs(5));
+
+    // A mutation waits, then gives up with a plain error.
+    let start = Instant::now();
+    let o = t.dw(&["init", "--name", "blocked"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(
+        start.elapsed() >= Duration::from_millis(350),
+        "did not wait: {:?}",
+        start.elapsed()
+    );
+    assert!(String::from_utf8_lossy(&o.stderr).contains("another dotwarden command"));
+    assert!(!t.dirs().repo().exists());
+
+    // With a longer wait it succeeds once the holder lets go.
+    t.set(dotwarden::lock::WAIT_ENV, "8000");
+    let releaser = std::thread::spawn(move || {
+        std::thread::sleep(Duration::from_millis(600));
+        drop(held);
+    });
+    let start = Instant::now();
+    t.dw_ok(&["init", "--name", "waited"]);
+    assert!(start.elapsed() >= Duration::from_millis(500));
+    releaser.join().unwrap();
+    assert!(t.dirs().repo().join(".chezmoiroot").is_file());
+}
+
+#[test]
+fn errors_carry_exit_codes_and_json_error_objects() {
+    let t = TestEnv::new();
+    // Usage error (bad machine name): code 2.
+    let o = t.dw(&["init", "--name", "Bad Name", "--json"]);
+    assert_eq!(o.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).expect("JSON on stdout");
+    assert_eq!(v["error"]["code"], 2);
+    assert_eq!(v["error"]["kind"], "usage");
+    assert!(
+        v["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("invalid machine name")
+    );
+    assert!(
+        o.stderr.is_empty(),
+        "{}",
+        String::from_utf8_lossy(&o.stderr)
+    );
+
+    // clap's own usage errors are JSON too, with code 2.
+    let o = t.dw(&["--json", "no-such-command"]);
+    assert_eq!(o.status.code(), Some(2));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(v["error"]["kind"], "usage");
+    // Without --json they stay on stderr.
+    let o = t.dw(&["no-such-command"]);
+    assert_eq!(o.status.code(), Some(2));
+    assert!(o.stdout.is_empty());
+
+    // A plain failure: code 1, kind "error".
+    t.dw_ok(&["init", "--name", "one"]);
+    let o = t.dw(&["init", "--name", "two", "--json"]);
+    assert_eq!(o.status.code(), Some(1));
+    let v: serde_json::Value = serde_json::from_slice(&o.stdout).unwrap();
+    assert_eq!(
+        (v["error"]["code"].as_i64(), v["error"]["kind"].as_str()),
+        (Some(1), Some("error"))
+    );
+
+    // Help and version still succeed with --json.
+    assert!(t.dw(&["--json", "--help"]).status.success());
+}
+
+#[test]
+fn status_and_doctor_write_nothing() {
+    let t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "ro"]);
+    let repo = t.dirs().repo();
+    let root = t.root.path().canonicalize().unwrap();
+
+    // Healthy: nothing is created, rewritten or touched, not even the git index.
+    // (Rewrite a tracked file with identical content so a refresh would show.)
+    std::thread::sleep(Duration::from_millis(1100));
+    fs::write(repo.join(".chezmoiroot"), "home\n").unwrap();
+    let before = snapshot(&root);
+    t.dw_ok(&["status"]);
+    t.dw_ok(&["status", "--json"]);
+    t.dw_ok(&["doctor"]);
+    assert_eq!(snapshot(&root), before, "a read-only command wrote to disk");
+
+    // A missing generated config is reported, never silently regenerated.
+    fs::remove_file(t.dirs().chezmoi_config()).unwrap();
+    let before = snapshot(&root);
+    t.dw_ok(&["status"]);
+    let o = t.dw(&["doctor"]);
+    assert_eq!(o.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&o.stdout).contains("[FAIL] chezmoi config"));
+    assert!(!t.dirs().chezmoi_config().exists());
+    assert_eq!(snapshot(&root), before);
 }

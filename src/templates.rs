@@ -5,6 +5,9 @@
 pub const CHEZMOIIGNORE: &str = include_str!("../assets/home/.chezmoiignore");
 /// `home/.chezmoitemplates/dotwarden/targets`: the current machine's targets.
 pub const TARGETS: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/targets");
+/// `home/.chezmoitemplates/dotwarden/select`: specificity selection shared by
+/// variants and (later) values.
+pub const SELECT: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/select");
 /// `home/.chezmoitemplates/dotwarden/variant`: most specific variant selection.
 pub const VARIANT: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/variant");
 
@@ -12,5 +15,6 @@ pub const VARIANT: &str = include_str!("../assets/home/.chezmoitemplates/dotward
 pub const FILES: &[(&str, &str)] = &[
     ("home/.chezmoiignore", CHEZMOIIGNORE),
     ("home/.chezmoitemplates/dotwarden/targets", TARGETS),
+    ("home/.chezmoitemplates/dotwarden/select", SELECT),
     ("home/.chezmoitemplates/dotwarden/variant", VARIANT),
 ];
