@@ -8,11 +8,35 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 
-use crate::error::{DwError, Kind};
-
 pub const DEFAULT_WAIT: Duration = Duration::from_secs(10);
 /// Overrides the wait in milliseconds (tests).
 pub const WAIT_ENV: &str = "DOTWARDEN_LOCK_WAIT_MS";
+
+/// The lock stayed held by another dotwarden command for the whole wait. Callers
+/// that can retry (the TUI) look for this to say "busy, try again".
+#[derive(Debug)]
+pub struct Busy(pub String);
+
+impl std::fmt::Display for Busy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for Busy {}
+
+pub fn is_busy(e: &anyhow::Error) -> bool {
+    e.chain().any(|c| c.downcast_ref::<Busy>().is_some())
+}
+
+/// Call right after releasing a lock you are about to take again: flock is not
+/// fair and waiters poll, so without a pause the next iteration would win every
+/// time and starve other commands.
+pub fn yield_to_waiters() {
+    thread::sleep(Duration::from_millis(3 * POLL.as_millis() as u64));
+}
+
+const POLL: Duration = Duration::from_millis(25);
 
 /// Held for as long as the value lives; released when dropped or the process exits.
 #[derive(Debug)]
@@ -38,6 +62,20 @@ pub fn acquire(path: &Path, wait: Duration) -> Result<Lock> {
         .write(true)
         .open(path)
         .with_context(|| format!("opening {}", path.display()))?;
+    lock_file(file, path, wait)
+}
+
+/// Like [`acquire`] but never creates anything: `None` when the lock file does
+/// not exist yet (read-only commands must not write).
+pub fn acquire_existing(path: &Path, wait: Duration) -> Result<Option<Lock>> {
+    match File::open(path) {
+        Ok(file) => lock_file(file, path, wait).map(Some),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).with_context(|| format!("opening {}", path.display())),
+    }
+}
+
+fn lock_file(file: File, path: &Path, wait: Duration) -> Result<Lock> {
     let deadline = Instant::now() + wait;
     loop {
         match file.try_lock() {
@@ -48,17 +86,13 @@ pub fn acquire(path: &Path, wait: Duration) -> Result<Lock> {
             }
         }
         if Instant::now() >= deadline {
-            return Err(DwError::new(
-                Kind::Error,
-                format!(
-                    "another dotwarden command has held the lock for more than {} s ({})",
-                    wait.as_secs_f32(),
-                    path.display()
-                ),
-            )
-            .into());
+            return Err(anyhow::Error::new(Busy(format!(
+                "another dotwarden command has held the lock for more than {} s ({})",
+                wait.as_secs_f32(),
+                path.display()
+            ))));
         }
-        thread::sleep(Duration::from_millis(25));
+        thread::sleep(POLL);
     }
 }
 

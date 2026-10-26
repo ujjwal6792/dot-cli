@@ -8,7 +8,6 @@ use serde::Serialize;
 use serde_json::json;
 
 use crate::error::{DwError, Kind};
-use crate::lock::Lock;
 use crate::pending::{self, Item};
 use crate::store::Store;
 use crate::track::{self, Ctx, ItemResult, Outcome, Plan};
@@ -69,7 +68,6 @@ fn results_exit(results: &[ItemResult]) -> ExitCode {
 /// Add planned items to the pending list, show them, or apply them at once.
 fn submit(
     store: &Store,
-    lock: &Lock,
     items: Vec<Item>,
     apply: bool,
     dry_run: bool,
@@ -100,7 +98,7 @@ fn submit(
         return Ok(ExitCode::SUCCESS);
     }
     if apply {
-        let results = track::apply_items(store, lock, &items)?;
+        let results = track::apply_now(store, &items)?;
         if json {
             print_json(&json!({"dry_run": false, "applied": results}))?;
         } else {
@@ -108,7 +106,12 @@ fn submit(
         }
         return Ok(results_exit(&results));
     }
-    let added = pending::add(store, lock, items)?;
+    // Planning ran without the lock; under it the items must still be fresh.
+    let lock = store.lock()?;
+    track::recheck(store, &lock, &items)?;
+    let ctx = Ctx::load(store)?;
+    let stale = track::stale_checker(store, &ctx);
+    let added = pending::add(store, &lock, items, &stale)?;
     if json {
         print_json(&json!({"dry_run": false, "added": added}))?;
     } else {
@@ -117,6 +120,8 @@ fn submit(
                 "{} {}: {}{}",
                 if a.already_pending {
                     "Already pending"
+                } else if a.replaced {
+                    "Replaced the stale item"
                 } else {
                     "Added"
                 },
@@ -144,9 +149,8 @@ pub fn track_cmd(
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     let requester = pending::requester(store);
-    let lock = store.lock()?;
     let items = track::plan_paths(store, plan, paths, &cwd()?, &requester)?;
-    submit(store, &lock, items, apply, dry_run, json)
+    submit(store, items, apply, dry_run, json)
 }
 
 pub fn hide_cmd(
@@ -159,7 +163,6 @@ pub fn hide_cmd(
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     let requester = pending::requester(store);
-    let lock = store.lock()?;
     let ctx = Ctx::load(store)?;
     let mut items = Vec::new();
     for p in patterns {
@@ -171,7 +174,7 @@ pub fn hide_cmd(
             items.push(item);
         }
     }
-    submit(store, &lock, items, apply, dry_run, json)
+    submit(store, items, apply, dry_run, json)
 }
 
 pub fn hide_list(store: &Store, json: bool) -> Result<ExitCode> {
@@ -188,6 +191,16 @@ pub fn hide_list(store: &Store, json: bool) -> Result<ExitCode> {
 }
 
 // ---- pending ---------------------------------------------------------------
+
+fn no_ids(verb: &str, store: &Store) -> anyhow::Error {
+    let n = pending::load(store).map_or(0, |l| l.items.len());
+    DwError::usage(format!(
+        "no item numbers given. There {} {n} pending item(s) (see `dw pending list`): \
+         name the ones to {verb}, or run `dw pending {verb} --all` to {verb} every one of them",
+        if n == 1 { "is" } else { "are" },
+    ))
+    .into()
+}
 
 pub fn pending_list(store: &Store, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
@@ -244,9 +257,9 @@ pub fn pending_drop(
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     if ids.is_empty() && !all {
-        return Err(DwError::usage("name the items to drop, or pass --all").into());
+        return Err(no_ids("drop", store));
     }
-    let lock = store.lock()?;
+    let lock = if dry_run { None } else { Some(store.lock()?) };
     let ids: Vec<u64> = if all {
         pending::load(store)?
             .items
@@ -262,7 +275,7 @@ pub fn pending_drop(
             .map(|i| list.get(*i).cloned().ok_or_else(|| pending::not_found(*i)))
             .collect::<Result<Vec<_>>>()?
     } else {
-        pending::drop_items(store, &lock, &ids)?
+        pending::drop_items(store, lock.as_ref().expect("held unless dry-run"), &ids)?
     };
     if json {
         print_json(&json!({"dry_run": dry_run, "dropped": gone}))?;
@@ -291,7 +304,7 @@ pub fn pending_apply(
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     if ids.is_empty() && !all {
-        return Err(DwError::usage("name the items to apply, or pass --all").into());
+        return Err(no_ids("apply", store));
     }
     if dry_run {
         let list = pending::load(store)?;

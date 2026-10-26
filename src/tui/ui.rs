@@ -32,6 +32,10 @@ const HELP: &[(&str, &str)] = &[
         "Files: track / untrack (adds or drops a pending item)",
     ),
     ("v", "Files: start / end a range selection, then Space"),
+    (
+        "i",
+        "Files: hide (or un-hide) the path through a pending hide item",
+    ),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
     ("Enter (Pending)", "review and apply all checked items"),

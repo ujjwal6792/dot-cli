@@ -1278,3 +1278,444 @@ fn commands_need_an_initialised_repository() {
         assert!(r.err.contains("not initialised"), "{}", r.err);
     }
 }
+
+// ---- review fixes ---------------------------------------------------------------------
+
+fn entry_keys(t: &TestEnv) -> BTreeSet<String> {
+    let out = t
+        .store()
+        .chezmoi(&["state", "dump", "--format", "json"])
+        .unwrap()
+        .stdout;
+    let v: Value = serde_json::from_str(&out).unwrap();
+    v["entryState"]
+        .as_object()
+        .map(|o| o.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+fn key(t: &TestEnv, rel: &str) -> String {
+    t.home.join(rel).display().to_string()
+}
+
+/// A libexec whose chezmoi sleeps before `add` (not before a dry run) and then
+/// runs the real one; git is the real one.
+fn slow_add_libexec(t: &TestEnv, seconds: &str) -> std::path::PathBuf {
+    let fake = t.root.path().join("slow-libexec");
+    fs::create_dir_all(&fake).unwrap();
+    let _ = symlink(common::libexec().join("git"), fake.join("git"));
+    let script = format!(
+        "#!/bin/sh\nadd=0; dry=0\nfor a in \"$@\"; do [ \"$a\" = add ] && add=1; [ \"$a\" = --dry-run ] && dry=1; done\n\
+         [ $add = 1 ] && [ $dry = 0 ] && sleep {seconds}\nexec {} \"$@\"\n",
+        common::libexec().join("chezmoi").display()
+    );
+    fs::write(fake.join("chezmoi"), script).unwrap();
+    fs::set_permissions(fake.join("chezmoi"), fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+fn dw_with(t: &TestEnv, extra: &[(&str, &str)], args: &[&str]) -> Run {
+    let o = Command::new(env!("CARGO_BIN_EXE_dotwarden"))
+        .args(args)
+        .env_clear()
+        .envs(&t.env)
+        .envs(extra.iter().copied())
+        .current_dir(&t.home)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    Run {
+        code: o.status.code().unwrap(),
+        out: String::from_utf8_lossy(&o.stdout).into_owned(),
+        err: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+// 1. case ------------------------------------------------------------------------------
+
+#[test]
+fn a_path_spelled_with_the_wrong_case_is_refused_naming_the_real_spelling() {
+    let t = setup();
+    write(&t, ".Zshrc", "z");
+    write(&t, "Dir/inner", "i");
+    let insensitive = t.home.join(".ZSHRC").exists();
+    if insensitive {
+        let r = dw(&t, &["track", "~/.ZSHRC"]);
+        assert_eq!(r.code, 2, "{}{}", r.out, r.err);
+        assert!(
+            r.err.contains("~/.Zshrc") && r.err.contains("ignores case"),
+            "{}",
+            r.err
+        );
+        let r = dw(&t, &["track", "dir/inner"]);
+        assert_eq!(r.code, 2, "{}", r.err);
+        assert!(
+            r.err.contains("~/Dir/inner"),
+            "the folder part too: {}",
+            r.err
+        );
+        let r = dw(&t, &["untrack", ".ZSHRC"]);
+        assert_eq!(r.code, 2, "{}", r.err);
+        assert!(pending_ids(&t).is_empty());
+        assert!(!repo(&t).join("home/dot_ZSHRC").exists());
+    }
+    // The exact spelling always works and records the real name.
+    ok(&t, &["track", ".Zshrc", "Dir/inner", "--apply"]);
+    assert!(repo(&t).join("home/dot_Zshrc").is_file());
+    assert!(managed(&t).contains(".Zshrc"));
+    // A path that does not exist is not a case problem.
+    assert_eq!(dw(&t, &["track", ".NoSuch"]).code, 1);
+}
+
+// 2. symlinked HOME and canonical paths ------------------------------------------------------
+
+#[test]
+fn absolute_paths_through_a_symlink_to_home_are_not_outside_home() {
+    let t = setup();
+    write(&t, ".zshrc", "z");
+    write(&t, ".config/app/a", "a");
+    let alias = t.root.path().canonicalize().unwrap().join("alias");
+    symlink(&t.home, &alias).unwrap();
+    let via = alias.join(".zshrc");
+    let j = ok(&t, &["track", via.to_str().unwrap(), "--dry-run", "--json"]).json();
+    assert_eq!(j["items"][0]["item"]["path"], ".zshrc");
+    let via_dir = alias.join(".config/app");
+    let r = ok(
+        &t,
+        &["track", via_dir.to_str().unwrap(), "--apply", "--json"],
+    );
+    assert_eq!(r.json()["applied"][0]["status"], "applied");
+    assert!(managed(&t).contains(".config/app/a"));
+    let r = ok(
+        &t,
+        &["ls", alias.join(".config").to_str().unwrap(), "--json"],
+    );
+    assert_eq!(r.json()["path"], "~/.config");
+    let r = ok(
+        &t,
+        &["untrack", via_dir.to_str().unwrap(), "--dry-run", "--json"],
+    );
+    assert_eq!(r.json()["items"][0]["item"]["path"], ".config/app");
+}
+
+#[test]
+fn a_symlinked_home_accepts_its_canonical_and_its_symlinked_spelling() {
+    let mut t = TestEnv::new();
+    let link = t.root.path().canonicalize().unwrap().join("home-link");
+    symlink(&t.home, &link).unwrap();
+    t.set("HOME", link.clone());
+    t.dw_ok(&["init", "--name", "testbox"]);
+    fs::write(t.home.join(".zshrc"), "z").unwrap();
+    for spelled in [t.home.join(".zshrc"), link.join(".zshrc")] {
+        let j = ok(
+            &t,
+            &["track", spelled.to_str().unwrap(), "--dry-run", "--json"],
+        )
+        .json();
+        assert_eq!(j["items"][0]["item"]["path"], ".zshrc", "{spelled:?}");
+    }
+    // Symlinks *below* HOME are still not followed.
+    fs::create_dir_all(t.home.join("real")).unwrap();
+    fs::write(t.home.join("real/f"), "f").unwrap();
+    symlink("real", t.home.join("via")).unwrap();
+    assert_eq!(
+        dw(&t, &["track", link.join("via/f").to_str().unwrap()]).code,
+        2
+    );
+}
+
+// 3. chezmoi's last-written state ---------------------------------------------------------------
+
+#[test]
+fn a_rolled_back_track_restores_chezmoi_state() {
+    let t = setup();
+    write(&t, ".kept", "k");
+    ok(&t, &["track", ".kept", "--apply"]);
+    write(&t, "bad/x", "x");
+    let store = t.store();
+    let mut items = dotwarden::track::plan_paths(
+        &store,
+        dotwarden::track::Plan::Track,
+        &["bad".to_string()],
+        &t.home,
+        "human",
+    )
+    .unwrap();
+    items[0].preview.files[0].source = "home/bogus".into();
+    let before = entry_keys(&t);
+    assert!(before.contains(&key(&t, ".kept")));
+    let results = dotwarden::track::apply_now(&store, &items).unwrap();
+    assert_eq!(results[0].status, dotwarden::track::Outcome::Failed);
+    assert_eq!(
+        entry_keys(&t),
+        before,
+        "chezmoi remembers nothing of the failed item"
+    );
+    assert_eq!(t.store().chezmoi(&["status"]).unwrap().stdout.trim(), "");
+}
+
+#[test]
+fn untracking_cleans_the_state_of_files_and_of_folders_left_empty() {
+    let t = setup();
+    write(&t, "a/b/f", "f");
+    write(&t, "a/g", "g");
+    ok(&t, &["track", "a/b/f", "a/g", "--apply"]);
+    for k in ["a", "a/b", "a/b/f", "a/g"] {
+        assert!(entry_keys(&t).contains(&key(&t, k)), "{k} before");
+    }
+    ok(&t, &["untrack", "a/b/f", "--apply"]);
+    let keys = entry_keys(&t);
+    assert!(
+        !keys.contains(&key(&t, "a/b/f")) && !keys.contains(&key(&t, "a/b")),
+        "{keys:?}"
+    );
+    assert!(
+        keys.contains(&key(&t, "a/g")) && keys.contains(&key(&t, "a")),
+        "{keys:?}"
+    );
+    ok(&t, &["untrack", "a/g", "--apply"]);
+    let keys = entry_keys(&t);
+    assert!(keys.iter().all(|k| !k.contains("/a")), "{keys:?}");
+    // Still consistent: tracking again works and chezmoi sees nothing to apply.
+    ok(&t, &["track", "a/b/f", "--apply"]);
+    assert_eq!(t.store().chezmoi(&["status"]).unwrap().stdout.trim(), "");
+}
+
+#[test]
+fn state_cleanup_leaves_entries_of_paths_that_were_tracked_again_meanwhile() {
+    let t = setup();
+    write(&t, ".again", "x");
+    ok(&t, &["track", ".again", "--apply"]);
+    let store = t.store();
+    let fake = dotwarden::track::ItemResult {
+        id: None,
+        kind: "untrack",
+        summary: "x".into(),
+        status: dotwarden::track::Outcome::Applied,
+        message: None,
+        staged: vec![],
+        forgotten: vec![".again".into()],
+    };
+    let warnings = dotwarden::track::cleanup_state(&store, &[fake]);
+    assert!(warnings.is_empty(), "{warnings:?}");
+    assert!(
+        entry_keys(&t).contains(&key(&t, ".again")),
+        "still tracked: keep its state"
+    );
+}
+
+// 4. lock hold ---------------------------------------------------------------------------------
+
+#[test]
+fn planning_and_dry_runs_do_not_need_the_mutation_lock() {
+    let mut t = setup();
+    t.set("DOTWARDEN_LOCK_WAIT_MS", "300");
+    write(&t, ".a", "a");
+    let held = t.store().lock().unwrap();
+    // Previews never wait for a running mutation ...
+    let r = ok(&t, &["track", ".a", "--dry-run"]);
+    assert!(r.out.contains("home/dot_a"));
+    ok(&t, &["hide", "add", "/x/", "--dry-run"]);
+    // ... only storing the item does, and says so.
+    let r = dw(&t, &["track", ".a"]);
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("another dotwarden command"), "{}", r.err);
+    drop(held);
+    ok(&t, &["track", ".a"]);
+}
+
+#[test]
+fn slow_planning_does_not_block_other_commands() {
+    let mut t = setup();
+    write(&t, ".slow", "s");
+    // Planning (a dry run) is slow here: chezmoi sleeps before running.
+    let fake = t.root.path().join("slow-plan");
+    fs::create_dir_all(&fake).unwrap();
+    symlink(common::libexec().join("git"), fake.join("git")).unwrap();
+    fs::write(
+        fake.join("chezmoi"),
+        format!(
+            "#!/bin/sh\nsleep 2\nexec {} \"$@\"\n",
+            common::libexec().join("chezmoi").display()
+        ),
+    )
+    .unwrap();
+    fs::set_permissions(fake.join("chezmoi"), fs::Permissions::from_mode(0o755)).unwrap();
+    let env = t.env.clone();
+    let home = t.home.clone();
+    let fake2 = fake.clone();
+    let slow = std::thread::spawn(move || {
+        Command::new(env!("CARGO_BIN_EXE_dotwarden"))
+            .args(["track", ".slow"])
+            .env_clear()
+            .envs(&env)
+            .env("DOTWARDEN_LIBEXEC", &fake2)
+            .current_dir(&home)
+            .output()
+            .unwrap()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(500));
+    t.set("DOTWARDEN_LOCK_WAIT_MS", "600");
+    let start = std::time::Instant::now();
+    ok(&t, &["hide", "add", "/other/", "--apply"]);
+    assert!(
+        start.elapsed() < std::time::Duration::from_millis(1500),
+        "{:?}",
+        start.elapsed()
+    );
+    assert!(slow.join().unwrap().status.success());
+    assert_eq!(pending_ids(&t), [1]);
+}
+
+#[test]
+fn a_batch_releases_the_lock_between_items() {
+    let t = setup();
+    for f in [".a", ".b", ".c"] {
+        write(&t, f, f);
+    }
+    ok(&t, &["track", ".a", ".b", ".c"]);
+    let fake = slow_add_libexec(&t, "1.5");
+    let env = t.env.clone();
+    let home = t.home.clone();
+    let batch = std::thread::spawn(move || {
+        Command::new(env!("CARGO_BIN_EXE_dotwarden"))
+            .args(["pending", "apply", "--all"])
+            .env_clear()
+            .envs(&env)
+            .env("DOTWARDEN_LIBEXEC", &fake)
+            .current_dir(&home)
+            .output()
+            .unwrap()
+    });
+    std::thread::sleep(std::time::Duration::from_millis(400));
+    // The batch needs ~4.5 s; with the lock held throughout this would time out.
+    let started = std::time::Instant::now();
+    let r = dw_with(
+        &t,
+        &[("DOTWARDEN_LOCK_WAIT_MS", "3500")],
+        &["hide", "add", "/y/", "--dry-run"],
+    );
+    assert_eq!(r.code, 0);
+    let r = dw_with(
+        &t,
+        &[("DOTWARDEN_LOCK_WAIT_MS", "3500")],
+        &["pending", "drop", "--dry-run", "--all"],
+    );
+    assert_eq!(r.code, 0, "{}", r.err);
+    let r = dw_with(
+        &t,
+        &[("DOTWARDEN_LOCK_WAIT_MS", "3500")],
+        &["hide", "add", "/y/"],
+    );
+    assert_eq!(r.code, 0, "waited {:?}: {}", started.elapsed(), r.err);
+    assert!(started.elapsed() < std::time::Duration::from_millis(3500));
+    let o = batch.join().unwrap();
+    assert!(o.status.success(), "{}", String::from_utf8_lossy(&o.stderr));
+    assert_eq!(managed(&t).len(), 3);
+}
+
+// 5. stale items are replaced -----------------------------------------------------------------------
+
+#[test]
+fn a_fresh_request_replaces_a_stale_pending_item() {
+    let t = setup();
+    write(&t, ".a", "one");
+    ok(&t, &["track", ".a"]);
+    // Not stale yet: an identical request changes nothing.
+    let j = ok(&t, &["track", ".a", "--json"]).json();
+    assert_eq!(j["added"][0]["already_pending"], true);
+    write(&t, ".a", "changed since");
+    assert!(pending_json(&t)["items"][0]["stale"].is_string());
+
+    let j = ok(&t, &["track", ".a", "--json"]).json();
+    assert_eq!(j["added"][0]["replaced"], true);
+    assert_eq!(j["added"][0]["already_pending"], false);
+    assert_eq!(j["added"][0]["item"]["id"], 1, "keeps its id");
+    let list = pending_json(&t);
+    assert_eq!(list["items"].as_array().unwrap().len(), 1);
+    assert!(list["items"][0]["stale"].is_null());
+    let human = ok(&t, &["pending", "apply", "--all"]);
+    assert!(human.out.contains("applied"), "{}", human.out);
+    assert_eq!(
+        fs::read_to_string(repo(&t).join("home/dot_a")).unwrap(),
+        "changed since"
+    );
+}
+
+#[test]
+fn pending_commands_without_ids_say_how_to_proceed() {
+    let t = setup();
+    write(&t, ".a", "a");
+    ok(&t, &["track", ".a"]);
+    for verb in ["apply", "drop"] {
+        let r = dw(&t, &["pending", verb]);
+        assert_eq!(r.code, 2);
+        assert!(
+            r.err.contains(&format!("dw pending {verb} --all")) && r.err.contains("1 pending item"),
+            "{}",
+            r.err
+        );
+    }
+}
+
+// 7. folder assignments --------------------------------------------------------------------------------
+
+#[test]
+fn untracking_a_folder_also_removes_the_assignment_of_the_folder_itself() {
+    let t = setup();
+    write(&t, ".config/app/a", "a");
+    write(&t, ".config/other", "o");
+    ok(&t, &["track", ".config/app", ".config/other", "--apply"]);
+    for p in [".config/app", ".config/app/a", ".config/other"] {
+        dotwarden::assign::set_assignment(&repo(&t), p, &["platform:linux".into()], &[]).unwrap();
+    }
+    t.git(&repo(&t), &["add", "-A"]);
+    t.git(&repo(&t), &["commit", "-qm", "assign"]);
+    let j = ok(&t, &["untrack", ".config/app", "--dry-run", "--json"]).json();
+    let data = j["items"][0]["item"]["preview"]["data"].to_string();
+    assert!(data.contains("assignment of ~/.config/app from"), "{data}");
+    ok(&t, &["untrack", ".config/app", "--apply"]);
+    let data = fs::read_to_string(repo(&t).join("home/.chezmoidata/dotwarden.toml")).unwrap();
+    assert!(
+        !data.contains("\".config/app\"") && !data.contains("\".config/app/a\""),
+        "{data}"
+    );
+    assert!(
+        data.contains("\".config/other\""),
+        "unrelated assignment stays: {data}"
+    );
+}
+
+// 8. content hash ------------------------------------------------------------------------------------------
+
+#[test]
+fn an_edit_with_the_same_size_and_restored_mtime_makes_the_item_stale() {
+    let t = setup();
+    write(&t, ".a", "AAAA");
+    let mtime = fs::metadata(t.home.join(".a")).unwrap().modified().unwrap();
+    ok(&t, &["track", ".a"]);
+    fs::write(t.home.join(".a"), "BBBB").unwrap();
+    fs::File::options()
+        .write(true)
+        .open(t.home.join(".a"))
+        .unwrap()
+        .set_modified(mtime)
+        .unwrap();
+    let meta = fs::metadata(t.home.join(".a")).unwrap();
+    assert_eq!(
+        (meta.len(), meta.modified().unwrap()),
+        (4, mtime),
+        "the edit is invisible to size and mtime"
+    );
+    let list = pending_json(&t);
+    assert!(
+        list["items"][0]["stale"]
+            .as_str()
+            .unwrap()
+            .contains("~/.a in HOME"),
+        "{list}"
+    );
+    let r = dw(&t, &["pending", "apply", "--all"]);
+    assert_eq!(r.code, 7, "{}", r.out);
+    assert_eq!(git_status(&t), "");
+}

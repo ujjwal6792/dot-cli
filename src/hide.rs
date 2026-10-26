@@ -9,6 +9,7 @@ use ignore::gitignore::{Gitignore, GitignoreBuilder};
 /// Hide rules written to a new repository's `hide` file.
 pub const DEFAULT_RULES: &str = include_str!("../assets/hide.default");
 
+#[derive(Debug)]
 pub struct HideRules {
     root: PathBuf,
     matcher: Gitignore,
@@ -146,7 +147,9 @@ pub fn validate_pattern(pattern: &str) -> Result<()> {
     if pattern.chars().any(char::is_control) {
         return bad("it contains a newline or another control character");
     }
-    if pattern != pattern.trim() {
+    if pattern != pattern.trim_start()
+        || (pattern != pattern.trim_end() && !pattern.ends_with("\\ "))
+    {
         return bad("leading or trailing whitespace is not significant in hide rules");
     }
     let mut b = GitignoreBuilder::new("/");
@@ -154,6 +157,44 @@ pub fn validate_pattern(pattern: &str) -> Result<()> {
         return bad(&e.to_string());
     }
     Ok(())
+}
+
+/// The rule that hides exactly the HOME path `rel` (and, for a folder, everything
+/// in it): anchored, with gitignore's special characters escaped.
+pub fn pattern_for_path(rel: &str, is_dir: bool) -> String {
+    let mut p = String::from("/");
+    for c in rel.chars() {
+        if matches!(c, '*' | '?' | '[' | ']' | '\\') {
+            p.push('\\');
+        }
+        p.push(c);
+    }
+    if is_dir {
+        p.push('/');
+    } else {
+        let trimmed = p.trim_end_matches(' ').len();
+        let spaces = p.len() - trimmed;
+        p.truncate(trimmed);
+        for _ in 0..spaces {
+            p.push_str("\\ ");
+        }
+    }
+    p
+}
+
+/// Size and modification time (ns) of the `hide` file, to notice changes cheaply.
+pub type HideStamp = Option<(u64, u128)>;
+
+/// A cheap change marker for the `hide` file.
+pub fn stamp(repo: &Path) -> HideStamp {
+    let m = std::fs::metadata(repo.join(HIDE_FILE)).ok()?;
+    let nanos = m
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_nanos();
+    Some((m.len(), nanos))
 }
 
 /// The rule lines of the repository's `hide` file (comments and blanks excluded).
@@ -219,6 +260,35 @@ mod tests {
         }
         validate_pattern("\\#x").unwrap();
         validate_pattern("!/Library/Application Support/Foo/").unwrap();
+    }
+
+    #[test]
+    fn a_path_pattern_hides_exactly_that_path_even_with_special_characters() {
+        let root = Path::new("/h");
+        for (rel, dir) in [
+            (".config/app", true),
+            ("[1]", false),
+            ("a*b", false),
+            ("q?", true),
+            ("#x", false),
+            ("!y", false),
+            ("trail ", false),
+            ("back\\slash", false),
+            ("sp ace/in", false),
+        ] {
+            let pattern = pattern_for_path(rel, dir);
+            validate_pattern(&pattern).unwrap();
+            let r = HideRules::parse(root, &format!("{pattern}\n")).unwrap();
+            let path = root.join(rel);
+            assert!(r.is_hidden(&path, dir), "{pattern} must hide {rel}");
+            assert!(!r.is_hidden(&root.join("other"), false), "{pattern}");
+            assert!(
+                !r.is_hidden(&root.join(format!("{rel}x")), false),
+                "{pattern} overreaches"
+            );
+        }
+        assert_eq!(pattern_for_path("Projects", true), "/Projects/");
+        assert_eq!(pattern_for_path(".zshrc", false), "/.zshrc");
     }
 
     #[test]

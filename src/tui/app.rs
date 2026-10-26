@@ -10,8 +10,8 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
-    ActionReport, Done, Jobs, KEY_ACTION, KEY_LISTING, KEY_PENDING, KEY_PREVIEW, KEY_STATUS,
-    KEY_TRACKED, Payload,
+    ActionReport, Done, Jobs, KEY_ACTION, KEY_HIDE, KEY_LISTING, KEY_PENDING, KEY_PREVIEW,
+    KEY_STATUS, KEY_TRACKED, Payload,
 };
 use crate::hide::HideRules;
 use crate::pending::{self, Item, List};
@@ -83,6 +83,8 @@ impl Panel {
 pub enum ActionReq {
     /// Space: flip the tracked state of these HOME paths (absolute).
     Toggle(Vec<std::path::PathBuf>),
+    /// `i`: hide (or un-hide) this absolute path, through a pending hide item.
+    Hide(std::path::PathBuf, bool),
     Drop(u64),
     Apply(Vec<u64>),
 }
@@ -124,6 +126,8 @@ pub struct App {
     /// One-line feedback shown in the footer until the next key press.
     pub message: Option<String>,
     pub dialog: Option<Dialog>,
+    /// Change marker of the `hide` file last loaded (`None` until the first load).
+    hide_stamp: Option<crate::hide::HideStamp>,
     actions: VecDeque<ActionReq>,
     action_running: bool,
 }
@@ -149,6 +153,7 @@ impl App {
             range_anchor: None,
             message: None,
             dialog: None,
+            hide_stamp: None,
             actions: VecDeque::new(),
             action_running: false,
         }
@@ -167,7 +172,21 @@ impl App {
     pub fn start(&mut self) {
         self.refresh_status();
         self.refresh_tracking();
+        self.refresh_hide();
         self.reload_listing(None);
+    }
+
+    /// Re-read the hide rules; the result replaces them only when the file changed.
+    fn refresh_hide(&mut self) {
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_HIDE, move |_| {
+            let stamp = crate::hide::stamp(&store.repo());
+            Payload::Hide(
+                HideRules::for_store(&store)
+                    .map(|r| (Box::new(r), stamp))
+                    .map_err(|e| format!("{e:#}")),
+            )
+        });
     }
 
     /// Reload what the repository and the pending list say about tracking.
@@ -207,7 +226,14 @@ impl App {
         self.message = Some("working…".into());
         let store = Arc::clone(&self.store);
         self.jobs.spawn_detached(KEY_ACTION, move |_| {
-            Payload::Action(run_action(&store, req).map_err(|e| format!("{e:#}")))
+            Payload::Action(run_action(&store, req).map_err(|e| {
+                if crate::lock::is_busy(&e) {
+                    "Busy: another dotwarden command holds the lock; nothing was changed, try again"
+                        .to_string()
+                } else {
+                    format!("{e:#}")
+                }
+            }))
         });
     }
 
@@ -253,6 +279,10 @@ impl App {
             Event::Input(TermEvent::Resize(w, h)) => self.size = (w, h),
             Event::Input(_) => {}
             Event::Job(done) => self.handle_job(done),
+            Event::Tick => {
+                self.refresh_tracking();
+                self.refresh_hide();
+            }
         }
     }
 
@@ -273,6 +303,18 @@ impl App {
                     self.request_preview();
                 }
             }
+            Payload::Hide(r) => match r {
+                Ok((rules, stamp)) => {
+                    let changed = self.hide_stamp.is_some_and(|old| old != stamp);
+                    self.hide_stamp = Some(stamp);
+                    if changed {
+                        self.rules = Arc::new(*rules);
+                        let keep = self.files.selected_entry().map(|e| e.name.clone());
+                        self.reload_listing(keep);
+                    }
+                }
+                Err(e) => self.message = Some(e),
+            },
             Payload::Tracked(r) => {
                 if let Ok(t) = r {
                     self.tracked = Arc::new(*t);
@@ -294,6 +336,7 @@ impl App {
                     Err(e) => self.message = Some(e),
                 }
                 self.refresh_tracking();
+                self.refresh_hide();
                 self.refresh_status();
                 self.pump_actions();
             }
@@ -379,6 +422,7 @@ impl App {
             KeyCode::Char('0') => return self.focus = Panel::Pending,
             KeyCode::Char('r') => {
                 self.refresh_tracking();
+                self.refresh_hide();
                 self.refresh_status();
                 return self.reload_listing(None);
             }
@@ -450,6 +494,13 @@ impl App {
         let before = self.files.selected_path();
         match key.code {
             KeyCode::Char(' ') => return self.toggle_selection(),
+            KeyCode::Char('i') => {
+                if let Some(e) = self.files.selected_entry() {
+                    let (path, is_dir) = (self.files.cwd.join(&e.name), e.is_dir);
+                    self.request_action(ActionReq::Hide(path, is_dir));
+                }
+                return;
+            }
             KeyCode::Char('v') => {
                 self.range_anchor = match self.range_anchor {
                     Some(_) => None,
@@ -491,16 +542,16 @@ impl App {
 fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
     match req {
         ActionReq::Toggle(paths) => {
-            let lock = store.lock()?;
             let requester = "human";
             let mut messages = Vec::new();
             let mut refused = Vec::new();
             for p in &paths {
                 let result =
                     track::resolve_home_path(store, &p.to_string_lossy(), &store.dirs.home)
-                        .and_then(|hp| track::toggle(store, &lock, &hp, requester));
+                        .and_then(|hp| track::toggle(store, &hp, requester));
                 match result {
                     Ok(t) => messages.push(t.message),
+                    Err(e) if crate::lock::is_busy(&e) => return Err(e),
                     Err(e) => refused.push(format!("{e:#}")),
                 }
             }
@@ -512,6 +563,14 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             };
             Ok(ActionReport {
                 message,
+                results: None,
+            })
+        }
+        ActionReq::Hide(path, is_dir) => {
+            let hp = track::resolve_home_path(store, &path.to_string_lossy(), &store.dirs.home)?;
+            let t = track::toggle_hide(store, &hp, is_dir, "human")?;
+            Ok(ActionReport {
+                message: t.message,
                 results: None,
             })
         }

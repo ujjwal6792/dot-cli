@@ -6,7 +6,6 @@ mod common;
 use std::collections::BTreeSet;
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
-use std::path::Path;
 use std::process::Command;
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, channel};
@@ -297,12 +296,24 @@ fn space_on_a_folder_tracks_the_folder_and_the_markers_show_every_state() {
     assert!(tui.screen().contains("?+ new.txt"), "{}", tui.screen());
     tui.press(' ');
 
-    // A folder: Space tracks it, with its file count in the summary.
+    // A folder holding tracked files offers to untrack them (review fix 6) ...
     tui.press('h');
     tui.press('h');
     tui.select("proj");
     tui.press(' ');
-    assert_eq!(summaries(&tui.t), ["Track folder ~/proj (1 file)"]);
+    assert_eq!(summaries(&tui.t), ["Untrack ~/proj (1 file)"]);
+    tui.press(' ');
+    assert!(pending(&tui.t).is_empty());
+}
+
+#[test]
+fn space_on_a_folder_without_tracked_files_tracks_it() {
+    let t = initialised();
+    write(&t, "fresh/f", "f");
+    let mut tui = open(t);
+    tui.select("fresh");
+    tui.press(' ');
+    assert_eq!(summaries(&tui.t), ["Track folder ~/fresh (1 file)"]);
 }
 
 #[test]
@@ -651,5 +662,138 @@ fn the_tui_and_concurrent_cli_commands_share_one_consistent_pending_list() {
     assert_eq!(tui.app.pending.items.len(), 8);
 }
 
-#[allow(dead_code)]
-fn unused(_: &Path) {}
+// ---- review fixes ------------------------------------------------------------------------
+
+#[test]
+fn space_never_creates_an_item_that_overlaps_a_pending_folder_item() {
+    let t = initialised();
+    for f in ["d/a", "d/b", "e/x"] {
+        write(&t, f, f);
+    }
+    t.dw_ok(&["track", "d"]);
+    t.dw_ok(&["track", "e/x"]);
+    let mut tui = open(t);
+    // A file inside the pending folder item.
+    tui.enter("d");
+    tui.select("a");
+    tui.press(' ');
+    let msg = tui.app.message.clone().unwrap_or_default();
+    assert!(msg.contains("overlaps pending item #1"), "{msg}");
+    assert_eq!(pending(&tui.t).len(), 2, "no overlapping item was added");
+    // The folder above a pending file item.
+    tui.press('h');
+    tui.select("e");
+    tui.press(' ');
+    let msg = tui.app.message.clone().unwrap_or_default();
+    assert!(msg.contains("overlaps pending item #2"), "{msg}");
+    assert_eq!(pending(&tui.t).len(), 2);
+    // The folder item itself still toggles off.
+    tui.select("d");
+    tui.press(' ');
+    assert_eq!(summaries(&tui.t), ["Track ~/e/x"]);
+}
+
+#[test]
+fn a_lock_timeout_shows_busy_try_again_and_changes_nothing() {
+    let mut t = initialised();
+    t.set("DOTWARDEN_LOCK_WAIT_MS", "200");
+    write(&t, ".a", "a");
+    let mut tui = open(t);
+    tui.select(".a");
+    let held = tui.t.store().lock().unwrap();
+    tui.press(' ');
+    let screen = tui.screen();
+    assert!(
+        screen.contains("Busy") && screen.contains("try again"),
+        "{screen}"
+    );
+    assert!(
+        !screen.contains("another dotwarden command has held"),
+        "no hard failure text:\n{screen}"
+    );
+    drop(held);
+    assert!(pending(&tui.t).is_empty());
+    tui.press(' ');
+    assert_eq!(summaries(&tui.t), ["Track ~/.a"]);
+}
+
+#[test]
+fn i_hides_a_path_through_a_pending_item_and_the_list_updates_after_it_is_applied() {
+    let t = initialised();
+    write(&t, "Projects/x", "x");
+    write(&t, ".zshrc", "z");
+    let mut tui = open(t);
+    tui.select("Projects");
+    tui.press('i');
+    assert_eq!(summaries(&tui.t), ["Add hide rule `/Projects/`"]);
+    assert!(tui.screen().contains("Added #1"));
+    tui.press('i');
+    assert!(pending(&tui.t).is_empty(), "i again drops the item");
+    tui.press('i');
+    tui.press('0');
+    tui.press_key(KeyCode::Enter);
+    tui.press_key(KeyCode::Enter);
+    let hide = fs::read_to_string(tui.t.dirs().repo().join("hide")).unwrap();
+    assert!(hide.lines().any(|l| l == "/Projects/"), "{hide}");
+    assert_eq!(git_status(&tui.t), "M  hide");
+    tui.press_key(KeyCode::Char('x')); // close the result
+    tui.press('2');
+    let screen = tui.screen();
+    assert!(
+        !screen.contains("Projects/"),
+        "the browser dropped the hidden folder:\n{screen}"
+    );
+    assert!(screen.contains(".zshrc"));
+    // Revealed with `.`, `i` offers to remove exactly that rule.
+    tui.press('.');
+    tui.select("Projects");
+    tui.press('i');
+    assert_eq!(summaries(&tui.t), ["Remove hide rule `/Projects/`"]);
+}
+
+#[test]
+fn i_on_a_path_hidden_by_another_rule_points_at_dw_hide() {
+    let t = initialised();
+    write(&t, ".cache/x", "c");
+    let mut tui = open(t);
+    tui.press('.');
+    tui.select(".cache");
+    tui.press('i');
+    let screen = tui.screen();
+    assert!(pending(&tui.t).is_empty());
+    assert!(
+        screen.contains("edit the rules with `dw hide`") && screen.contains(".cache/"),
+        "{screen}"
+    );
+}
+
+#[test]
+fn hide_rules_changed_from_the_cli_are_reloaded_without_a_restart() {
+    let t = initialised();
+    write(&t, "Zed/settings", "s");
+    write(&t, ".zshrc", "z");
+    let mut tui = open(t);
+    assert!(tui.screen().contains("Zed/"));
+    tui.t.dw_ok(&["hide", "add", "/Zed/", "--apply"]);
+    // The periodic tick notices the changed file.
+    tui.app.handle_event(Event::Tick);
+    tui.settle();
+    let screen = tui.screen();
+    assert!(!screen.contains("Zed/"), "{screen}");
+    assert!(screen.contains(".zshrc"));
+    // And back again via `r`.
+    tui.t.dw_ok(&["hide", "remove", "/Zed/", "--apply"]);
+    tui.press('r');
+    assert!(tui.screen().contains("Zed/"));
+}
+
+#[test]
+fn the_tick_also_picks_up_pending_items_added_by_the_cli() {
+    let t = initialised();
+    write(&t, ".a", "a");
+    let mut tui = open(t);
+    tui.t.dw_ok(&["track", ".a"]);
+    tui.app.handle_event(Event::Tick);
+    tui.settle();
+    assert!(tui.screen().contains("[x] #1 human: Track ~/.a"));
+}

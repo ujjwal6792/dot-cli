@@ -107,10 +107,34 @@ impl Store {
         cmd
     }
 
+    /// Run chezmoi to completion without writing anything of dotwarden's own:
+    /// it waits for the chezmoi lock only if some other command created it.
     pub fn chezmoi<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Output> {
+        let _guard = lock::acquire_existing(
+            &self.dirs.chezmoi_lock_file(),
+            lock::wait_from_env(&self.env),
+        )?;
         let mut cmd = self.chezmoi_command();
         cmd.args(args);
         exec::run_ok(cmd, None)
+    }
+
+    /// Run chezmoi for planning and mutations. Each invocation holds a short lock
+    /// of its own, so planning (which only previews) can run outside the
+    /// mutation lock without two chezmoi processes fighting over its state
+    /// database.
+    pub fn chezmoi_locked<S: AsRef<OsStr>>(&self, args: &[S]) -> Result<Output> {
+        let _guard = self.chezmoi_guard()?;
+        let mut cmd = self.chezmoi_command();
+        cmd.args(args);
+        exec::run_ok(cmd, None)
+    }
+
+    pub fn chezmoi_guard(&self) -> Result<lock::Lock> {
+        lock::acquire(
+            &self.dirs.chezmoi_lock_file(),
+            lock::wait_from_env(&self.env),
+        )
     }
 
     /// The generated chezmoi configuration for `machine_name`. The registry

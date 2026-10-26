@@ -53,6 +53,21 @@ pub struct HomePath {
     pub rel: String,
 }
 
+/// Express `norm` below `home` even when one of them is spelled through a
+/// symlink (a symlinked HOME, `/tmp` vs `/private/tmp`): find the ancestor of
+/// `norm` that is HOME itself and re-root the rest there. Symlinks *below* HOME
+/// are deliberately not resolved.
+fn map_into_home(norm: &Path, home: &Path) -> Option<PathBuf> {
+    if norm.starts_with(home) {
+        return Some(norm.to_path_buf());
+    }
+    let canonical_home = fs::canonicalize(home).ok()?;
+    norm.ancestors()
+        .filter(|a| !a.as_os_str().is_empty())
+        .find(|a| fs::canonicalize(a).is_ok_and(|c| c == canonical_home))
+        .map(|a| home.join(norm.strip_prefix(a).expect("an ancestor")))
+}
+
 fn lexical_normalise(p: &Path) -> PathBuf {
     let mut out = PathBuf::new();
     for c in p.components() {
@@ -101,16 +116,14 @@ fn resolve_inner(
         cwd.join(arg)
     };
     let norm = lexical_normalise(&raw);
-    let canonical_home = fs::canonicalize(home).unwrap_or_else(|_| home.clone());
-    let abs = if norm.starts_with(home) {
-        norm
-    } else if let Ok(rest) = norm.strip_prefix(&canonical_home) {
-        home.join(rest)
-    } else {
-        return Err(usage(format!(
-            "{arg:?} is outside HOME ({}); only HOME paths can be tracked",
-            home.display()
-        )));
+    let abs = match map_into_home(&norm, home) {
+        Some(abs) => abs,
+        None => {
+            return Err(usage(format!(
+                "{arg:?} is outside HOME ({}); only HOME paths can be tracked",
+                home.display()
+            )));
+        }
     };
     let rel_path = abs.strip_prefix(home).expect("checked above");
     if rel_path.as_os_str().is_empty() && allow_root {
@@ -147,6 +160,42 @@ fn resolve_inner(
                 cur.display()
             )));
         }
+    }
+    // Case-insensitive filesystems resolve `.ZSHRC` to `.Zshrc`; the repository
+    // would then record the wrong spelling. Insist on the on-disk name.
+    let mut cur = home.clone();
+    let mut real: Vec<String> = Vec::new();
+    for c in &comps {
+        let name = c.as_os_str();
+        let mut spelled = name.to_string_lossy().into_owned();
+        if fs::symlink_metadata(cur.join(name)).is_ok() {
+            let exact = fs::read_dir(&cur)
+                .map(|rd| rd.flatten().any(|e| e.file_name() == name))
+                .unwrap_or(true);
+            if !exact {
+                let lower = spelled.to_lowercase();
+                if let Some(actual) = fs::read_dir(&cur).ok().and_then(|rd| {
+                    rd.flatten()
+                        .map(|e| e.file_name().to_string_lossy().into_owned())
+                        .find(|n| n.to_lowercase() == lower)
+                }) {
+                    spelled = actual;
+                }
+                real.push(spelled);
+                let mut full = real.join("/");
+                let done = real.len();
+                for rest in &comps[done..] {
+                    full.push('/');
+                    full.push_str(&rest.as_os_str().to_string_lossy());
+                }
+                return Err(usage(format!(
+                    "~/{rel} is spelled ~/{full} on disk (this filesystem ignores case); \
+                     use the exact spelling so the repository records the real name"
+                )));
+            }
+        }
+        real.push(spelled);
+        cur.push(name);
     }
     Ok(Some(HomePath { abs, rel }))
 }
@@ -255,26 +304,65 @@ fn unix_nanos(m: &fs::Metadata) -> u128 {
         .map_or(0, |d| d.as_nanos())
 }
 
+/// FNV-1a, 64 bit: stable across Rust versions, which matters because guards
+/// are persisted.
+fn fnv1a(mut hash: u64, bytes: &[u8]) -> u64 {
+    for b in bytes {
+        hash ^= u64::from(*b);
+        hash = hash.wrapping_mul(0x0100_0000_01b3);
+    }
+    hash
+}
+
+/// Files up to this size are hashed whole; larger ones by their first and last
+/// 64 KiB (plus size and mtime), which keeps a guard cheap.
+const FULL_HASH_LIMIT: u64 = 4 * 1024 * 1024;
+const SAMPLE: u64 = 64 * 1024;
+
+fn content_hash(path: &Path, len: u64) -> String {
+    use std::io::{Read, Seek, SeekFrom};
+    let Ok(mut f) = fs::File::open(path) else {
+        return "unreadable".into();
+    };
+    let mut h = 0xcbf2_9ce4_8422_2325_u64;
+    let mut buf = Vec::new();
+    if len <= FULL_HASH_LIMIT {
+        if f.read_to_end(&mut buf).is_err() {
+            return "unreadable".into();
+        }
+        h = fnv1a(h, &buf);
+    } else {
+        buf.resize(SAMPLE as usize, 0);
+        if f.read_exact(&mut buf).is_err() {
+            return "unreadable".into();
+        }
+        h = fnv1a(h, &buf);
+        if f.seek(SeekFrom::End(-(SAMPLE as i64))).is_err() || f.read_exact(&mut buf).is_err() {
+            return "unreadable".into();
+        }
+        h = fnv1a(h, &buf);
+    }
+    format!("{h:016x}")
+}
+
 fn home_fingerprint(abs: &Path) -> String {
     let Ok(m) = fs::symlink_metadata(abs) else {
         return "missing".into();
     };
-    let kind = if m.file_type().is_symlink() {
-        "link"
+    let (kind, extra) = if m.file_type().is_symlink() {
+        (
+            "link",
+            fs::read_link(abs)
+                .map(|t| t.display().to_string())
+                .unwrap_or_default(),
+        )
     } else if m.is_dir() {
-        "dir"
+        ("dir", String::new())
     } else {
-        "file"
-    };
-    let link = if m.file_type().is_symlink() {
-        fs::read_link(abs)
-            .map(|t| t.display().to_string())
-            .unwrap_or_default()
-    } else {
-        String::new()
+        ("file", content_hash(abs, m.len()))
     };
     format!(
-        "{kind}:{}:{}:{:o}:{link}",
+        "{kind}:{}:{}:{:o}:{extra}",
         m.len(),
         unix_nanos(&m),
         m.mode() & 0o7777
@@ -343,6 +431,7 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         Action::Untrack {
             files,
             forget_folders,
+            assignments: keys,
             ..
         } => {
             let assigned = assignments(&repo)?;
@@ -354,8 +443,10 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                         .get(t)
                         .map_or("-".to_string(), |e| repo_fingerprint(&repo, &e.source)),
                 );
+            }
+            for k in keys {
                 g.repo
-                    .insert(format!("assignment:{t}"), yes_no(assigned.contains(t)));
+                    .insert(format!("assignment:{k}"), yes_no(assigned.contains(k)));
             }
             for f in forget_folders {
                 g.repo.insert(
@@ -632,10 +723,14 @@ pub fn plan_untrack(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) ->
             "stop recording ~/{f} as a tracked folder in {DATA_FILE}"
         ));
     }
-    for (t, _) in &entries {
-        if assigned.contains(*t) {
-            data.push(format!("remove the assignment of ~/{t} from {DATA_FILE}"));
-        }
+    let below = format!("{}/", hp.rel);
+    let removed_assignments: Vec<String> = assigned
+        .iter()
+        .filter(|k| **k == hp.rel || k.starts_with(&below))
+        .cloned()
+        .collect();
+    for k in &removed_assignments {
+        data.push(format!("remove the assignment of ~/{k} from {DATA_FILE}"));
     }
     let mut notes =
         vec!["HOME files are kept on every machine; they just stop syncing".to_string()];
@@ -676,6 +771,7 @@ pub fn plan_untrack(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) ->
         path: hp.rel.clone(),
         files,
         forget_folders,
+        assignments: removed_assignments,
     };
     new_item(store, requester, action, summary, preview, ctx)
 }
@@ -792,16 +888,136 @@ pub struct Toggled {
     pub dropped: Option<Item>,
 }
 
+fn covers(path: &str, rel: &str) -> bool {
+    path.len() < rel.len() && rel.starts_with(path) && rel.as_bytes()[path.len()] == b'/'
+}
+
+/// A pending track/untrack item for a folder above `rel` or for something below
+/// it: toggling `rel` would overlap it.
+fn overlapping_item<'a>(list: &'a pending::List, rel: &str) -> Option<&'a Item> {
+    list.items.iter().find(|i| match &i.action {
+        Action::Track { path, .. } | Action::Untrack { path, .. } => {
+            covers(path, rel) || covers(rel, path)
+        }
+        _ => false,
+    })
+}
+
+fn same_path_item<'a>(list: &'a pending::List, rel: &str) -> Option<&'a Item> {
+    list.items.iter().find(|i| {
+        matches!(&i.action, Action::Track { path, .. } | Action::Untrack { path, .. } if path == rel)
+    })
+}
+
+enum Decision {
+    Drop(u64),
+    Add(Box<Item>),
+}
+
+/// The stale test used when adding: a pending item replaced by a fresh request.
+pub fn stale_checker<'a>(store: &'a Store, ctx: &'a Ctx) -> impl Fn(&Item) -> bool + 'a {
+    move |i| stale_reason(store, ctx, i).ok().flatten().is_some()
+}
+
 /// Space: drop the pending track/untrack item of `hp` if there is one, else add
-/// the item that flips its tracked state. Decided under the lock so quick
-/// repeats and concurrent CLI use stay consistent.
-pub fn toggle(store: &Store, lock: &Lock, hp: &HomePath, requester: &str) -> Result<Toggled> {
+/// the item that flips its tracked state. A folder holding tracked files offers
+/// untrack of them. An item that would overlap a pending folder item (or sit
+/// inside one) is refused instead of added. Planning, which runs chezmoi,
+/// happens before the lock is taken; freshness is re-checked inside it.
+pub fn toggle(store: &Store, hp: &HomePath, requester: &str) -> Result<Toggled> {
+    for _ in 0..3 {
+        let list = pending::load(store)?;
+        let decision = if let Some(existing) = same_path_item(&list, &hp.rel) {
+            Decision::Drop(existing.id.expect("stored"))
+        } else {
+            if let Some(o) = overlapping_item(&list, &hp.rel) {
+                return Err(refuse(format!(
+                    "~/{} overlaps pending item {} ({}); drop that item first",
+                    hp.rel,
+                    o.label(),
+                    o.summary
+                )));
+            }
+            let ctx = Ctx::load(store)?;
+            let is_dir = fs::symlink_metadata(&hp.abs).is_ok_and(|m| m.is_dir());
+            let untrack = if is_dir {
+                ctx.tracked.folders.contains(&hp.rel) || ctx.tracked.under(&hp.rel).next().is_some()
+            } else {
+                ctx.tracked.is_tracked(&hp.rel)
+            };
+            Decision::Add(Box::new(if untrack {
+                plan_untrack(store, &ctx, hp, requester)?
+            } else {
+                plan_track(store, &ctx, hp, requester)?
+            }))
+        };
+        let lock = store.lock()?;
+        let list = pending::load(store)?;
+        match decision {
+            Decision::Drop(id) => {
+                if list.get(id).is_none() {
+                    return Ok(Toggled {
+                        message: format!("#{id} was already dropped"),
+                        ..Toggled::default()
+                    });
+                }
+                let mut gone = pending::drop_items(store, &lock, &[id])?;
+                let item = gone.remove(0);
+                return Ok(Toggled {
+                    message: format!("Dropped {}: {}", item.label(), item.summary),
+                    dropped: Some(item),
+                    added: None,
+                });
+            }
+            Decision::Add(item) => {
+                if let Some(same) = same_path_item(&list, &hp.rel) {
+                    return Ok(Toggled {
+                        message: format!("Already pending as {}: {}", same.label(), same.summary),
+                        ..Toggled::default()
+                    });
+                }
+                if let Some(o) = overlapping_item(&list, &hp.rel) {
+                    return Err(refuse(format!(
+                        "~/{} overlaps pending item {} ({}); drop that item first",
+                        hp.rel,
+                        o.label(),
+                        o.summary
+                    )));
+                }
+                let ctx = Ctx::load(store)?;
+                if stale_reason(store, &ctx, &item)?.is_some() {
+                    continue; // the world moved while planning: plan again
+                }
+                let check = stale_checker(store, &ctx);
+                let mut added = pending::add(store, &lock, vec![*item], &check)?;
+                let item = added.remove(0).item;
+                return Ok(Toggled {
+                    message: format!("Added {}: {}", item.label(), item.summary),
+                    added: Some(item),
+                    dropped: None,
+                });
+            }
+        }
+    }
+    Err(refuse(format!(
+        "~/{} kept changing while it was being planned; try again",
+        hp.rel
+    )))
+}
+
+/// `i` in the TUI: hide the path with an anchored rule through a pending item;
+/// pressing it again drops that item. For an already hidden path it offers to
+/// remove the rule when that exact rule exists.
+pub fn toggle_hide(store: &Store, hp: &HomePath, is_dir: bool, requester: &str) -> Result<Toggled> {
+    let pattern = hide::pattern_for_path(&hp.rel, is_dir);
     let list = pending::load(store)?;
-    if let Some(existing) = list.items.iter().find(|i| {
-        matches!(&i.action, Action::Track { path, .. } | Action::Untrack { path, .. } if *path == hp.rel)
-    }) {
+    let same = list.items.iter().find(|i| {
+        matches!(&i.action, Action::HideAdd { pattern: p } | Action::HideRemove { pattern: p } if *p == pattern)
+    });
+    if let Some(existing) = same {
         let id = existing.id.expect("stored");
-        let mut gone = pending::drop_items(store, lock, &[id])?;
+        let lock = store.lock()?;
+        let mut gone = pending::drop_items(store, &lock, &[id])?;
         let item = gone.remove(0);
         return Ok(Toggled {
             message: format!("Dropped {}: {}", item.label(), item.summary),
@@ -810,24 +1026,49 @@ pub fn toggle(store: &Store, lock: &Lock, hp: &HomePath, requester: &str) -> Res
         });
     }
     let ctx = Ctx::load(store)?;
-    let is_dir = fs::symlink_metadata(&hp.abs).is_ok_and(|m| m.is_dir());
-    let untrack = if is_dir {
-        ctx.tracked.folders.contains(&hp.rel)
+    let hidden = ctx.rules.is_hidden(&hp.abs, is_dir);
+    let item = if hidden {
+        if !hide::has_rule(&store.repo(), &pattern)? {
+            let why = ctx
+                .rules
+                .why_hidden(&hp.abs, is_dir)
+                .unwrap_or_else(|| "a hide rule".into());
+            return Err(refuse(format!(
+                "~/{} is hidden: {why}; edit the rules with `dw hide`",
+                hp.rel
+            )));
+        }
+        plan_hide(store, &ctx, false, &pattern, requester)?
     } else {
-        ctx.tracked.is_tracked(&hp.rel)
+        plan_hide(store, &ctx, true, &pattern, requester)?
     };
-    let item = if untrack {
-        plan_untrack(store, &ctx, hp, requester)?
-    } else {
-        plan_track(store, &ctx, hp, requester)?
-    };
-    let mut added = pending::add(store, lock, vec![item])?;
+    let lock = store.lock()?;
+    recheck(store, &lock, std::slice::from_ref(&item))?;
+    let ctx = Ctx::load(store)?;
+    let check = stale_checker(store, &ctx);
+    let mut added = pending::add(store, &lock, vec![item], &check)?;
     let item = added.remove(0).item;
     Ok(Toggled {
         message: format!("Added {}: {}", item.label(), item.summary),
         added: Some(item),
         dropped: None,
     })
+}
+
+/// Before taking the lock, items were planned from a snapshot; under the lock
+/// they must still describe the world.
+pub fn recheck(store: &Store, _lock: &Lock, items: &[Item]) -> Result<()> {
+    let ctx = Ctx::load(store)?;
+    for i in items {
+        if let Some(reason) = stale_reason(store, &ctx, i)? {
+            return Err(DwError::new(
+                Kind::Stale,
+                format!("{reason} while the request was being planned; run the command again"),
+            )
+            .into());
+        }
+    }
+    Ok(())
 }
 
 // ---- applying ------------------------------------------------------------
@@ -849,6 +1090,10 @@ pub struct ItemResult {
     pub message: Option<String>,
     /// Repository paths staged in git.
     pub staged: Vec<String>,
+    /// Targets an applied untrack removed; chezmoi's state for them is cleaned
+    /// afterwards (see [`cleanup_state`]).
+    #[serde(skip)]
+    pub forgotten: Vec<String>,
 }
 
 fn git_literal(store: &Store, args: &[&OsStr]) -> Result<exec::Output> {
@@ -986,7 +1231,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             for chunk in files.chunks(CHUNK) {
                 let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
                 args.extend(chunk.iter().map(|f| home.join(&f.path).into()));
-                store.chezmoi(&args)?;
+                store.chezmoi_locked(&args)?;
             }
             if *record_folder {
                 let mut folders = source::read_folders(&repo)?;
@@ -998,6 +1243,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
         Action::Untrack {
             files,
             forget_folders,
+            assignments: keys,
             ..
         } => {
             let root = repo.join(source::source_root(&repo));
@@ -1024,13 +1270,11 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
                 }
                 source::write_folders(&repo, &folders)?;
             }
-            let assigned = assignments(&repo)?;
-            let drop: Vec<&String> = files.iter().filter(|t| assigned.contains(*t)).collect();
-            if !drop.is_empty() {
+            if !keys.is_empty() {
                 crate::repo::edit_data(&repo, |doc| {
                     let dw = crate::repo::dotwarden_table(doc)?;
                     if let Some(t) = dw.get_mut("assignments").and_then(|a| a.as_table_mut()) {
-                        for k in &drop {
+                        for k in keys {
                             t.remove(k);
                         }
                     }
@@ -1050,8 +1294,31 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
     }
 }
 
+fn state_backup(store: &Store) -> Result<Option<Vec<u8>>> {
+    match fs::read(store.dirs.chezmoi_state()) {
+        Ok(b) => Ok(Some(b)),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(e) => Err(e).context("reading chezmoi's state"),
+    }
+}
+
+/// Put chezmoi's persistent state back as it was before a failed track: `add`
+/// records last-written state for every file it touched.
+fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()> {
+    let _guard = store.chezmoi_guard()?;
+    let path = store.dirs.chezmoi_state();
+    match backup {
+        Some(b) => crate::fsutil::write_atomic(&path, b),
+        None => match fs::remove_file(&path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e.into()),
+            _ => Ok(()),
+        },
+    }
+}
+
 /// Apply `items` in order, each all-or-nothing. A stale item is skipped and a
-/// failed one is rolled back; the others still apply. The caller holds the lock.
+/// failed one is rolled back (repository and chezmoi state); the others still
+/// apply. The caller holds the lock.
 pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<ItemResult>> {
     ensure_repo_clean(store)?;
     let mut results = Vec::new();
@@ -1063,6 +1330,7 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
             status,
             message,
             staged,
+            forgotten: Vec::new(),
         };
         let ctx = Ctx::load(store)?;
         if let Some(reason) = stale_reason(store, &ctx, item)? {
@@ -1070,8 +1338,16 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
             continue;
         }
         let tree = index_tree(store)?;
+        let tracks = matches!(item.action, Action::Track { .. });
+        let backup = if tracks { state_backup(store)? } else { None };
         match exec_item(store, &ctx, item) {
-            Ok(staged) => results.push(result(Outcome::Applied, None, staged)),
+            Ok(staged) => {
+                let mut r = result(Outcome::Applied, None, staged);
+                if let Action::Untrack { files, .. } = &item.action {
+                    r.forgotten = files.clone();
+                }
+                results.push(r);
+            }
             Err(e) => {
                 let mut message = format!("{e:#}");
                 if let Err(re) = rollback(store, &tree) {
@@ -1080,6 +1356,9 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
                         store.repo().display()
                     ));
                 }
+                if tracks && let Err(re) = state_restore(store, backup) {
+                    message.push_str(&format!("; chezmoi's state could not be restored ({re:#})"));
+                }
                 results.push(result(Outcome::Failed, Some(message), vec![]));
             }
         }
@@ -1087,43 +1366,108 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
     Ok(results)
 }
 
+/// Delete chezmoi's last-written state of untracked targets (and of folders that
+/// no longer hold tracked files). `chezmoi state delete` handles one key per
+/// call, so this runs after the mutation lock was released, a few keys at a
+/// time, re-checking under the lock that a key was not tracked again in between.
+/// Returns warnings; cleaning is best-effort and never fails an apply.
+pub fn cleanup_state(store: &Store, results: &[ItemResult]) -> Vec<String> {
+    let targets: BTreeSet<&String> = results.iter().flat_map(|r| &r.forgotten).collect();
+    if targets.is_empty() {
+        return Vec::new();
+    }
+    let mut keys: BTreeSet<String> = BTreeSet::new();
+    for t in targets {
+        keys.insert(t.clone());
+        let mut cur = t.as_str();
+        while let Some((parent, _)) = cur.rsplit_once('/') {
+            keys.insert(parent.to_string());
+            cur = parent;
+        }
+    }
+    let keys: Vec<String> = keys.into_iter().collect();
+    let mut warnings = Vec::new();
+    for chunk in keys.chunks(25) {
+        let done = (|| -> Result<()> {
+            let _lock = store.lock()?;
+            let tracked = source::load(&store.repo())?;
+            for k in chunk {
+                if tracked.under(k).next().is_some() {
+                    continue;
+                }
+                let key = format!("--key={}", store.dirs.home.join(k).display());
+                store.chezmoi_locked(&["state", "delete", "--bucket=entryState", key.as_str()])?;
+            }
+            Ok(())
+        })();
+        crate::lock::yield_to_waiters();
+        if let Err(e) = done {
+            warnings.push(format!("could not clean chezmoi's state: {e:#}"));
+            break;
+        }
+    }
+    warnings
+}
+
 /// Apply stored items by id (all when `ids` is `None`), removing those that
-/// applied from the list. Takes the lock itself.
+/// applied from the list. The lock is taken per item, so a long batch never
+/// blocks other commands for longer than its largest item.
 pub fn apply_pending(store: &Store, ids: Option<&[u64]>) -> Result<Vec<ItemResult>> {
-    let lock = store.lock()?;
     let list = pending::load(store)?;
-    let chosen: Vec<Item> = match ids {
-        None => list.items.clone(),
+    let chosen: Vec<u64> = match ids {
+        None => list.items.iter().filter_map(|i| i.id).collect(),
         Some(ids) => {
             let mut v = Vec::new();
             for id in ids {
-                v.push(
-                    list.get(*id)
-                        .ok_or_else(|| pending::not_found(*id))?
-                        .clone(),
-                );
+                list.get(*id).ok_or_else(|| pending::not_found(*id))?;
+                v.push(*id);
             }
-            v.sort_by_key(|i| i.id);
-            v.dedup_by_key(|i| i.id);
+            v.sort();
+            v.dedup();
             v
         }
     };
-    let results = apply_items(store, &lock, &chosen)?;
-    let done: Vec<u64> = results
-        .iter()
-        .filter(|r| r.status == Outcome::Applied)
-        .filter_map(|r| r.id)
-        .collect();
-    if !done.is_empty() {
-        pending::drop_items(store, &lock, &done)?;
+    let mut results = Vec::new();
+    for id in chosen {
+        let lock = store.lock()?;
+        let Some(item) = pending::load(store)?.get(id).cloned() else {
+            continue; // dropped by someone else meanwhile
+        };
+        let mut r = apply_items(store, &lock, std::slice::from_ref(&item))?;
+        if r.iter().any(|x| x.status == Outcome::Applied) {
+            pending::drop_items(store, &lock, &[id])?;
+        }
+        results.append(&mut r);
+        drop(lock);
+        crate::lock::yield_to_waiters();
     }
+    let warnings = cleanup_state(store, &results);
+    attach_warnings(&mut results, warnings);
     Ok(results)
 }
 
-/// Apply freshly planned items immediately without storing them.
+/// Show state-cleaning warnings on the first applied untrack result.
+fn attach_warnings(results: &mut [ItemResult], warnings: Vec<String>) {
+    if warnings.is_empty() {
+        return;
+    }
+    if let Some(r) = results.iter_mut().find(|r| !r.forgotten.is_empty()) {
+        r.message = Some(warnings.join("; "));
+    }
+}
+
+/// Apply freshly planned items immediately without storing them (lock per item).
 pub fn apply_now(store: &Store, items: &[Item]) -> Result<Vec<ItemResult>> {
-    let lock = store.lock()?;
-    apply_items(store, &lock, items)
+    let mut results = Vec::new();
+    for item in items {
+        let lock = store.lock()?;
+        results.append(&mut apply_items(store, &lock, std::slice::from_ref(item))?);
+        drop(lock);
+        crate::lock::yield_to_waiters();
+    }
+    let warnings = cleanup_state(store, &results);
+    attach_warnings(&mut results, warnings);
+    Ok(results)
 }
 
 /// The exit kind for a set of results: stale wins over a plain failure.

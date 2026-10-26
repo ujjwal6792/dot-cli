@@ -45,6 +45,10 @@ pub enum Action {
         files: Vec<String>,
         /// Recorded tracked folders removed.
         forget_folders: Vec<String>,
+        /// Assignment keys removed: the paths of the removed files and, for a
+        /// folder, the folder path itself and anything below it.
+        #[serde(default)]
+        assignments: Vec<String>,
     },
     HideAdd {
         pattern: String,
@@ -203,18 +207,42 @@ pub struct Added {
     pub item: Item,
     /// True when an identical item was already pending (nothing was added).
     pub already_pending: bool,
+    /// True when a stale item for the same thing was replaced by this fresh one
+    /// (it keeps its id).
+    pub replaced: bool,
 }
 
-/// Store new items, skipping any identical to one already pending.
-pub fn add(store: &Store, lock: &Lock, items: Vec<Item>) -> Result<Vec<Added>> {
+/// Store new items. An identical pending item is kept, unless `is_stale` says it
+/// can no longer be applied: then the fresh item replaces it, keeping its id.
+pub fn add(
+    store: &Store,
+    lock: &Lock,
+    items: Vec<Item>,
+    is_stale: &dyn Fn(&Item) -> bool,
+) -> Result<Vec<Added>> {
     let mut list = load(store)?;
     let mut out = Vec::new();
     for mut item in items {
-        if let Some(same) = list.find_same(&item.action) {
-            out.push(Added {
-                item: same.clone(),
-                already_pending: true,
-            });
+        if let Some(at) = list
+            .items
+            .iter()
+            .position(|i| i.action.key() == item.action.key())
+        {
+            if is_stale(&list.items[at]) {
+                item.id = list.items[at].id;
+                list.items[at] = item.clone();
+                out.push(Added {
+                    item,
+                    already_pending: false,
+                    replaced: true,
+                });
+            } else {
+                out.push(Added {
+                    item: list.items[at].clone(),
+                    already_pending: true,
+                    replaced: false,
+                });
+            }
             continue;
         }
         item.id = Some(list.next_id);
@@ -223,6 +251,7 @@ pub fn add(store: &Store, lock: &Lock, items: Vec<Item>) -> Result<Vec<Added>> {
         out.push(Added {
             item,
             already_pending: false,
+            replaced: false,
         });
     }
     save(store, lock, &list)?;

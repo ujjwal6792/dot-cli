@@ -11,6 +11,7 @@ use std::thread;
 use super::event::Event;
 use super::files::Entry;
 use crate::exec::CancelToken;
+use crate::hide::{HideRules, HideStamp};
 use crate::pending::List;
 use crate::source::Tracked;
 use crate::status::Status;
@@ -22,6 +23,7 @@ pub const KEY_LISTING: &str = "listing";
 pub const KEY_PREVIEW: &str = "preview";
 pub const KEY_TRACKED: &str = "tracked";
 pub const KEY_PENDING: &str = "pending";
+pub const KEY_HIDE: &str = "hide";
 /// Mutations never supersede one another: every one runs, in the order requested.
 pub const KEY_ACTION: &str = "action";
 
@@ -45,6 +47,8 @@ pub enum Payload {
         text: Result<String, String>,
     },
     Tracked(Result<Box<Tracked>, String>),
+    /// The hide rules as loaded, with the change marker of the `hide` file.
+    Hide(Result<(Box<HideRules>, HideStamp), String>),
     Pending(Result<Box<List>, String>),
     Action(Result<ActionReport, String>),
 }

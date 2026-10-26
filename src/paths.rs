@@ -80,6 +80,10 @@ impl Dirs {
     pub fn lock_file(&self) -> PathBuf {
         self.state_dir().join("lock")
     }
+    /// Serialises single chezmoi invocations (its state database admits one writer).
+    pub fn chezmoi_lock_file(&self) -> PathBuf {
+        self.state_dir().join("chezmoi.lock")
+    }
     /// The pending list, shared by the CLI and the TUI.
     pub fn pending_file(&self) -> PathBuf {
         self.state_dir().join("pending.json")
