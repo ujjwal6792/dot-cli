@@ -80,6 +80,10 @@ impl Dirs {
     pub fn lock_file(&self) -> PathBuf {
         self.state_dir().join("lock")
     }
+    /// The pending list, shared by the CLI and the TUI.
+    pub fn pending_file(&self) -> PathBuf {
+        self.state_dir().join("pending.json")
+    }
     /// This machine's registry name and local confirmations.
     pub fn machine_toml(&self) -> PathBuf {
         self.state_dir().join("machine.toml")

@@ -61,6 +61,27 @@ impl HideRules {
         }
     }
 
+    /// The rules of the store: the repository's `hide` file plus Dotwarden's
+    /// own directories.
+    pub fn for_store(store: &crate::store::Store) -> Result<Self> {
+        Ok(Self::load(&store.dirs.home, &store.repo())?.always_hide(store.dirs.own_dirs()))
+    }
+
+    /// Why `path` is hidden, for error messages; `None` when it is not hidden.
+    pub fn why_hidden(&self, path: &Path, is_dir: bool) -> Option<String> {
+        if !self.is_hidden(path, is_dir) {
+            return None;
+        }
+        if self.always_hidden.iter().any(|h| path.starts_with(h)) {
+            return Some("it is inside one of dotwarden's own directories".to_string());
+        }
+        let m = self.matcher.matched_path_or_any_parents(path, is_dir);
+        Some(match m.inner() {
+            Some(g) => format!("it matches the hide rule `{}`", g.original()),
+            None => "it is hidden by a hide rule".to_string(),
+        })
+    }
+
     /// Always hide these absolute paths and everything below them.
     pub fn always_hide(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         self.always_hidden.extend(paths);
@@ -108,9 +129,111 @@ impl HideRules {
     }
 }
 
+/// The `hide` file, relative to the repository root.
+pub const HIDE_FILE: &str = "hide";
+
+/// A rule must be one non-empty, non-comment gitignore line.
+pub fn validate_pattern(pattern: &str) -> Result<()> {
+    let bad = |why: &str| -> Result<()> {
+        Err(crate::error::DwError::usage(format!("invalid hide rule {pattern:?}: {why}")).into())
+    };
+    if pattern.trim().is_empty() {
+        return bad("it is empty");
+    }
+    if pattern.starts_with('#') {
+        return bad("a leading # starts a comment; escape it as \\#");
+    }
+    if pattern.chars().any(char::is_control) {
+        return bad("it contains a newline or another control character");
+    }
+    if pattern != pattern.trim() {
+        return bad("leading or trailing whitespace is not significant in hide rules");
+    }
+    let mut b = GitignoreBuilder::new("/");
+    if let Err(e) = b.add_line(None, pattern) {
+        return bad(&e.to_string());
+    }
+    Ok(())
+}
+
+/// The rule lines of the repository's `hide` file (comments and blanks excluded).
+pub fn rule_lines(repo: &Path) -> Result<Vec<String>> {
+    let text = match std::fs::read_to_string(repo.join(HIDE_FILE)) {
+        Ok(t) => t,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => return Err(e.into()),
+    };
+    Ok(text
+        .lines()
+        .filter(|l| !l.trim().is_empty() && !l.starts_with('#'))
+        .map(str::to_string)
+        .collect())
+}
+
+pub fn has_rule(repo: &Path, pattern: &str) -> Result<bool> {
+    Ok(rule_lines(repo)?.iter().any(|l| l == pattern))
+}
+
+/// Append `pattern` to the `hide` file (atomic).
+pub fn add_rule(repo: &Path, pattern: &str) -> Result<()> {
+    validate_pattern(pattern)?;
+    let path = repo.join(HIDE_FILE);
+    let mut text = std::fs::read_to_string(&path).unwrap_or_default();
+    if !text.is_empty() && !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(pattern);
+    text.push('\n');
+    crate::fsutil::write_atomic(&path, text)
+}
+
+/// Remove every line equal to `pattern` from the `hide` file (atomic).
+pub fn remove_rule(repo: &Path, pattern: &str) -> Result<()> {
+    let path = repo.join(HIDE_FILE);
+    let text = std::fs::read_to_string(&path)?;
+    let mut out: String = text
+        .lines()
+        .filter(|l| *l != pattern)
+        .collect::<Vec<_>>()
+        .join("\n");
+    out.push('\n');
+    crate::fsutil::write_atomic(&path, out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn rule_editing_keeps_comments_and_other_rules() {
+        let d = tempfile::tempdir().unwrap();
+        std::fs::write(d.path().join(HIDE_FILE), "# c\n.cache/\nfoo").unwrap();
+        add_rule(d.path(), "bar/").unwrap();
+        assert_eq!(rule_lines(d.path()).unwrap(), [".cache/", "foo", "bar/"]);
+        remove_rule(d.path(), "foo").unwrap();
+        let text = std::fs::read_to_string(d.path().join(HIDE_FILE)).unwrap();
+        assert_eq!(text, "# c\n.cache/\nbar/\n");
+        assert!(has_rule(d.path(), "bar/").unwrap());
+        for bad in ["", "  ", "#x", "a\nb", " a", "a "] {
+            assert!(validate_pattern(bad).is_err(), "{bad:?}");
+        }
+        validate_pattern("\\#x").unwrap();
+        validate_pattern("!/Library/Application Support/Foo/").unwrap();
+    }
+
+    #[test]
+    fn why_hidden_names_the_rule() {
+        let r = HideRules::defaults(Path::new("/h")).unwrap();
+        let why = r.why_hidden(Path::new("/h/.cache/x"), false).unwrap();
+        assert!(why.contains(".cache/"), "{why}");
+        assert!(r.why_hidden(Path::new("/h/.zshrc"), false).is_none());
+        let r = r.always_hide([PathBuf::from("/h/own")]);
+        assert!(
+            r.why_hidden(Path::new("/h/own/x"), false)
+                .unwrap()
+                .contains("own directories")
+        );
+    }
 
     fn rules(text: &str) -> HideRules {
         HideRules::parse(Path::new("/h"), text).unwrap()

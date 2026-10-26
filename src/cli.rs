@@ -12,7 +12,8 @@ use crate::error::{self, DwError};
 use crate::machine;
 use crate::repo::{self, DEFAULT_BRANCH};
 use crate::store::Store;
-use crate::{doctor, status, tui};
+use crate::track::Plan;
+use crate::{cmds, doctor, status, tui};
 
 /// Dotfiles, secrets and variables in sync across your machines.
 ///
@@ -62,8 +63,131 @@ pub enum Command {
     Status,
     /// Check tool versions, paths, the registered machine and repository health.
     Doctor,
+    /// Add tracking of files, symlinks or folders to the pending list.
+    ///
+    /// Paths are HOME paths: `~/x`, absolute, or relative to the current folder.
+    /// A folder tracks its current files and is recorded as a tracked folder: new
+    /// files that appear in it later show up as New, never added automatically.
+    /// New tracked files apply to all machines. Hidden paths are refused.
+    Track {
+        /// Files, symlinks or folders to track.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+        /// Apply immediately instead of leaving the items in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Add untracking of files or folders to the pending list.
+    ///
+    /// The files leave the repository (staged in git, not committed); every
+    /// machine keeps its HOME copy.
+    Untrack {
+        /// Tracked files or folders to stop tracking.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+        /// Apply immediately instead of leaving the items in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List, show, drop or apply pending items (lists when no subcommand is given).
+    Pending {
+        #[command(subcommand)]
+        action: Option<PendingCmd>,
+    },
+    /// List, add or remove hide rules (lists when no subcommand is given).
+    ///
+    /// Hide rules use gitignore syntax relative to HOME, are shared by all
+    /// machines, keep noise out of the file browser and refuse tracking. Changes
+    /// go through the pending list.
+    Hide {
+        #[command(subcommand)]
+        action: Option<HideCmd>,
+    },
+    /// Show the tracked state of the entries of a HOME folder.
+    ///
+    /// States: tracked, tracked-folder, contains-tracked, new (untracked file in a
+    /// tracked folder), untracked, hidden.
+    Ls {
+        /// A HOME path (`~/x`, absolute or relative); the current folder inside HOME, else HOME.
+        path: Option<String>,
+        /// Include entries matched by hide rules.
+        #[arg(long, short = 'a')]
+        all: bool,
+    },
     /// Open the terminal UI (the default when no command is given).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum PendingCmd {
+    /// List pending items; stale ones are marked.
+    List,
+    /// Show everything one item will change.
+    Show {
+        /// Item number.
+        id: u64,
+    },
+    /// Remove items from the list without applying them.
+    Drop {
+        /// Item numbers.
+        ids: Vec<u64>,
+        /// Drop every item.
+        #[arg(long)]
+        all: bool,
+        /// Show what would be dropped without dropping it.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Apply items: each is all-or-nothing and staged in git (not committed).
+    ///
+    /// An item whose files or repository changed since it was added is stale: it
+    /// is skipped and kept, and the exit code is 7.
+    Apply {
+        /// Item numbers.
+        ids: Vec<u64>,
+        /// Apply every item.
+        #[arg(long)]
+        all: bool,
+        /// Show what would be applied (and which items are stale) without applying.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum HideCmd {
+    /// List the hide rules.
+    List,
+    /// Add hide rules (gitignore syntax, e.g. `/.cache/` or `*.log`).
+    Add {
+        /// Rules to add.
+        #[arg(required = true, num_args = 1..)]
+        patterns: Vec<String>,
+        /// Apply immediately instead of leaving the items in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove hide rules (exact text as listed).
+    Remove {
+        /// Rules to remove.
+        #[arg(required = true, num_args = 1..)]
+        patterns: Vec<String>,
+        /// Apply immediately instead of leaving the items in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 pub fn main(bin_name: &'static str) -> ExitCode {
@@ -139,6 +263,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 return Ok(ExitCode::from(error::Kind::Error.code()));
             }
         }
+        Command::Track {
+            paths,
+            apply,
+            dry_run,
+        } => return cmds::track_cmd(&store, Plan::Track, &paths, apply, dry_run, json),
+        Command::Untrack {
+            paths,
+            apply,
+            dry_run,
+        } => return cmds::track_cmd(&store, Plan::Untrack, &paths, apply, dry_run, json),
+        Command::Pending { action } => {
+            return match action.unwrap_or(PendingCmd::List) {
+                PendingCmd::List => cmds::pending_list(&store, json),
+                PendingCmd::Show { id } => cmds::pending_show(&store, id, json),
+                PendingCmd::Drop { ids, all, dry_run } => {
+                    cmds::pending_drop(&store, &ids, all, dry_run, json)
+                }
+                PendingCmd::Apply { ids, all, dry_run } => {
+                    cmds::pending_apply(&store, &ids, all, dry_run, json)
+                }
+            };
+        }
+        Command::Hide { action } => {
+            return match action.unwrap_or(HideCmd::List) {
+                HideCmd::List => cmds::hide_list(&store, json),
+                HideCmd::Add {
+                    patterns,
+                    apply,
+                    dry_run,
+                } => cmds::hide_cmd(&store, true, &patterns, apply, dry_run, json),
+                HideCmd::Remove {
+                    patterns,
+                    apply,
+                    dry_run,
+                } => cmds::hide_cmd(&store, false, &patterns, apply, dry_run, json),
+            };
+        }
+        Command::Ls { path, all } => return cmds::ls_cmd(&store, path.as_deref(), all, json),
         Command::Tui => {
             if !store.is_initialised() {
                 return Err(DwError::usage(

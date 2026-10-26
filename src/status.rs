@@ -35,6 +35,11 @@ pub struct Status {
     pub machine: Option<MachineStatus>,
     pub repo: Option<RepoStatus>,
     pub pending: usize,
+    /// Tracked files and recorded tracked folders.
+    pub tracked_files: usize,
+    pub tracked_folders: usize,
+    /// Untracked, unhidden files inside tracked folders (relative to HOME).
+    pub new_files: Vec<String>,
     pub vault: &'static str,
 }
 
@@ -53,6 +58,9 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             machine: None,
             repo: None,
             pending: 0,
+            tracked_files: 0,
+            tracked_folders: 0,
+            new_files: Vec::new(),
             vault: "none",
         });
     }
@@ -98,6 +106,10 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         .lines()
         .map(str::to_string)
         .collect();
+    let pending = crate::pending::load(store)?.items.len();
+    let tracked = crate::source::load(&store.repo())?;
+    let rules = crate::hide::HideRules::for_store(store)?;
+    let new_files = crate::track::new_files(&store.dirs.home, &tracked, &rules, cancel)?;
     Ok(Status {
         initialised: true,
         repo_path,
@@ -111,7 +123,10 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             behind,
             remotes,
         }),
-        pending: 0,
+        pending,
+        tracked_files: tracked.files.len(),
+        tracked_folders: tracked.folders.len(),
+        new_files,
         vault: "none",
     })
 }
@@ -164,6 +179,22 @@ impl Status {
             ));
         }
         s.push_str(&format!("Pending:    {}\n", self.pending));
+        s.push_str(&format!(
+            "Tracked:    {} files, {} folders\n",
+            self.tracked_files, self.tracked_folders
+        ));
+        if !self.new_files.is_empty() {
+            s.push_str(&format!(
+                "New files:  {} (in tracked folders)\n",
+                self.new_files.len()
+            ));
+            for f in self.new_files.iter().take(20) {
+                s.push_str(&format!("  ? ~/{f}\n"));
+            }
+            if self.new_files.len() > 20 {
+                s.push_str(&format!("  … and {} more\n", self.new_files.len() - 20));
+            }
+        }
         s.push_str(&format!("Vault:      {}\n", self.vault));
         s.push_str(&format!("Repository: {}\n", self.repo_path));
         s
