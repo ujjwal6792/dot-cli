@@ -1,0 +1,16 @@
+{{- /* JSON list of the targets the current machine matches, e.g.
+       ["platform:linux","distribution:cachyos","family:arch-like","machine:laptop"].
+       The machine's registry name comes from the generated chezmoi config
+       (data.dotwardenMachine.name); everything else from the registry. */ -}}
+{{- if not (hasKey . "dotwardenMachine") -}}
+{{- fail "dotwarden: chezmoi data 'dotwardenMachine' is missing; run chezmoi through dotwarden" -}}
+{{- end -}}
+{{- $name := .dotwardenMachine.name -}}
+{{- $machine := dict -}}
+{{- range (dig "dotwarden" "machines" (list) .) }}{{ if eq .name $name }}{{ $machine = . }}{{ end }}{{ end -}}
+{{- if not $machine -}}
+{{- fail (printf "dotwarden: machine %q is not in the machine registry" $name) -}}
+{{- end -}}
+{{- $targets := list (printf "platform:%s" $machine.platform) (printf "distribution:%s" $machine.distribution) (printf "machine:%s" $machine.name) -}}
+{{- range $machine.families }}{{ $targets = append $targets (printf "family:%s" .) }}{{ end -}}
+{{- toJson $targets -}}

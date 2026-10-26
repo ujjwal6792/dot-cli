@@ -1,0 +1,33 @@
+# Dotwarden hide rules (gitignore syntax), shared by all machines.
+# Hidden paths are left out of the file browser (press . to show them) and
+# cannot be tracked. Use "!pattern" to un-hide something.
+
+# Caches and build output
+.cache/
+node_modules/
+__pycache__/
+.npm/
+.cargo/registry/
+.cargo/git/
+.rustup/
+.gradle/caches/
+.Trash/
+.local/share/Trash/
+
+# Dotwarden's own machine-local files
+.local/share/dotwarden/
+.local/state/dotwarden/
+
+# Histories and session noise
+.zsh_history
+.zsh_sessions/
+.bash_history
+.python_history
+.node_repl_history
+.lesshst
+.viminfo
+.zcompdump*
+.DS_Store
+
+# macOS Library is mostly application state; un-hide specific paths explicitly
+/Library/*

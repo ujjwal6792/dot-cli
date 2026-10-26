@@ -1,0 +1,26 @@
+{{- /* Variant selection. Call with (dict "data" . "path" "<target path>").
+       Prints the `file` of the most specific matching variant of that target
+       (machine > distribution > family > platform), or nothing when no variant
+       matches and the default content applies. Two matches at the same
+       specificity are an error. */ -}}
+{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- $best := 0 -}}
+{{- $file := "" -}}
+{{- $ties := list -}}
+{{- range (dig "dotwarden" "variants" .path (list) .data) -}}
+{{- $parts := splitList ":" .target -}}
+{{- $level := 0 -}}
+{{- if eq (index $parts 0) "machine" }}{{ $level = 4 }}
+{{- else if eq (index $parts 0) "distribution" }}{{ $level = 3 }}
+{{- else if eq (index $parts 0) "family" }}{{ $level = 2 }}
+{{- else if eq (index $parts 0) "platform" }}{{ $level = 1 }}
+{{- else }}{{ fail (printf "dotwarden: unknown target kind in %q" .target) }}{{ end -}}
+{{- if has .target $targets -}}
+{{- if gt $level $best }}{{ $best = $level }}{{ $file = .file }}{{ $ties = list .target }}
+{{- else if eq $level $best }}{{ $ties = append $ties .target }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- if gt (len $ties) 1 -}}
+{{- fail (printf "dotwarden: ambiguous variants for %s at the same specificity: %s" .path (join ", " $ties)) -}}
+{{- end -}}
+{{- $file -}}

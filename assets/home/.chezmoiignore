@@ -1,0 +1,16 @@
+{{- /* Written once by dotwarden; never regenerated or hand-edited (ADR 0005).
+       Evaluates the assignments in .chezmoidata/dotwarden.toml for this machine:
+       a file applies when (no includes OR any include matches) AND no exclude
+       matches. Everything printed here is a target path that is NOT applied;
+       glob characters in paths are escaped so they match literally. */ -}}
+{{- $targets := includeTemplate "dotwarden/targets" . | fromJson -}}
+{{- range $path, $a := (dig "dotwarden" "assignments" (dict) .) -}}
+{{- $include := get $a "include" | default (list) -}}
+{{- $exclude := get $a "exclude" | default (list) -}}
+{{- $applies := not $include -}}
+{{- range $include }}{{ if has . $targets }}{{ $applies = true }}{{ end }}{{ end -}}
+{{- range $exclude }}{{ if has . $targets }}{{ $applies = false }}{{ end }}{{ end -}}
+{{- if not $applies }}
+{{ regexReplaceAll `([\\*?\[\]{}])` $path `\$1` }}
+{{- end }}
+{{ end -}}
