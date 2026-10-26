@@ -1,8 +1,8 @@
 # Dotwarden v2 tickets
 
 Draft bodies for the GitHub parent issue and its children. Each ticket is a
-vertical slice: CLI + TUI + tests, verified on macOS and in the Docker suites
-(Ubuntu, Arch, CachyOS) unless stated. Section numbers refer to
+vertical slice: CLI + TUI + tests, verified on macOS only (no Linux, Docker or emulated
+runs; the owner tests Linux on real machines later). Section numbers refer to
 [spec.md](spec.md).
 
 ---
@@ -37,10 +37,10 @@ Spec §2, §3, §4 (registration only), §9, §10 (shell), §13.
 - `dw status --json` / `dw doctor`.
 - TUI shell: panels 1–5 laid out, Files browser over HOME with hide rules and `.`
   toggle, non-blocking job runner, help overlay, quit/resize.
-- Docker harness (Ubuntu, Arch, CachyOS) running the test suite.
 
 Acceptance: a user's existing `~/.config/chezmoi` and `~/.local/share/chezmoi`
-are untouched (test); init/clone/register work in all three containers; TUI
+are untouched (test); init/clone/register work on macOS, with Linux
+detection covered by unit tests on sample `/etc/os-release` files; TUI
 browses HOME at 80×24 and 45×14; the event loop never blocks on I/O (test with a
 slow fake tool).
 
@@ -199,8 +199,8 @@ Spec §2, §13.
 - Release workflow for macOS arm64, Linux x86-64/arm64 bundles with licences and
   checksums; `install.sh`; `self-update` and rollback; `.deb`, AUR `dotwarden-bin`,
   Homebrew tap.
-- Multi-machine acceptance: Mac + Ubuntu and CachyOS containers on a shared bare
-  remote covering assignments, variants, values, vault, incoming, conflicts,
+- Multi-machine acceptance on macOS: isolated HOME/state directories registered as
+  Ubuntu, CachyOS and macOS machines on a shared bare remote, covering assignments, variants, values, vault, incoming, conflicts,
   retire, archive restore.
 
 Blocked by all others.

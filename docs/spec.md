@@ -291,12 +291,15 @@ keymap. Changes to repository-wide settings go through the pending list.
 
 ## 13. Verification
 
-- Unit and integration tests run with the bundled tools and isolated HOME/state.
-- Docker suites on Ubuntu, Arch and CachyOS (arm64 images locally) run the
-  integration tests.
-- A multi-machine scenario: this Mac plus two containers sharing a local bare
-  remote exercise assignments, variants, values, vault unlock, incoming, conflicts
-  and retire.
+- Unit and integration tests run with the bundled tools and isolated HOME/state,
+  on macOS only. Implementations do not run Linux, Docker or emulated tests; the
+  owner verifies Linux behaviour on real Linux machines after development, and
+  Linux fixes follow from that. Linux-specific code must still compile and carry
+  unit tests that do not need a Linux host.
+- A multi-machine scenario on macOS: several isolated HOME/state directories
+  registered as different machines (with overridden platform/distribution data)
+  share a local bare remote and exercise assignments, variants, values, vault
+  unlock, incoming, conflicts and retire.
 - TUI tests use Ratatui's test backend with real key events; a PTY smoke test
   covers start, handoff to editor, resize and exit.
 - No test may print a secret value; a test asserts outputs and logs contain none.
