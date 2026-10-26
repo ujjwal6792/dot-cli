@@ -46,31 +46,35 @@ pub struct Tracked {
     pub folders: BTreeSet<String>,
 }
 
-const DIR_PREFIXES: [&str; 3] = ["exact_", "private_", "readonly_"];
-const FILE_PREFIXES: [&str; 5] = [
-    "encrypted_",
-    "private_",
-    "readonly_",
-    "empty_",
-    "executable_",
-];
+/// Strip each prefix of `order` at most once, in this order (chezmoi's rule:
+/// `exact_exact_x` is a folder literally named `exact_x`).
+fn strip_in_order<'a>(mut s: &'a str, order: &[&str]) -> &'a str {
+    for p in order {
+        if let Some(rest) = s.strip_prefix(p) {
+            s = rest;
+        }
+    }
+    s
+}
+
+/// The target name after `literal_` / `dot_` handling.
+fn plain_name(s: &str) -> String {
+    if let Some(rest) = s.strip_prefix("literal_") {
+        rest.to_string()
+    } else if let Some(rest) = s.strip_prefix("dot_") {
+        format!(".{rest}")
+    } else {
+        s.to_string()
+    }
+}
 
 /// Decode one source directory name into its target name.
 fn decode_dir(name: &str) -> Option<String> {
     if name.starts_with('.') || name.starts_with("external_") || name.starts_with("remove_") {
         return None;
     }
-    let mut s = name;
-    while let Some(rest) = DIR_PREFIXES.iter().find_map(|p| s.strip_prefix(p)) {
-        s = rest;
-    }
-    if let Some(rest) = s.strip_prefix("literal_") {
-        return Some(rest.to_string());
-    }
-    Some(match s.strip_prefix("dot_") {
-        Some(rest) => format!(".{rest}"),
-        None => s.to_string(),
-    })
+    let s = strip_in_order(name, &["exact_", "private_", "readonly_"]);
+    Some(plain_name(s))
 }
 
 /// Decode one source file name into its target name and whether it is a symlink.
@@ -90,18 +94,18 @@ fn decode_file(name: &str) -> Option<(String, bool)> {
     {
         s = rest;
     }
-    let mut encrypted = false;
-    while let Some(rest) = FILE_PREFIXES.iter().find_map(|p| s.strip_prefix(p)) {
-        encrypted |= s.starts_with("encrypted_");
-        s = rest;
-    }
-    let mut target = if let Some(rest) = s.strip_prefix("literal_") {
-        rest.to_string()
-    } else if let Some(rest) = s.strip_prefix("dot_") {
-        format!(".{rest}")
-    } else {
-        s.to_string()
-    };
+    let encrypted = s.starts_with("encrypted_");
+    let s = strip_in_order(
+        s,
+        &[
+            "encrypted_",
+            "private_",
+            "readonly_",
+            "empty_",
+            "executable_",
+        ],
+    );
+    let mut target = plain_name(s);
     if encrypted {
         for ext in [".age", ".asc"] {
             if let Some(t) = target.strip_suffix(ext) {
@@ -110,7 +114,9 @@ fn decode_file(name: &str) -> Option<(String, bool)> {
             }
         }
     }
-    if let Some(t) = target.strip_suffix(".tmpl") {
+    if let Some(t) = target.strip_suffix(".literal") {
+        target = t.to_string();
+    } else if let Some(t) = target.strip_suffix(".tmpl") {
         target = t.to_string();
     }
     (!target.is_empty()).then_some((target, symlink))
@@ -311,6 +317,13 @@ mod tests {
         );
         assert_eq!(decode_file("symlink_link"), Some(("link".into(), true)));
         assert_eq!(decode_file("dot_x.tmpl"), Some((".x".into(), false)));
+        assert_eq!(
+            decode_file("x.tmpl.literal"),
+            Some(("x.tmpl".into(), false))
+        );
+        assert_eq!(decode_file("exact_y"), Some(("exact_y".into(), false)));
+        assert_eq!(decode_dir("exact_exact_y"), Some("exact_y".into()));
+        assert_eq!(decode_dir("literal_private_d"), Some("private_d".into()));
         assert_eq!(
             decode_file("encrypted_dot_k.age"),
             Some((".k".into(), false))
