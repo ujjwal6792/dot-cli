@@ -125,10 +125,18 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    includes, no includes means every machine, and plain `chezmoi apply`
    enforces the result. Assigning edits only data; `.chezmoiignore` is
    byte-identical to the template shipped with dotwarden.
-   *Caveats found:* (a) `.chezmoiignore` lines are globs, so paths containing
-   `* ? [ ] { } \` must be escaped, which the template does
-   (`regexReplaceAll`); without that, an assignment for `.a[1]b` ignored
-   `.a1b` instead. (b) Ignoring every file of a directory leaves the empty
+   *Caveats found:* (a) `.chezmoiignore` lines are patterns, not paths. The
+   template escapes: glob characters `* ? [ ] { } \` with a backslash (without
+   that, an assignment for `.a[1]b` ignored `.a1b`); a leading `#` (comment) and
+   a leading `!` (negation) with a backslash; and every space or other Unicode
+   separator as `[ ]`, because chezmoi trims whitespace around each line.
+   Verified for `#x`, `!x`, `a b ` (trailing space), ` lead`, `a<NBSP>`, `[1]`,
+   `*`, `?`, `{a,b}` and a backslash. Paths that cannot be one line (newline,
+   carriage return, tab or any control character), absolute paths, `..`
+   components and empty components are refused with a usage error when the
+   assignment is made (`assign::set_assignment`), before anything is written.
+   An include or exclude whose target kind is unknown never matches (`dw doctor`
+   warns). (b) Ignoring every file of a directory leaves the empty
    directory itself managed; to keep a directory off a machine, assign the
    directory path.
 6. **Variant selection.** Variants are data, keyed by target path:
@@ -139,9 +147,14 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    ```
    The `dotwarden/variant` helper prints the `file` of the most specific
    matching variant (machine > distribution > family > platform) or nothing when
-   the default content applies. Two matches at the same specificity (for
-   example a machine in two families, each with a variant) fail with
-   `ambiguous variants for <path> at the same specificity: …`. A tracked file
+   the default content applies. Selection itself lives in the shared
+   `dotwarden/select` helper (reused by values): only the best level matters, so
+   a more specific match beats any tie at a lower level; two matches at the best
+   specificity (for example a machine in two families, each with a variant)
+   fail with `ambiguous variants for <path> at the same specificity: …`. An
+   entry with an unknown target kind never matches and does not affect other
+   entries or files. Retired machines have no targets: chezmoi on a retired
+   machine fails with `machine "<name>" is retired and has no targets`. A tracked file
    using variants is a template such as `home/dot_gitconfig.tmpl`:
    ```
    {{- $v := includeTemplate "dotwarden/variant" (dict "data" . "path" ".gitconfig") | trim -}}
@@ -151,7 +164,17 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    first error, but `chezmoi apply --keep-going` writes every other file and
    reports the failing one, so dotwarden must apply with `--keep-going` to
    "block apply of that file only".
-7. **Isolation.** With explicit `--config/--source/--persistent-state/--cache/
+7. **Git isolation.** Dotwarden's git (and the git chezmoi runs, which gets the
+   bundled git first on `PATH`) runs with `GIT_CONFIG_NOSYSTEM=1` and
+   `GIT_CONFIG_GLOBAL=/dev/null`; only `user.name`, `user.email`,
+   `user.signingkey`, `commit.gpgsign`, `gpg.format`, `gpg.program` and
+   `gpg.{openpgp,x509,ssh}.program` are read from the user's global config
+   (honouring `GIT_CONFIG_GLOBAL` if the user set it) and passed on as
+   `GIT_CONFIG_COUNT/KEY/VALUE`. Hooks, `core.fsmonitor`, URL rewrites, aliases
+   and every other global setting are not applied. Other `GIT_*` variables are
+   dropped; `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_TERMINAL_PROMPT` and
+   `SSH_AUTH_SOCK` pass through so SSH remotes work.
+8. **Isolation.** With explicit `--config/--source/--persistent-state/--cache/
    --destination` and `CHEZMOI_*` stripped, a pre-existing `~/.config/chezmoi`
    and `~/.local/share/chezmoi` are neither read (their data and source never
    appear) nor modified (byte, size and mtime identical after init, status,
@@ -166,8 +189,14 @@ Exact template code (written once into every repository; the files in
 {{- /* Written once by dotwarden; never regenerated or hand-edited (ADR 0005).
        Evaluates the assignments in .chezmoidata/dotwarden.toml for this machine:
        a file applies when (no includes OR any include matches) AND no exclude
-       matches. Everything printed here is a target path that is NOT applied;
-       glob characters in paths are escaped so they match literally. */ -}}
+       matches. Everything printed here is a target path that is NOT applied.
+       Each line is a chezmoi ignore pattern, so a path is escaped to match
+       literally: glob characters get a backslash; a leading # (comment) or !
+       (negation) is backslash-escaped; spaces and other Unicode separators
+       become [ ] because chezmoi trims whitespace around lines. Paths that
+       cannot be represented (control characters, newlines) are refused when
+       the assignment is made. An include or exclude with an unknown target
+       kind never matches. */ -}}
 {{- $targets := includeTemplate "dotwarden/targets" . | fromJson -}}
 {{- range $path, $a := (dig "dotwarden" "assignments" (dict) .) -}}
 {{- $include := get $a "include" | default (list) -}}
@@ -176,7 +205,10 @@ Exact template code (written once into every repository; the files in
 {{- range $include }}{{ if has . $targets }}{{ $applies = true }}{{ end }}{{ end -}}
 {{- range $exclude }}{{ if has . $targets }}{{ $applies = false }}{{ end }}{{ end -}}
 {{- if not $applies }}
-{{ regexReplaceAll `([\\*?\[\]{}])` $path `\$1` }}
+{{- $p := regexReplaceAll `([\\*?\[\]{}])` $path `\$1` -}}
+{{- $p = regexReplaceAll `^([#!])` $p `\$1` -}}
+{{- $p = regexReplaceAll `(\pZ)` $p `[$1]` }}
+{{ $p }}
 {{- end }}
 {{ end -}}
 ```
@@ -186,13 +218,22 @@ Exact template code (written once into every repository; the files in
 {{- /* JSON list of the targets the current machine matches, e.g.
        ["platform:linux","distribution:cachyos","family:arch-like","machine:laptop"].
        The machine's registry name comes from the generated chezmoi config
-       (data.dotwardenMachine.name); everything else from the registry. */ -}}
+       (data.dotwardenMachine.name); everything else from the registry.
+       Retired machines are not in any target: a retired machine is refused. */ -}}
 {{- if not (hasKey . "dotwardenMachine") -}}
 {{- fail "dotwarden: chezmoi data 'dotwardenMachine' is missing; run chezmoi through dotwarden" -}}
 {{- end -}}
 {{- $name := .dotwardenMachine.name -}}
 {{- $machine := dict -}}
-{{- range (dig "dotwarden" "machines" (list) .) }}{{ if eq .name $name }}{{ $machine = . }}{{ end }}{{ end -}}
+{{- $retired := false -}}
+{{- range (dig "dotwarden" "machines" (list) .) -}}
+{{- if eq .name $name -}}
+{{- if get . "retired" | default false }}{{ $retired = true }}{{ else }}{{ $machine = . }}{{ end -}}
+{{- end -}}
+{{- end -}}
+{{- if $retired -}}
+{{- fail (printf "dotwarden: machine %q is retired and has no targets" $name) -}}
+{{- end -}}
 {{- if not $machine -}}
 {{- fail (printf "dotwarden: machine %q is not in the machine registry" $name) -}}
 {{- end -}}
@@ -201,34 +242,42 @@ Exact template code (written once into every repository; the files in
 {{- toJson $targets -}}
 ```
 
-`home/.chezmoitemplates/dotwarden/variant`
+`home/.chezmoitemplates/dotwarden/select`
 ```
-{{- /* Variant selection. Call with (dict "data" . "path" "<target path>").
-       Prints the `file` of the most specific matching variant of that target
-       (machine > distribution > family > platform), or nothing when no variant
-       matches and the default content applies. Two matches at the same
-       specificity are an error. */ -}}
-{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- /* Specificity selection shared by variants and values: machine >
+       distribution > family > platform. Call with
+       (dict "targets" <this machine's targets> "entries" <list of dicts with a
+       .target> "what" "<label for errors>"). Prints the winning entry as JSON,
+       or nothing when no entry matches. Two matches at the best level are an
+       error; ties at a lower level do not matter when a more specific entry
+       matches. An entry whose target kind is unknown never matches. */ -}}
+{{- $levels := dict "platform" 1 "family" 2 "distribution" 3 "machine" 4 -}}
 {{- $best := 0 -}}
-{{- $file := "" -}}
+{{- $winner := dict -}}
 {{- $ties := list -}}
-{{- range (dig "dotwarden" "variants" .path (list) .data) -}}
-{{- $parts := splitList ":" .target -}}
-{{- $level := 0 -}}
-{{- if eq (index $parts 0) "machine" }}{{ $level = 4 }}
-{{- else if eq (index $parts 0) "distribution" }}{{ $level = 3 }}
-{{- else if eq (index $parts 0) "family" }}{{ $level = 2 }}
-{{- else if eq (index $parts 0) "platform" }}{{ $level = 1 }}
-{{- else }}{{ fail (printf "dotwarden: unknown target kind in %q" .target) }}{{ end -}}
-{{- if has .target $targets -}}
-{{- if gt $level $best }}{{ $best = $level }}{{ $file = .file }}{{ $ties = list .target }}
+{{- range .entries -}}
+{{- $level := get $levels (index (splitList ":" .target) 0) | default 0 -}}
+{{- if and (gt $level 0) (has .target $.targets) -}}
+{{- if gt $level $best }}{{ $best = $level }}{{ $winner = . }}{{ $ties = list .target }}
 {{- else if eq $level $best }}{{ $ties = append $ties .target }}{{ end -}}
 {{- end -}}
 {{- end -}}
 {{- if gt (len $ties) 1 -}}
-{{- fail (printf "dotwarden: ambiguous variants for %s at the same specificity: %s" .path (join ", " $ties)) -}}
+{{- fail (printf "dotwarden: ambiguous %s at the same specificity: %s" .what (join ", " $ties)) -}}
 {{- end -}}
-{{- $file -}}
+{{- if $winner }}{{ toJson $winner }}{{ end -}}
+```
+
+`home/.chezmoitemplates/dotwarden/variant`
+```
+{{- /* Variant selection. Call with (dict "data" . "path" "<target path>").
+       Prints the `file` of the most specific matching variant of that target
+       (see dotwarden/select), or nothing when no variant matches and the
+       default content applies. */ -}}
+{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- $entries := dig "dotwarden" "variants" .path (list) .data -}}
+{{- $winner := includeTemplate "dotwarden/select" (dict "targets" $targets "entries" $entries "what" (printf "variants for %s" .path)) -}}
+{{- if $winner }}{{ (fromJson $winner).file }}{{ end -}}
 ```
 
 ## 4. Machines and targeting (ADR 0005)
