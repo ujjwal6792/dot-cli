@@ -31,8 +31,16 @@ image="dotwarden-test-$distro-$arch_tag"
 
 # shellcheck disable=SC2086
 docker build $pflag --build-arg "BASE=$base" -t "$image" -f "$here/$file" "$here"
+emulated=""
+if [ -n "$platform" ]; then
+  case "$(uname -m)/$platform" in
+    arm64/linux/arm64|aarch64/linux/arm64|x86_64/linux/amd64) ;;
+    *) emulated=1 ;;
+  esac
+fi
+
 # shellcheck disable=SC2086
-docker run --rm $pflag \
+docker run --rm $pflag -e "DOTWARDEN_EMULATED=$emulated" \
   -v "$root:/src:ro" \
   -v "dotwarden-cache-$distro-$arch_tag:/cache" \
   "$image"
