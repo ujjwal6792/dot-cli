@@ -572,6 +572,7 @@ fn help_lists_the_new_keys() {
     for needle in [
         "Space",
         "range selection",
+        "hide (or un-hide) the path",
         "drop the selected pending item",
         "review and apply",
     ] {

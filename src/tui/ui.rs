@@ -23,6 +23,8 @@ const FOOTER: &str =
     " q quit · ? help · 1-5 · 0 pending · Space track · v range · . hidden · r refresh";
 
 const HELP: &[(&str, &str)] = &[
+    ("?", "toggle this help"),
+    ("q / Ctrl-C", "quit"),
     ("1-5", "focus panel Status/Files/Changes/Git/Machines"),
     ("Tab / Shift-Tab", "next / previous panel"),
     ("0", "focus the Pending pane (also Tab after Machines)"),
@@ -41,7 +43,7 @@ const HELP: &[(&str, &str)] = &[
     ("Enter (Pending)", "review and apply all checked items"),
     (
         "markers",
-        "✓ tracked  ▣ tracked folder  ◇ holds tracked  ? new  + / - pending track / untrack",
+        "✓ tracked ▣ folder ◇ holds tracked ? new +/- pending",
     ),
     ("l / → / Enter", "open folder (Files)"),
     (
@@ -51,8 +53,6 @@ const HELP: &[(&str, &str)] = &[
     ("< / >, Home / End", "first / last item"),
     (".", "show or hide items matched by hide rules"),
     ("r", "refresh status and folder"),
-    ("?", "toggle this help"),
-    ("q / Ctrl-C", "quit"),
 ];
 
 fn border(focused: bool) -> Style {
@@ -479,7 +479,7 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
 
 fn draw_help(f: &mut Frame, area: Rect) {
     let w = area.width.saturating_sub(4).min(76);
-    let h = (HELP.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let h = (HELP.len() as u16 + 2).min(area.height);
     let rect = Rect {
         x: area.x + (area.width.saturating_sub(w)) / 2,
         y: area.y + (area.height.saturating_sub(h)) / 2,
