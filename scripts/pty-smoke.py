@@ -30,7 +30,7 @@ proc = subprocess.Popen([binary], env=env, stdin=slave, stdout=slave, stderr=sla
 os.close(slave)
 screen = b""
 
-def pump(until, timeout=5.0):
+def pump(until, timeout=5.0, what="condition"):
     global screen
     deadline = time.time() + timeout
     while time.time() < deadline:
@@ -42,10 +42,10 @@ def pump(until, timeout=5.0):
                 screen += os.read(master, 65536)
             except OSError:
                 break
-    raise SystemExit(f"timeout waiting; tail of output: {screen[-400:]!r}")
+    raise SystemExit(f"timeout waiting for {what}; tail of output: {screen[-400:]!r}")
 
 def expect(text, timeout=5.0):
-    pump(lambda s: text.encode() in s, timeout)
+    pump(lambda s: text.encode() in s, timeout, repr(text))
 
 def mark():
     global screen
@@ -56,15 +56,19 @@ try:
     expect("[5] Machines")
     expect(".zshrc")
     assert b".cache" not in screen, "hidden item was shown"
-    mark(); os.write(master, b"?"); expect("Help (Esc to close)")
+    mark(); os.write(master, b"?"); expect("toggle this help")
     mark(); os.write(master, b"\x1b"); time.sleep(0.3)
-    mark(); os.write(master, b"."); expect(".cache")
+    mark(); os.write(master, b" "); expect("Added #1")
+    # The screen is redrawn as a diff, so wait for the title that only appears now.
+    mark(); os.write(master, b"."); expect("(+hidden)")
     mark(); setsize(master, 14, 45); proc.send_signal(signal.SIGWINCH)
     pump(lambda s: b"[2] Files" in s and b"[3] Changes" not in s, 5.0)
     mark(); os.write(master, b"q")
     code = proc.wait(timeout=5)
     assert code == 0, f"exit code {code}"
-    print("pty smoke: OK (start, hidden toggle, help, resize to 45x14, quit)")
+    listed = subprocess.run([binary, "pending", "list"], env=env, capture_output=True, text=True).stdout
+    assert "Track folder ~/.config" in listed, f"Space did not add a pending item: {listed!r}"
+    print("pty smoke: OK (start, Space adds a pending item, hidden toggle, help, resize to 45x14, quit)")
 finally:
     if proc.poll() is None:
         proc.kill()

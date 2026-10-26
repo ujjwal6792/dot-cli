@@ -181,6 +181,26 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    doctor, managed, status, apply, data); on a fresh HOME neither directory is
    created.
 
+9. **Track and untrack (ticket 2).** Verified against chezmoi v2.73.3 by
+   `tests/track.rs`:
+   - `chezmoi add --dry-run --verbose <files>` prints `diff --git a/<S> b/<S>`
+     for every repository path it would create (directories too, with mode
+     `40xxx`) without touching the repository or the persistent state; split at
+     the middle of the line, `<S>` is unambiguous even with spaces, quotes and
+     non-ASCII. This is the exact preview of a track item.
+   - `chezmoi add` records last-written state itself, so `chezmoi status` is
+     empty right after tracking; it does not stage anything (dotwarden runs
+     `git add`).
+   - chezmoi strips each source-name attribute once, in a fixed order (a folder
+     literally named `exact_x` is `exact_exact_x`; a file named `x.tmpl` is
+     `x.tmpl.literal`; a file named `dot_x` is `literal_dot_x`).
+   - `chezmoi managed` omits files an assignment keeps off this machine, so
+     "is it tracked" is answered by decoding the source tree (`src/source.rs`,
+     cross-checked against `chezmoi managed`); tracking such a file again would
+     overwrite the shared version.
+   - Tracked folders are recorded as `dotwarden.tracked_folders = ["<target path>", …]`
+     in `.chezmoidata/dotwarden.toml`.
+
 Exact template code (written once into every repository; the files in
 `assets/home/` are the source of truth and are embedded in the binary):
 
