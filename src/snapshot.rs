@@ -116,7 +116,7 @@ pub fn take_at(
         .chars()
         .filter(|c| c.is_ascii_alphanumeric())
         .collect();
-    let mut n = u32::try_from(std::process::id() % 10_000).unwrap_or(0);
+    let mut n = std::process::id() % 10_000;
     let (id, dir) = loop {
         let id = format!("{compact}-{n:04}");
         let dir = root.join(&id);

@@ -10,9 +10,10 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
-    ActionReport, Done, Jobs, KEY_ACTION, KEY_HIDE, KEY_LISTING, KEY_PENDING, KEY_PREVIEW,
-    KEY_STATUS, KEY_TRACKED, Payload,
+    ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_HIDE, KEY_LISTING, KEY_PENDING,
+    KEY_PREVIEW, KEY_STATUS, KEY_TRACKED, Payload,
 };
+use crate::changes::{self, Change, CommitOpts, State};
 use crate::hide::HideRules;
 use crate::pending::{self, Item, List};
 use crate::source::{self, Tracked};
@@ -87,7 +88,29 @@ pub enum ActionReq {
     Hide(std::path::PathBuf, bool),
     Drop(u64),
     Apply(Vec<u64>),
+    /// Stage (or, from the Staged tab, unstage) these HOME paths, relative to
+    /// HOME; `None` is every change that can be.
+    Stage(Option<Vec<String>>),
+    Unstage(Option<Vec<String>>),
+    /// Commit with this message; `amend` replaces the last commit.
+    Commit {
+        message: String,
+        amend: bool,
+    },
+    /// Read the last commit message to open the amend box with.
+    LoadAmend,
+    Discard(Vec<String>),
 }
+
+/// The commit message being typed.
+#[derive(Debug, Clone)]
+pub struct CommitBox {
+    pub text: String,
+    pub amend: bool,
+}
+
+/// Tabs of the Changes panel.
+pub const TABS: [&str; 4] = ["Local", "Staged", "Incoming", "Conflicts"];
 
 /// A modal dialog over the main screen.
 #[derive(Debug)]
@@ -96,6 +119,10 @@ pub enum Dialog {
     Review(Vec<Item>),
     /// Per-item outcome of an apply, partial results included.
     Result(Vec<ItemResult>),
+    /// The commit message box: Enter commits, Ctrl+J / Alt+Enter add a line.
+    Commit(CommitBox),
+    /// `d` in Changes: y/n before overwriting these HOME paths.
+    ConfirmDiscard(Vec<String>),
 }
 
 #[derive(Debug)]
@@ -126,6 +153,11 @@ pub struct App {
     /// One-line feedback shown in the footer until the next key press.
     pub message: Option<String>,
     pub dialog: Option<Dialog>,
+    /// Active tab of the Changes panel (index into [`TABS`]) and the row in it.
+    pub changes_tab: usize,
+    pub changes_selected: usize,
+    /// The diff shown for the selected change.
+    pub diff: Load<ratatui::text::Text<'static>>,
     /// Change marker of the `hide` file last loaded (`None` until the first load).
     hide_stamp: Option<crate::hide::HideStamp>,
     actions: VecDeque<ActionReq>,
@@ -153,6 +185,9 @@ impl App {
             range_anchor: None,
             message: None,
             dialog: None,
+            changes_tab: 0,
+            changes_selected: 0,
+            diff: Load::Ready(ratatui::text::Text::default()),
             hide_stamp: None,
             actions: VecDeque::new(),
             action_running: false,
@@ -280,6 +315,7 @@ impl App {
             Event::Input(_) => {}
             Event::Job(done) => self.handle_job(done),
             Event::Tick => {
+                self.refresh_status();
                 self.refresh_tracking();
                 self.refresh_hide();
             }
@@ -294,6 +330,18 @@ impl App {
             Payload::Status(r) => {
                 self.status = match r {
                     Ok(s) => Load::Ready(*s),
+                    Err(e) => Load::Failed(e),
+                };
+                self.changes_selected = self
+                    .changes_selected
+                    .min(self.change_rows().len().saturating_sub(1));
+                if self.focus == Panel::Changes {
+                    self.request_diff();
+                }
+            }
+            Payload::Diff(r) => {
+                self.diff = match r {
+                    Ok(t) => Load::Ready(t),
                     Err(e) => Load::Failed(e),
                 }
             }
@@ -329,6 +377,9 @@ impl App {
                 match r {
                     Ok(report) => {
                         self.message = Some(report.message);
+                        if let Some(text) = report.amend_message {
+                            self.dialog = Some(Dialog::Commit(CommitBox { text, amend: true }));
+                        }
                         if let Some(results) = report.results {
                             self.dialog = Some(Dialog::Result(results));
                         }
@@ -395,11 +446,155 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::Review(items)),
             },
+            Some(Dialog::Commit(mut b)) => {
+                let m = key.modifiers;
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Enter if m.intersects(KeyModifiers::ALT | KeyModifiers::SHIFT) => {
+                        b.text.push('\n')
+                    }
+                    KeyCode::Char('j') if m.contains(KeyModifiers::CONTROL) => b.text.push('\n'),
+                    KeyCode::Enter if b.text.trim().is_empty() => {
+                        self.message = Some("the commit message is empty".into())
+                    }
+                    KeyCode::Enter => {
+                        return self.request_action(ActionReq::Commit {
+                            message: b.text.trim().to_string(),
+                            amend: b.amend,
+                        });
+                    }
+                    KeyCode::Backspace => {
+                        b.text.pop();
+                    }
+                    KeyCode::Char(c)
+                        if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) =>
+                    {
+                        b.text.push(c)
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::Commit(b));
+            }
+            Some(Dialog::ConfirmDiscard(paths)) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Discard(paths)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::ConfirmDiscard(paths)),
+            },
             Some(Dialog::Result(_)) | None => {}
         }
     }
 
+    /// Changes shown in the active tab.
+    pub fn change_rows(&self) -> Vec<&Change> {
+        let Load::Ready(s) = &self.status else {
+            return Vec::new();
+        };
+        s.changes
+            .iter()
+            .filter(|c| tab_of(c.state) == self.changes_tab)
+            .collect()
+    }
+
+    /// Number of changes per tab.
+    pub fn change_counts(&self) -> [usize; 4] {
+        let mut n = [0; 4];
+        if let Load::Ready(s) = &self.status {
+            for c in &s.changes {
+                n[tab_of(c.state)] += 1;
+            }
+        }
+        n
+    }
+
+    pub fn selected_change(&self) -> Option<&Change> {
+        self.change_rows().get(self.changes_selected).copied()
+    }
+
+    fn request_diff(&mut self) {
+        let Some(c) = self.selected_change().cloned() else {
+            self.diff = Load::Ready(ratatui::text::Text::default());
+            return;
+        };
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_DIFF, move |cancel| {
+            Payload::Diff(render_diff(&store, &c, cancel).map_err(|e| format!("{e:#}")))
+        });
+    }
+
+    fn changes_key(&mut self, key: KeyEvent) {
+        let rows = self.change_rows().len();
+        let before = (self.changes_tab, self.changes_selected);
+        let tab = self.changes_tab;
+        let selected = self.selected_change().cloned();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.changes_selected = (self.changes_selected + 1).min(rows.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.changes_selected = self.changes_selected.saturating_sub(1);
+            }
+            KeyCode::Char('[') => {
+                self.changes_tab = (tab + TABS.len() - 1) % TABS.len();
+                self.changes_selected = 0;
+            }
+            KeyCode::Char(']') => {
+                self.changes_tab = (tab + 1) % TABS.len();
+                self.changes_selected = 0;
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            KeyCode::Enter => self.request_diff(),
+            KeyCode::Char(' ') => match (tab, selected) {
+                (0, Some(c)) => self.request_action(ActionReq::Stage(Some(vec![c.path]))),
+                (1, Some(c)) if c.kind == "repo" => {
+                    self.message = Some("repository files are unstaged together: press a".into())
+                }
+                (1, Some(c)) => self.request_action(ActionReq::Unstage(Some(vec![c.path]))),
+                (2 | 3, Some(_)) => self.message = Some(READ_ONLY.into()),
+                _ => {}
+            },
+            KeyCode::Char('a') => match tab {
+                0 => self.request_action(ActionReq::Stage(None)),
+                1 => self.request_action(ActionReq::Unstage(None)),
+                _ => self.message = Some(READ_ONLY.into()),
+            },
+            KeyCode::Char('c') => {
+                if self.change_counts()[1] == 0 {
+                    self.message = Some("nothing is staged".into());
+                } else {
+                    self.dialog = Some(Dialog::Commit(CommitBox {
+                        text: String::new(),
+                        amend: false,
+                    }));
+                }
+            }
+            KeyCode::Char('A') => self.request_action(ActionReq::LoadAmend),
+            KeyCode::Char('d') => match selected {
+                Some(c) if c.state == State::Local => {
+                    self.dialog = Some(Dialog::ConfirmDiscard(vec![c.path]))
+                }
+                Some(c) if c.state == State::New => {
+                    self.message = Some("a new file has no committed version to restore".into())
+                }
+                Some(_) => self.message = Some("only local changes can be discarded".into()),
+                None => {}
+            },
+            _ => {}
+        }
+        if (self.changes_tab, self.changes_selected) != before {
+            self.request_diff();
+        }
+    }
+
     pub fn handle_key(&mut self, key: KeyEvent) {
+        let before = self.focus;
+        self.handle_key_inner(key);
+        if self.focus == Panel::Changes && before != Panel::Changes {
+            self.request_diff();
+        }
+    }
+
+    fn handle_key_inner(&mut self, key: KeyEvent) {
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         self.message = None;
         if self.dialog.is_some() {
@@ -431,6 +626,7 @@ impl App {
         match self.focus {
             Panel::Files => self.files_key(key),
             Panel::Pending => self.pending_key(key),
+            Panel::Changes => self.changes_key(key),
             _ => match key.code {
                 KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
                 KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
@@ -538,6 +734,74 @@ impl App {
     }
 }
 
+fn report(message: String) -> ActionReport {
+    ActionReport {
+        message,
+        results: None,
+        amend_message: None,
+    }
+}
+
+fn done_message(verb: &str, d: &changes::Done) -> String {
+    let mut m = match d.paths.as_slice() {
+        [one] => format!("{verb} {one}"),
+        many => format!("{verb} {} files", many.len()),
+    };
+    if !d.skipped.is_empty() {
+        m.push_str(&format!(" ({} skipped)", d.skipped.len()));
+    }
+    m
+}
+
+const READ_ONLY: &str = "incoming changes and conflicts are read-only for now";
+
+fn tab_of(s: State) -> usize {
+    match s {
+        State::Local | State::New => 0,
+        State::Staged => 1,
+        State::Incoming => 2,
+        State::Conflict => 3,
+    }
+}
+
+/// The selected change as styled text: delta's output when it works, else the
+/// plain unified diff.
+fn render_diff(
+    store: &Store,
+    c: &Change,
+    cancel: &crate::exec::CancelToken,
+) -> anyhow::Result<ratatui::text::Text<'static>> {
+    use ansi_to_tui::IntoText;
+    if matches!(c.state, State::Incoming | State::Conflict) {
+        return Ok(format!(
+            "~/{} has an {} change.\n\nIt is shown read-only for now; applying and resolving come later.",
+            c.path,
+            c.state.label()
+        )
+        .into());
+    }
+    let sel = (c.kind != "repo").then(|| vec![c.path.clone()]);
+    let label = if c.kind == "repo" {
+        format!("repo:{}", c.path)
+    } else {
+        track::tilde(&c.path)
+    };
+    let plain: String = changes::diff(store, sel.as_deref())?
+        .into_iter()
+        .filter(|d| d.state == c.state && d.path == label)
+        .map(|d| d.diff)
+        .collect();
+    if plain.is_empty() {
+        return Ok("(no textual difference: only the mode or type changed)"
+            .to_string()
+            .into());
+    }
+    match changes::through_delta(store, &plain, Some(cancel)) {
+        Some(styled) => styled.into_text().or_else(|_| Ok(plain.clone().into())),
+        None => Ok(plain.into()),
+    }
+}
+
 /// Run one queued mutation on a worker thread.
 fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
     match req {
@@ -564,6 +828,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             Ok(ActionReport {
                 message,
                 results: None,
+                amend_message: None,
             })
         }
         ActionReq::Hide(path, is_dir) => {
@@ -572,6 +837,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             Ok(ActionReport {
                 message: t.message,
                 results: None,
+                amend_message: None,
             })
         }
         ActionReq::Drop(id) => {
@@ -580,7 +846,61 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             Ok(ActionReport {
                 message: format!("Dropped {}: {}", gone[0].label(), gone[0].summary),
                 results: None,
+                amend_message: None,
             })
+        }
+        ActionReq::Stage(sel) => {
+            let d = changes::stage(store, sel.as_deref(), false)?;
+            Ok(report(done_message("Staged", &d)))
+        }
+        ActionReq::Unstage(sel) => {
+            let d = changes::unstage(store, sel.as_deref(), false)?;
+            Ok(report(done_message("Unstaged", &d)))
+        }
+        ActionReq::Commit { message, amend } => {
+            let c = changes::commit(
+                store,
+                &CommitOpts {
+                    messages: vec![message],
+                    amend,
+                    dry_run: false,
+                    interactive: false,
+                },
+            )?;
+            Ok(report(format!(
+                "{} {} ({} file(s))",
+                if amend { "Amended" } else { "Committed" },
+                c.commit.unwrap_or_default(),
+                c.files
+            )))
+        }
+        ActionReq::LoadAmend => {
+            changes::ensure_amendable(store)?;
+            let mut r = report(String::new());
+            r.amend_message = Some(changes::last_message(store)?);
+            Ok(r)
+        }
+        ActionReq::Discard(paths) => {
+            let mut items = Vec::new();
+            for p in &paths {
+                items.push(changes::plan_discard(store, p, "human")?);
+            }
+            let results = track::apply_now(store, &items)?;
+            if let Some(bad) = results.iter().find(|r| r.status != track::Outcome::Applied) {
+                anyhow::bail!(
+                    bad.message
+                        .clone()
+                        .unwrap_or_else(|| "discard failed".into())
+                );
+            }
+            Ok(report(format!(
+                "Discarded {} (snapshot taken; see `dw snapshot list`)",
+                if paths.len() == 1 {
+                    track::tilde(&paths[0])
+                } else {
+                    format!("{} items", paths.len())
+                }
+            )))
         }
         ActionReq::Apply(ids) => {
             let results = track::apply_pending(store, Some(&ids))?;
@@ -591,6 +911,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             Ok(ActionReport {
                 message: format!("Applied {applied} of {} item(s)", results.len()),
                 results: Some(results),
+                amend_message: None,
             })
         }
     }

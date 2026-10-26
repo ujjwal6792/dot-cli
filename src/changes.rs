@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{DwError, Kind};
 use crate::exec;
-use crate::pending::{self, Action, FileChange, Item, Preview};
+use crate::pending::{Action, FileChange, Item, Preview};
 use crate::snapshot;
 use crate::source::{self, decode_source_path};
 use crate::store::Store;
@@ -302,7 +302,7 @@ pub struct Done {
 /// can be staged). Explicitly named changes that cannot be staged are refused;
 /// with `None`, or inside a named folder, they are skipped and reported.
 pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Done> {
-    let _lock = if dry_run { None } else { Some(store.lock()?) };
+    let lock = if dry_run { None } else { Some(store.lock()?) };
     let ctx = Ctx::load(store)?;
     let scan = scan(store, &ctx)?;
     let mut files = Vec::new();
@@ -371,11 +371,12 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     if files.is_empty() && deleted.is_empty() && skipped.is_empty() {
         bail!("nothing to stage");
     }
-    if !dry_run && !(files.is_empty() && deleted.is_empty()) {
+    if !(dry_run || files.is_empty() && deleted.is_empty()) {
         track::ensure_repo_clean(store)?;
         let tree = track::index_tree(store)?;
         let backup = track::state_backup(store)?;
-        let run = || -> Result<()> {
+        let mut results = Vec::new();
+        let mut run = || -> Result<()> {
             for chunk in files.chunks(CHUNK) {
                 let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
                 args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
@@ -393,15 +394,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                     rel: rel.clone(),
                 };
                 let item = track::plan_untrack(store, &Ctx::load(store)?, &hp, "human")?;
-                let lock = _lock.as_ref().expect("held outside dry runs");
-                let results = track::apply_items(store, lock, &[item])?;
-                if let Some(r) = results.iter().find(|r| r.status != track::Outcome::Applied) {
+                let lock = lock.as_ref().expect("held outside dry runs");
+                let done = track::apply_items(store, lock, &[item])?;
+                if let Some(r) = done.iter().find(|r| r.status != track::Outcome::Applied) {
                     bail!(
                         "~/{rel}: {}",
                         r.message.as_deref().unwrap_or("could not be untracked")
                     );
                 }
-                track::cleanup_state(store, &results);
+                results.extend(done);
             }
             Ok(())
         };
@@ -410,6 +411,9 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             track::state_restore(store, backup)?;
             return Err(e.context("staging failed; the repository was left as before"));
         }
+        // chezmoi's records of untracked files go once the mutation lock is free.
+        drop(lock);
+        track::cleanup_state(store, &results);
     }
     Ok(Done {
         paths: files
@@ -716,6 +720,42 @@ fn edit_message(store: &Store, initial: &str) -> Result<String> {
         .to_string())
 }
 
+/// Refuse amending a commit that is already on a remote-tracking branch.
+pub fn ensure_amendable(store: &Store) -> Result<()> {
+    let head = git_literal(
+        store,
+        &["rev-parse".as_ref(), "--verify".as_ref(), "HEAD".as_ref()],
+    )
+    .context("there is no commit to amend")?;
+    let remote = git_literal(
+        store,
+        &[
+            "branch".as_ref(),
+            "-r".as_ref(),
+            "--contains".as_ref(),
+            OsStr::new(head.stdout.trim()),
+        ],
+    )?;
+    if !remote.stdout.trim().is_empty() {
+        return Err(refuse(format!(
+            "HEAD is already on {}; amending it would rewrite shared history",
+            remote.stdout.lines().next().unwrap_or("a remote").trim()
+        )));
+    }
+    Ok(())
+}
+
+/// The full message of the last commit.
+pub fn last_message(store: &Store) -> Result<String> {
+    Ok(git_literal(
+        store,
+        &["log".as_ref(), "-1".as_ref(), "--format=%B".as_ref()],
+    )?
+    .stdout
+    .trim()
+    .to_string())
+}
+
 pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
     let _lock = if opts.dry_run {
         None
@@ -728,26 +768,7 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
         bail!("nothing is staged; stage changes with `dw stage` first");
     }
     if opts.amend {
-        let head = git_literal(
-            store,
-            &["rev-parse".as_ref(), "--verify".as_ref(), "HEAD".as_ref()],
-        )
-        .context("there is no commit to amend")?;
-        let remote = git_literal(
-            store,
-            &[
-                "branch".as_ref(),
-                "-r".as_ref(),
-                "--contains".as_ref(),
-                OsStr::new(head.stdout.trim()),
-            ],
-        )?;
-        if !remote.stdout.trim().is_empty() {
-            return Err(refuse(format!(
-                "HEAD is already on {}; amending it would rewrite shared history",
-                remote.stdout.lines().next().unwrap_or("a remote").trim()
-            )));
-        }
+        ensure_amendable(store)?;
     }
     if opts.messages.iter().any(|m| m.trim().is_empty()) {
         return Err(DwError::usage("the commit message is empty").into());
@@ -941,6 +962,20 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
         });
     }
     Ok(out)
+}
+
+/// Run a plain unified diff through the bundled delta, returning ANSI-styled
+/// text, or `None` when delta is unavailable or fails.
+pub fn through_delta(
+    store: &Store,
+    plain: &str,
+    cancel: Option<&exec::CancelToken>,
+) -> Option<String> {
+    let mut cmd = std::process::Command::new(store.tools.delta());
+    cmd.env_clear()
+        .args(["--paging=never", "--no-gitconfig", "--true-color=never"]);
+    let out = exec::run_with_input(cmd, Some(plain.as_bytes().to_vec()), cancel).ok()?;
+    (out.success() && !out.stdout.trim().is_empty()).then_some(out.stdout)
 }
 
 #[cfg(test)]

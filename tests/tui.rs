@@ -384,7 +384,7 @@ fn other_panels_have_placeholders_and_h_l_switch_between_them() {
     app.handle_event(ch('3'));
     let screen = render(&mut app, 80, 24);
     assert!(
-        screen.contains("[3] Changes") && screen.contains("Local ·"),
+        screen.contains("[3] Changes") && screen.contains("Local 0"),
         "{screen}"
     );
     app.handle_event(ch('l'));
