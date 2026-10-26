@@ -455,6 +455,11 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 );
             }
         }
+        Action::Discard { files, .. } => {
+            for f in files {
+                g.home.insert(f.clone(), home_fingerprint(&home.join(f)));
+            }
+        }
         Action::HideAdd { pattern } | Action::HideRemove { pattern } => {
             g.repo.insert(
                 format!("rule:{pattern}"),
@@ -568,7 +573,7 @@ fn preview_add(store: &Store, files: &[TrackFile]) -> Result<Vec<FileChange>> {
     Ok(out)
 }
 
-fn new_item(
+pub(crate) fn new_item(
     store: &Store,
     requester: &str,
     action: Action,
@@ -1282,6 +1287,10 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
                 })?;
             }
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
+        }
+        Action::Discard { files, .. } => {
+            crate::changes::discard_files(store, files, &item.requester)?;
+            Ok(Vec::new())
         }
         Action::HideAdd { pattern } => {
             hide::add_rule(&repo, pattern)?;

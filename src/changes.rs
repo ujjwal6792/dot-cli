@@ -20,6 +20,8 @@ use sha2::{Digest, Sha256};
 
 use crate::error::{DwError, Kind};
 use crate::exec;
+use crate::pending::{self, Action, FileChange, Item, Preview};
+use crate::snapshot;
 use crate::source::{self, decode_source_path};
 use crate::store::Store;
 use crate::track::{self, Ctx, git_literal, refuse};
@@ -304,6 +306,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     let ctx = Ctx::load(store)?;
     let scan = scan(store, &ctx)?;
     let mut files = Vec::new();
+    let mut deleted = Vec::new();
     let mut skipped = Vec::new();
     let mut refusals = Vec::new();
     let matched_any = |p: &str| {
@@ -329,10 +332,10 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 Kind::Conflict,
                 "changed here and by an incoming change; resolve the conflict first".into(),
             )),
-            _ if c.kind == "deleted" => Some((
-                Kind::Error,
-                "deleted in HOME; stage the deletion with `dw untrack`".into(),
-            )),
+            _ if c.kind == "deleted" => {
+                deleted.push(c.path.clone());
+                continue;
+            }
             _ if ctx
                 .tracked
                 .files
@@ -365,10 +368,10 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .join("; ");
         return Err(DwError::new(*kind, msg).into());
     }
-    if files.is_empty() && skipped.is_empty() {
+    if files.is_empty() && deleted.is_empty() && skipped.is_empty() {
         bail!("nothing to stage");
     }
-    if !dry_run && !files.is_empty() {
+    if !dry_run && !(files.is_empty() && deleted.is_empty()) {
         track::ensure_repo_clean(store)?;
         let tree = track::index_tree(store)?;
         let backup = track::state_backup(store)?;
@@ -383,6 +386,23 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             if !track::unstaged(store)?.is_empty() {
                 bail!("some changes could not be staged");
             }
+            // A file deleted in HOME is staged by untracking it.
+            for rel in &deleted {
+                let hp = track::HomePath {
+                    abs: store.dirs.home.join(rel),
+                    rel: rel.clone(),
+                };
+                let item = track::plan_untrack(store, &Ctx::load(store)?, &hp, "human")?;
+                let lock = _lock.as_ref().expect("held outside dry runs");
+                let results = track::apply_items(store, lock, &[item])?;
+                if let Some(r) = results.iter().find(|r| r.status != track::Outcome::Applied) {
+                    bail!(
+                        "~/{rel}: {}",
+                        r.message.as_deref().unwrap_or("could not be untracked")
+                    );
+                }
+                track::cleanup_state(store, &results);
+            }
             Ok(())
         };
         if let Err(e) = run() {
@@ -392,7 +412,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
         }
     }
     Ok(Done {
-        paths: files.iter().map(|f| track::tilde(f)).collect(),
+        paths: files
+            .iter()
+            .map(|f| track::tilde(f))
+            .chain(
+                deleted
+                    .iter()
+                    .map(|f| format!("{} (deleted; untracked)", track::tilde(f))),
+            )
+            .collect(),
         skipped,
         dry_run,
     })
@@ -543,6 +571,88 @@ fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> Result<()> {
         }
     }
     Ok(())
+}
+
+// ---- discard -----------------------------------------------------------
+
+/// Snapshot `files` and write their committed version back to HOME. Returns
+/// the snapshot id when something was preserved.
+pub fn discard_files(store: &Store, files: &[String], actor: &str) -> Result<Option<String>> {
+    let snap = snapshot::take(store, files, "discard", actor)?.map(|s| s.id);
+    for chunk in files.chunks(CHUNK) {
+        let mut args: Vec<std::ffi::OsString> = vec!["apply".into(), "--force".into()];
+        args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
+        store.chezmoi_locked(&args)?;
+    }
+    Ok(snap)
+}
+
+/// Plan the discard of the local changes at `rel` (a file or folder) as a
+/// pending item. Only Local changes can be discarded.
+pub fn plan_discard(store: &Store, rel: &str, requester: &str) -> Result<Item> {
+    let ctx = Ctx::load(store)?;
+    let scan = scan(store, &ctx)?;
+    let mut files = Vec::new();
+    let mut problems = Vec::new();
+    for c in scan
+        .changes
+        .iter()
+        .filter(|c| c.kind != "repo" && covers(rel, &c.path))
+    {
+        let exact = c.path == rel;
+        match (c.state, c.kind) {
+            (State::Local, _) => files.push(c.path.clone()),
+            (State::Staged, _) => {}
+            (State::New, _) if exact => problems.push(format!(
+                "~/{} is not tracked yet; there is no committed version to restore",
+                c.path
+            )),
+            (State::Incoming | State::Conflict, _) if exact => problems.push(format!(
+                "~/{} has an incoming change; resolving it is not supported yet",
+                c.path
+            )),
+            _ => {}
+        }
+    }
+    if let Some(p) = problems.first() {
+        return Err(refuse(p.clone()));
+    }
+    files.sort();
+    files.dedup();
+    if files.is_empty() {
+        return Err(refuse(format!(
+            "no local changes to discard at {}",
+            track::tilde(rel)
+        )));
+    }
+    let preview = Preview {
+        applies_to: None,
+        files: files
+            .iter()
+            .map(|f| FileChange {
+                action: "overwrite".into(),
+                target: f.clone(),
+                source: String::new(),
+                kind: "file".into(),
+            })
+            .collect(),
+        data: Vec::new(),
+        rules: Vec::new(),
+        notes: vec!["a snapshot of the current files is taken first (`dw snapshot list`)".into()],
+    };
+    let summary = format!(
+        "Discard local changes to {} (requested by {requester})",
+        if files.len() == 1 {
+            track::tilde(&files[0])
+        } else {
+            format!("{} files under {}", files.len(), track::tilde(rel))
+        }
+    );
+    let action = Action::Discard {
+        path: rel.to_string(),
+        files,
+    };
+    track::new_item(store, requester, action, summary, preview, &ctx)
 }
 
 // ---- commit ------------------------------------------------------------

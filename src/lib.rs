@@ -15,6 +15,7 @@ pub mod paths;
 pub mod pending;
 pub mod pins;
 pub mod repo;
+pub mod snapshot;
 pub mod source;
 pub mod status;
 pub mod store;

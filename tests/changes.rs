@@ -319,3 +319,167 @@ fn diff_gives_plain_unified_diff_for_local_new_and_staged_changes() {
         (Some("~/.a"), Some("local"))
     );
 }
+
+fn snapshots(t: &TestEnv) -> Vec<serde_json::Value> {
+    t.dw_json(&["snapshot", "list"]).as_array().unwrap().clone()
+}
+
+fn dw_agent(t: &TestEnv, args: &[&str]) -> Run {
+    let o = std::process::Command::new(env!("CARGO_BIN_EXE_dotwarden"))
+        .args(args)
+        .env_clear()
+        .envs(&t.env)
+        .env("DOTWARDEN_AGENT", "claude")
+        .current_dir(&t.home)
+        .stdin(std::process::Stdio::null())
+        .output()
+        .unwrap();
+    Run {
+        code: o.status.code().unwrap(),
+        out: String::from_utf8_lossy(&o.stdout).into_owned(),
+        err: String::from_utf8_lossy(&o.stderr).into_owned(),
+    }
+}
+
+#[test]
+fn discard_snapshots_first_and_the_snapshot_restores_the_lost_edit() {
+    let t = setup();
+    write(&t, ".a", "my precious edit\n");
+    t.dw_ok(&["discard", ".a", "--yes"]);
+    assert_eq!(fs::read_to_string(t.home.join(".a")).unwrap(), "one\n");
+    assert!(changes(&t).is_empty());
+
+    let snaps = snapshots(&t);
+    assert_eq!(snaps.len(), 1);
+    assert_eq!(snaps[0]["reason"], "discard");
+    assert_eq!(snaps[0]["files"][0]["path"], ".a");
+    assert_eq!(snaps[0]["files"][0]["sha256"].as_str().unwrap().len(), 64);
+    let dir = t.dirs().state_dir().join("snapshots");
+    assert_eq!(
+        fs::metadata(&dir).unwrap().permissions().mode() & 0o777,
+        0o700
+    );
+
+    let id = snaps[0]["id"].as_str().unwrap();
+    t.dw_ok(&["snapshot", "restore", id]);
+    assert_eq!(
+        fs::read_to_string(t.home.join(".a")).unwrap(),
+        "my precious edit\n"
+    );
+    // The restore itself snapshotted what it replaced.
+    assert_eq!(snapshots(&t).len(), 2);
+}
+
+#[test]
+fn discard_restores_deleted_files_modes_and_symlinks() {
+    let t = setup();
+    symlink(".a", t.home.join(".l")).unwrap();
+    t.dw_ok(&["track", ".l", "--apply"]);
+    t.dw_ok(&["commit", "-m", "link"]);
+    fs::remove_file(t.home.join(".b")).unwrap();
+    fs::set_permissions(t.home.join(".a"), fs::Permissions::from_mode(0o755)).unwrap();
+    fs::remove_file(t.home.join(".l")).unwrap();
+    symlink("elsewhere", t.home.join(".l")).unwrap();
+    t.dw_ok(&["discard", ".a", ".b", ".l", "--yes"]);
+    assert_eq!(fs::read_to_string(t.home.join(".b")).unwrap(), "bee\n");
+    assert_eq!(
+        fs::metadata(t.home.join(".a"))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777,
+        0o644
+    );
+    assert_eq!(
+        fs::read_link(t.home.join(".l")).unwrap().to_str(),
+        Some(".a")
+    );
+    assert!(changes(&t).is_empty());
+}
+
+#[test]
+fn an_agent_or_a_script_without_yes_cannot_discard_but_a_human_can_approve_it() {
+    let t = setup();
+    write(&t, ".a", "edit\n");
+    let r = dw_agent(&t, &["discard", ".a", "--yes"]);
+    assert_eq!(r.code, 3, "{}{}", r.out, r.err);
+    assert_eq!(fs::read_to_string(t.home.join(".a")).unwrap(), "edit\n");
+    let p = t.dw_json(&["pending", "list"]);
+    assert_eq!(p["items"][0]["kind"], "discard");
+    assert_eq!(p["items"][0]["requester"], "claude");
+    assert!(snapshots(&t).is_empty());
+
+    t.dw_ok(&["pending", "apply", "--all"]);
+    assert_eq!(fs::read_to_string(t.home.join(".a")).unwrap(), "one\n");
+    assert_eq!(snapshots(&t)[0]["actor"], "claude");
+
+    // No terminal and no --yes: same route, still exit 3.
+    write(&t, ".a", "edit again\n");
+    assert_eq!(dw(&t, &["discard", ".a"]).code, 3);
+    assert_eq!(
+        fs::read_to_string(t.home.join(".a")).unwrap(),
+        "edit again\n"
+    );
+}
+
+#[test]
+fn discard_refuses_what_has_no_committed_version_to_restore() {
+    let t = setup();
+    write(&t, ".cfg/x", "x\n");
+    t.dw_ok(&["track", ".cfg", "--apply"]);
+    t.dw_ok(&["commit", "-m", "folder"]);
+    write(&t, ".cfg/new", "n\n");
+    let r = dw(&t, &["discard", ".cfg/new", "--yes"]);
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("not tracked yet"), "{}", r.err);
+    assert!(t.home.join(".cfg/new").exists());
+}
+
+#[test]
+fn staging_a_file_deleted_in_home_untracks_it_and_unstaging_brings_it_back() {
+    let t = setup();
+    fs::remove_file(t.home.join(".b")).unwrap();
+    t.dw_ok(&["stage", ".b"]);
+    assert_eq!(changes(&t), [".b:staged:removed"]);
+    assert_eq!(
+        t.git(&repo(&t), &["status", "--porcelain"]),
+        "D  home/dot_b"
+    );
+    t.dw_ok(&["unstage", ".b"]);
+    assert_eq!(changes(&t), [".b:local:deleted"]);
+    t.dw_ok(&["stage", "--all"]);
+    t.dw_ok(&["commit", "-m", "drop b"]);
+    assert!(changes(&t).is_empty());
+    assert!(
+        !t.dw_json(&["ls", "-a"])
+            .to_string()
+            .contains("\"name\":\".b\",\"state\":\"tracked\"")
+    );
+}
+
+#[test]
+fn snapshot_retention_keeps_recent_ones_and_the_five_newest_per_file() {
+    let t = setup();
+    let store = t.store();
+    let now = dotwarden::snapshot::now_unix();
+    let day = 86_400;
+    write(&t, ".b", "b\n");
+    for age in (40..47).rev() {
+        dotwarden::snapshot::take_at(&store, &[".a".into()], "t", "human", now - age * day)
+            .unwrap();
+    }
+    dotwarden::snapshot::take_at(&store, &[".b".into()], "t", "human", now - 90 * day).unwrap();
+    dotwarden::snapshot::take_at(&store, &[".a".into()], "t", "human", now).unwrap();
+    let a: Vec<u64> = dotwarden::snapshot::list_for(&store, ".a")
+        .unwrap()
+        .iter()
+        .map(|s| s.created_unix)
+        .collect();
+    // The new one plus the four newest old ones; the 90-day-old .b copy is its file's only one.
+    assert_eq!(a.len(), 5, "{a:?}");
+    assert!(a[1..].iter().all(|c| *c >= now - 43 * day));
+    assert_eq!(
+        dotwarden::snapshot::list_for(&store, ".b").unwrap().len(),
+        1
+    );
+}

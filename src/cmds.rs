@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::changes::{self, CommitOpts};
 use crate::error::{DwError, Kind};
 use crate::pending::{self, Item};
+use crate::snapshot;
 use crate::store::Store;
 use crate::track::{self, Ctx, ItemResult, Outcome, Plan};
 
@@ -43,6 +44,9 @@ fn print_results(results: &[ItemResult]) {
     for r in results {
         let id = r.id.map_or(String::new(), |i| format!("#{i} "));
         match r.status {
+            Outcome::Applied if r.kind == "discard" => {
+                println!("applied {id}{} (snapshot taken first)", r.summary)
+            }
             Outcome::Applied => println!(
                 "applied {id}{} (staged {} path(s); not committed)",
                 r.summary,
@@ -502,6 +506,126 @@ pub fn diff_cmd(store: &Store, path: Option<&str>, no_pager: bool, json: bool) -
         child.wait()?;
     } else {
         print!("{text}");
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn discard_cmd(
+    store: &Store,
+    paths: &[String],
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    use std::io::IsTerminal;
+    let agent = changes::agent(store);
+    let requester = agent.clone().unwrap_or_else(|| "human".into());
+    let cwd = cwd()?;
+    let mut items = Vec::new();
+    for p in paths {
+        let hp = track::resolve_home_path(store, p, &cwd)?;
+        items.push(changes::plan_discard(store, &hp.rel, &requester)?);
+    }
+    if dry_run {
+        return submit(store, items, false, true, json);
+    }
+    let interactive = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let approved = agent.is_none() && (yes || (interactive && confirm(&items)?));
+    if !approved {
+        if agent.is_none() && interactive {
+            return Err(anyhow::anyhow!("cancelled; nothing was discarded"));
+        }
+        submit(store, items, false, false, json)?;
+        if !json {
+            println!("Discarding needs a human: approve it with `dw pending apply`.");
+        }
+        return Ok(ExitCode::from(Kind::NeedsApproval.code()));
+    }
+    let results = track::apply_now(store, &items)?;
+    if json {
+        print_json(&json!({"dry_run": false, "applied": results}))?;
+    } else {
+        print_results(&results);
+    }
+    Ok(results_exit(&results))
+}
+
+fn confirm(items: &[Item]) -> Result<bool> {
+    use std::io::{BufRead, Write};
+    for i in items {
+        println!("{}", i.summary);
+    }
+    print!("Overwrite them with the committed version? A snapshot is taken first. [y/N] ");
+    std::io::stdout().flush()?;
+    let mut line = String::new();
+    std::io::stdin().lock().read_line(&mut line)?;
+    Ok(matches!(line.trim(), "y" | "Y" | "yes"))
+}
+
+pub fn snapshot_list(store: &Store, path: Option<&str>, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let snaps = match path {
+        Some(p) => {
+            let hp = track::resolve_home_path(store, p, &cwd()?)?;
+            snapshot::list_for(store, &hp.rel)?
+        }
+        None => snapshot::list(store)?,
+    };
+    if json {
+        print_json(&snaps)?;
+    } else {
+        for s in &snaps {
+            let names: Vec<_> = s.files.iter().map(|f| format!("~/{}", f.path)).collect();
+            println!(
+                "{}  {}  {:<8} {:<8} {}",
+                s.id,
+                s.created,
+                s.reason,
+                s.actor,
+                names.join(" ")
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn snapshot_restore(
+    store: &Store,
+    id: &str,
+    paths: &[String],
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let cwd = cwd()?;
+    let rels: Vec<String> = paths
+        .iter()
+        .map(|p| Ok(track::resolve_home_path(store, p, &cwd)?.rel))
+        .collect::<Result<_>>()?;
+    if dry_run {
+        let plan = snapshot::plan_restore(store, &snapshot::find(store, id)?, &rels)?;
+        if json {
+            print_json(&json!({"dry_run": true, "files": plan}))?;
+        } else {
+            for p in &plan {
+                println!("would restore ~/{}", p.path);
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let _lock = store.lock()?;
+    let actor = changes::agent(store).unwrap_or_else(|| "human".into());
+    let (restored, safety) = snapshot::restore(store, id, &rels, &actor)?;
+    if json {
+        print_json(&json!({"restored": restored, "safety_snapshot": safety}))?;
+    } else {
+        for r in &restored {
+            println!("restored ~/{r}");
+        }
+        if let Some(s) = safety {
+            println!("what was there before is in snapshot {s}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }

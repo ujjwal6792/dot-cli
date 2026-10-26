@@ -176,8 +176,49 @@ pub enum Command {
         #[arg(long)]
         no_pager: bool,
     },
+    /// Discard local changes: write the committed version back to HOME.
+    ///
+    /// A snapshot of the current files is taken first (`dw snapshot list`).
+    /// Needs a human: from an agent (DOTWARDEN_AGENT) or without a terminal and
+    /// without --yes the request goes to the pending list and the exit code is 3;
+    /// approve it with `dw pending apply`.
+    Discard {
+        /// Files or folders with local changes.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would be overwritten without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List or restore snapshots of HOME files taken before they were overwritten.
+    Snapshot {
+        #[command(subcommand)]
+        action: SnapshotCmd,
+    },
     /// Open the terminal UI (the default when no command is given).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SnapshotCmd {
+    /// List snapshots, newest first.
+    List {
+        /// Only snapshots holding this HOME path.
+        path: Option<String>,
+    },
+    /// Put snapshotted files back in HOME; what is there now is snapshotted first.
+    Restore {
+        /// Snapshot id from `dw snapshot list`.
+        id: String,
+        /// Only these files or folders (default: everything in the snapshot).
+        paths: Vec<String>,
+        /// Show what would be restored without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -373,6 +414,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => return cmds::commit_cmd(&store, messages, amend, dry_run, json),
         Command::Diff { path, no_pager } => {
             return cmds::diff_cmd(&store, path.as_deref(), no_pager, json);
+        }
+        Command::Discard {
+            paths,
+            yes,
+            dry_run,
+        } => return cmds::discard_cmd(&store, &paths, yes, dry_run, json),
+        Command::Snapshot { action } => {
+            return match action {
+                SnapshotCmd::List { path } => cmds::snapshot_list(&store, path.as_deref(), json),
+                SnapshotCmd::Restore { id, paths, dry_run } => {
+                    cmds::snapshot_restore(&store, &id, &paths, dry_run, json)
+                }
+            };
         }
         Command::Ls { path, all } => return cmds::ls_cmd(&store, path.as_deref(), all, json),
         Command::Tui => {
