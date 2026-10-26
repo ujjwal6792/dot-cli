@@ -240,7 +240,7 @@ impl Tracked {
         let hi = format!("{rel}0"); // '0' follows '/'
         exact
             .into_iter()
-            .chain(self.files.range(lo..hi).map(|(k, v)| (k, v)))
+            .chain(self.files.range(lo..hi))
     }
 
     pub fn is_tracked(&self, rel: &str) -> bool {
