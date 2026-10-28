@@ -23,9 +23,14 @@
 `tests/machines.rs` (10, real chezmoi/git; two-machine round trips through a bare remote): assignment keeps file off beta after pull+apply; exclude beats include; folder covers descendants + stop/start effects; target validation and warnings; odd paths (`[1]`, `#`, `!`, trailing space, `*`); rename (registry, targets, variant override, this machine's config, other machine still matches); retire (agent gets exit 3, this machine refused, targets removed, retired not assignable); preview-as writes nothing and diffs; agent may assign and stale item; add/rename checks. `tests/tui_machines.rs` (3): tri-state editor on mixed selection (mixed target untouched, no-change Enter), editor from Changes + untracked refusal, badges + Machines panel preview.
 Hand-broken: retire's approval flag removed (1 failed); ancestor check removed (1 failed). Reverted. The tri-state test also caught a dialog-dropped-on-empty-Enter bug during development.
 
+## Review fixes
+
+1. Retire keeps `machine:<name>` as a file's only include (retired machines never match), so the file applies to no machine instead of all; preview says "applies to no machine now"; spec §4 updated. Test: `retiring_the_only_included_machine_leaves_the_file_on_no_machine`.
+2. `dw status`/`doctor`/TUI Status flag a local name missing from the registry (status no longer fails, `pull` only warns); new human-only `dw machine use NAME` checks platform/distribution. Test: `a_machine_renamed_elsewhere_is_detected_and_machine_use_repoints_it`.
+3. The assignment editor scrolls around the cursor (title and footer stay put). Test: `the_editor_scrolls_to_keep_the_cursor_visible_with_many_machines` (46 rows at 80×24).
+
 ## Gaps
 
-- A computer whose registry name was renamed/retired elsewhere must be re-registered by hand (no command yet); unstaging a staged rename leaves `machine.toml` on the new name.
-- Editor dialog does not scroll: a registry with many distributions/machines overflows a 24-row terminal.
+- Unstaging a staged rename leaves `machine.toml` on the new name (`dw machine use` repairs it).
 - Value overrides do not exist yet; rename covers them only generically.
 - Linux not run.

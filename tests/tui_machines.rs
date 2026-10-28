@@ -90,7 +90,10 @@ impl Tui {
     }
 
     fn screen(&mut self) -> String {
-        let (w, h) = (100, 30);
+        self.screen_at(100, 30)
+    }
+
+    fn screen_at(&mut self, w: u16, h: u16) -> String {
         let mut term = Terminal::new(TestBackend::new(w, h)).unwrap();
         term.draw(|f| ui::draw(f, &mut self.app)).unwrap();
         let buf = term.backend().buffer().clone();
@@ -270,4 +273,48 @@ fn files_show_assignment_badges_and_the_machines_panel_previews_a_machine() {
     tui.press_key(KeyCode::Enter);
     let screen = tui.screen();
     assert!(screen.contains("srv would receive 0 file(s)"), "{screen}");
+}
+
+#[test]
+fn the_editor_scrolls_to_keep_the_cursor_visible_with_many_machines() {
+    let t = setup();
+    let mut registry = dotwarden::repo::read_registry(&t.dirs().repo()).unwrap();
+    for i in 1..=20 {
+        registry.push(dotwarden::machine::Machine {
+            name: format!("box{i:02}"),
+            platform: "linux".into(),
+            distribution: format!("distro{i:02}"),
+            families: vec![],
+            retired: false,
+        });
+    }
+    dotwarden::repo::write_registry(&t.dirs().repo(), &registry).unwrap();
+    let mut tui = Tui::open(t);
+    tui.select(".b");
+    tui.press('m');
+    let first = tui.screen_at(80, 24);
+    assert!(
+        first.contains("Platforms") && !first.contains("srv"),
+        "{first}"
+    );
+    let Some(Dialog::Assign(e)) = &tui.app.dialog else {
+        panic!("editor open")
+    };
+    let last = e.rows.len() - 1;
+    assert!(e.rows[last].target == "machine:srv" && e.rows.len() > 40);
+    for _ in 0..last {
+        tui.press('j');
+    }
+    tui.press('x');
+    let end = tui.screen_at(80, 24);
+    assert!(end.contains("srv") && end.contains("[x] excl"), "{end}");
+    assert!(
+        end.contains("Enter add item"),
+        "footer stays on screen: {end}"
+    );
+    tui.press_key(KeyCode::Enter);
+    assert_eq!(
+        pending_changes(&tui.t),
+        [(".b".to_string(), vec![], vec!["machine:srv".to_string()])]
+    );
 }

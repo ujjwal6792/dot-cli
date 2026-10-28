@@ -348,6 +348,14 @@ pub enum MachineCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Point this computer at an existing registry machine (human only).
+    ///
+    /// For when the machine was renamed on another computer: its entry must
+    /// match this computer's platform and distribution.
+    Use {
+        /// Registry machine this computer is.
+        name: String,
+    },
     /// List the tracked files a machine would receive.
     ///
     /// Uses a throwaway chezmoi state; nothing in HOME or the real state is written.
@@ -633,6 +641,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 MachineCmd::Retire { name, yes, dry_run } => {
                     cmds::machine_retire(&store, &name, yes, dry_run, json)
                 }
+                MachineCmd::Use { name } => cmds::machine_use(&store, &name, json),
                 MachineCmd::Preview { name, diff } => {
                     cmds::machine_preview(&store, &name, diff, json)
                 }

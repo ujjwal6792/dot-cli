@@ -418,13 +418,17 @@ pub fn plan_rename(
     )
 }
 
-/// The assignments with `machine:<name>` taken out of every list.
+/// The assignments with `machine:<name>` taken out of every list, except that
+/// a file whose only include it is keeps it: a retired machine never matches,
+/// so the file then applies to no machine instead of to all of them.
 fn without_machine(before: &Assignments, name: &str) -> Assignments {
     let target = format!("machine:{name}");
     let mut after = Assignments::new();
     for (p, a) in before {
         let mut a = a.clone();
-        a.include.retain(|t| *t != target);
+        if a.include != [target.clone()] {
+            a.include.retain(|t| *t != target);
+        }
         a.exclude.retain(|t| *t != target);
         if !a.is_empty() {
             after.insert(p.clone(), a);
@@ -461,11 +465,22 @@ pub fn plan_retire(store: &Store, ctx: &Ctx, name: &str, requester: &str) -> Res
             continue;
         }
         let now = after.get(p).cloned().unwrap_or_default();
+        let nowhere = a.include == [target.clone()];
+        let result = if nowhere {
+            format!(
+                "kept as the only include; {} applies to no machine now",
+                tilde(p)
+            )
+        } else {
+            format!(
+                "remove {target} from {} → {}",
+                sides.join(" and "),
+                now.describe()
+            )
+        };
         data.push(format!(
-            "{}: remove {target} from {} → {} ({} tracked file(s))",
+            "{}: {result} ({} tracked file(s))",
             tilde(p),
-            sides.join(" and "),
-            now.describe(),
             ctx.tracked.under(p).count()
         ));
         touched.push(p.clone());
@@ -631,6 +646,33 @@ pub fn finish(store: &Store, action: &Action) -> Result<()> {
         store.write_chezmoi_config(new)?;
     }
     Ok(())
+}
+
+/// `dw machine use`: point this computer at an existing registry entry whose
+/// platform and distribution match it (after the machine was renamed elsewhere).
+pub fn use_machine(store: &Store, name: &str) -> Result<Machine> {
+    let registry = repo::read_registry(&store.repo())?;
+    let Some(m) = registry.into_iter().find(|m| m.name == name) else {
+        return Err(refuse(format!(
+            "machine {name:?} is not in the registry (see `dw machine list`)"
+        )));
+    };
+    if m.retired {
+        return Err(refuse(format!("machine {name:?} is retired")));
+    }
+    let here = machine::detect()?;
+    if (here.platform.as_str(), here.distribution.as_str())
+        != (m.platform.as_str(), m.distribution.as_str())
+    {
+        return Err(refuse(format!(
+            "{name:?} is registered as {}/{} but this computer is {}/{}",
+            m.platform, m.distribution, here.platform, here.distribution
+        )));
+    }
+    let _lock = store.lock()?;
+    store.write_local_machine(name)?;
+    store.write_chezmoi_config(name)?;
+    Ok(m)
 }
 
 // ---- preview as machine ------------------------------------------------------

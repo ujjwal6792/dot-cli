@@ -256,7 +256,7 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
             let machine = match &s.machine {
                 Some(m) => match &m.registered {
                     Some(r) => format!("{} ({}/{})", m.name, r.platform, r.distribution),
-                    None => format!("{} (unregistered)", m.name),
+                    None => format!("{} NOT IN REGISTRY: dw machine use", m.name),
                 },
                 None => "no machine".into(),
             };
@@ -667,15 +667,13 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             } else {
                 format!("{} paths", e.paths.len())
             };
-            let mut l = vec![Line::styled(
-                format!("Assign {what}"),
-                Style::default().add_modifier(Modifier::BOLD),
-            )];
+            let mut body: Vec<Line> = Vec::new();
+            let mut cursor_line = 0;
             let mut group = "";
             for (i, r) in e.rows.iter().enumerate() {
                 if r.group != group {
                     group = r.group;
-                    l.push(Line::styled(group, Style::default().fg(Color::Blue)));
+                    body.push(Line::styled(group, Style::default().fg(Color::Blue)));
                 }
                 let (mark, colour) = match r.state {
                     crate::assign::Tri::None => ("[ ] —  ", Color::DarkGray),
@@ -687,15 +685,29 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 let mut style = Style::default().fg(colour);
                 if i == e.cursor {
                     style = style.add_modifier(Modifier::REVERSED);
+                    cursor_line = body.len();
                 }
-                l.push(Line::from(vec![Span::styled(
+                body.push(Line::from(Span::styled(
                     format!("  {mark:<10} {value}"),
                     style,
-                )]));
+                )));
             }
+            // Title, blank and footer take 3 lines; the rest scrolls around the cursor.
+            let window = usize::from(area.height.saturating_sub(4 + 3)).max(1);
+            if body.len() > window {
+                let start = cursor_line
+                    .saturating_sub(window / 2)
+                    .min(body.len() - window);
+                body = body.into_iter().skip(start).take(window).collect();
+            }
+            let mut l = vec![Line::styled(
+                format!("Assign {what}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            l.extend(body);
             l.push(Line::from(""));
             l.push(Line::styled(
-                "Space cycles · i include · x exclude · - none · Enter adds a pending item · Esc cancels",
+                "Space cycle · i incl · x excl · - none · Enter add item · Esc",
                 Style::default().fg(Color::Yellow),
             ));
             (" Assign ", l)

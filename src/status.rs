@@ -28,6 +28,18 @@ pub struct MachineStatus {
     pub registered: Option<Machine>,
 }
 
+impl MachineStatus {
+    /// What is wrong when this computer's name is not in the registry.
+    pub fn problem(&self) -> Option<String> {
+        self.registered.is_none().then(|| {
+            format!(
+                "{} is not in the machine registry (renamed or retired elsewhere?); see `dw machine list`, then `dw machine use NAME`",
+                self.name
+            )
+        })
+    }
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct Status {
     pub initialised: bool,
@@ -110,7 +122,9 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
     let rules = crate::hide::HideRules::for_store(store)?;
     let new_files = crate::track::new_files(&store.dirs.home, &tracked, &rules, cancel)?;
     // chezmoi needs the generated config (and so a registered machine) to render targets.
-    let changes = if machine.is_some() && store.dirs.chezmoi_config().exists() {
+    let changes = if machine.as_ref().is_some_and(|m| m.registered.is_some())
+        && store.dirs.chezmoi_config().exists()
+    {
         crate::changes::classify(store)?
     } else {
         Vec::new()
@@ -159,7 +173,10 @@ impl Status {
                         format!(", family {}", r.families.join(", "))
                     }
                 )),
-                None => s.push_str(&format!("Machine:    {} (not in the registry)\n", m.name)),
+                None => s.push_str(&format!(
+                    "Machine:    {}\n",
+                    m.problem().unwrap_or_default()
+                )),
             },
             None => s.push_str("Machine:    not registered on this computer\n"),
         }

@@ -779,10 +779,17 @@ pub fn fetch_cmd(store: &Store, all: bool, json: bool) -> Result<ExitCode> {
 pub fn pull_cmd(store: &Store, from: Option<&str>, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
     let p = remote::pull(store, from)?;
-    let incoming = changes::classify(store)?
-        .iter()
-        .filter(|c| c.state == changes::State::Incoming)
-        .count();
+    let incoming = match changes::classify(store) {
+        Ok(c) => c
+            .iter()
+            .filter(|c| c.state == changes::State::Incoming)
+            .count(),
+        Err(_) => {
+            // Typically this computer's machine was renamed elsewhere (`dw status` says so).
+            eprintln!("warning: incoming files could not be classified; run `dw status`");
+            0
+        }
+    };
     if json {
         print_json(&json!({"pulled": p, "incoming": incoming}))?;
     } else if p.commits == 0 {
@@ -1016,6 +1023,27 @@ pub fn machine_preview(store: &Store, name: &str, diff: bool, json: bool) -> Res
                 print!("{d}");
             }
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn machine_use(store: &Store, name: &str, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    if changes::agent(store).is_some() {
+        return Err(DwError::new(
+            Kind::NeedsApproval,
+            "needs a human: choosing which machine this computer is cannot be done by an agent",
+        )
+        .into());
+    }
+    let m = crate::machines::use_machine(store, name)?;
+    if json {
+        print_json(&json!({"machine": m}))?;
+    } else {
+        println!(
+            "This computer is now {name} ({}/{})",
+            m.platform, m.distribution
+        );
     }
     Ok(ExitCode::SUCCESS)
 }

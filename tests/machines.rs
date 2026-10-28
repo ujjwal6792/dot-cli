@@ -378,7 +378,7 @@ fn retire_needs_a_human_removes_targets_and_cannot_hit_this_machine() {
         dry.out
     );
     assert!(
-        dry.out.contains("~/.a: starts applying on alpha"),
+        dry.out.contains("~/.a: kept as the only include"),
         "{}",
         dry.out
     );
@@ -390,7 +390,7 @@ fn retire_needs_a_human_removes_targets_and_cannot_hit_this_machine() {
     let done = dw(&t, &["machine", "retire", "srv", "--yes"]);
     assert_eq!(done.code, 0, "{}{}", done.out, done.err);
     let data = fs::read_to_string(repo(&t).join("home/.chezmoidata/dotwarden.toml")).unwrap();
-    assert!(!data.contains("machine:srv"), "{data}");
+    assert!(!data.contains("exclude"), "{data}");
     let list = t.dw_json(&["machine", "list"]);
     let srv = &list["machines"][1];
     assert_eq!(
@@ -406,11 +406,7 @@ fn retire_needs_a_human_removes_targets_and_cannot_hit_this_machine() {
         2
     );
     assert_eq!(dw(&t, &["machine", "preview", "srv"]).code, 1);
-    assert_eq!(
-        receives(&t, "alpha"),
-        [".a", ".b"],
-        "removing the only include/exclude frees the file"
-    );
+    assert_eq!(receives(&t, "alpha"), [".b"], "only .b was freed");
 }
 
 #[test]
@@ -531,4 +527,92 @@ fn machine_add_rename_and_duplicates_are_checked() {
         list.contains("* alpha") && list.contains("srv") && list.contains("debian"),
         "{list}"
     );
+}
+
+#[test]
+fn retiring_the_only_included_machine_leaves_the_file_on_no_machine() {
+    let t = alpha_and_srv();
+    write(&t, ".srvrc", "s\n");
+    t.dw_ok(&["track", ".srvrc", "--apply"]);
+    t.dw_ok(&["assign", ".srvrc", "--include", "machine:srv", "--apply"]);
+    let dry = dw(&t, &["machine", "retire", "srv", "--dry-run"]);
+    assert!(dry.out.contains("applies to no machine now"), "{}", dry.out);
+    t.dw_ok(&["machine", "retire", "srv", "--yes"]);
+    assert!(
+        receives(&t, "alpha").is_empty(),
+        "a server-only file must not widen"
+    );
+    let data = fs::read_to_string(repo(&t).join("home/.chezmoidata/dotwarden.toml")).unwrap();
+    assert!(data.contains("machine:srv"), "{data}");
+}
+
+#[test]
+fn a_machine_renamed_elsewhere_is_detected_and_machine_use_repoints_it() {
+    let a = TestEnv::new();
+    a.dw_ok(&["init", "--name", "alpha"]);
+    write(&a, ".x", "x\n");
+    a.dw_ok(&["track", ".x", "--apply"]);
+    a.dw_ok(&["commit", "-m", "base"]);
+    let remote = bare(&a, "remote.git");
+    a.dw_ok(&["remote", "add", "origin", remote.to_str().unwrap(), "--yes"]);
+    a.dw_ok(&["push", "--yes"]);
+    let b = TestEnv::new();
+    b.dw_ok(&["clone", remote.to_str().unwrap(), "--name", "beta"]);
+    b.dw_ok(&["push", "--yes"]);
+    a.dw_ok(&["pull"]);
+    a.dw_ok(&["machine", "rename", "beta", "bee", "--apply"]);
+    a.dw_ok(&["commit", "-m", "rename"]);
+    a.dw_ok(&["push", "--yes"]);
+    b.dw_ok(&["pull"]);
+
+    let status = dw(&b, &["status"]);
+    assert_eq!(status.code, 0, "status still works: {}", status.err);
+    assert!(
+        status.out.contains("beta is not in the machine registry"),
+        "{}",
+        status.out
+    );
+    let doctor = dw(&b, &["doctor"]);
+    assert_ne!(doctor.code, 0);
+    assert!(doctor.out.contains("dw machine use"), "{}", doctor.out);
+
+    assert_eq!(run_with(&b, true, &["machine", "use", "bee"]).code, 3);
+    assert_eq!(dw(&b, &["machine", "use", "ghost"]).code, 1);
+    a.dw_ok(&[
+        "machine",
+        "add",
+        "srv",
+        "--platform",
+        "linux",
+        "--distribution",
+        "ubuntu",
+        "--apply",
+    ]);
+    b.dw_ok(&[
+        "machine",
+        "add",
+        "srv",
+        "--platform",
+        "linux",
+        "--distribution",
+        "ubuntu",
+        "--apply",
+    ]);
+    let wrong = dw(&b, &["machine", "use", "srv"]);
+    assert_eq!(wrong.code, 1);
+    assert!(wrong.err.contains("this computer is"), "{}", wrong.err);
+
+    b.dw_ok(&["machine", "use", "bee"]);
+    assert!(
+        fs::read_to_string(b.dirs().machine_toml())
+            .unwrap()
+            .contains("bee")
+    );
+    assert!(
+        !dw(&b, &["status"])
+            .out
+            .contains("not in the machine registry")
+    );
+    b.dw_ok(&["apply", "--all"]);
+    assert!(b.home.join(".x").exists());
 }

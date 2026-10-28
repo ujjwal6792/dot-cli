@@ -331,10 +331,17 @@ Exact template code (written once into every repository; the files in
   and the generated chezmoi config. Another computer registered under the old
   name must register again after pulling.
 - **Retire**: approval-required (never an agent). Removes the machine from every
-  assignment include/exclude and marks it retired (the entry is kept); variants
-  or overrides still naming it are listed as notes, not edited. The preview lists
-  each assignment and every file whose applicability changes (removing the only
-  include makes a file apply everywhere). This machine cannot be retired.
+  exclude and from every include list that has other includes, and marks it
+  retired (the entry is kept). When it is a file's *only* include it stays there:
+  a retired machine never matches, so the file then applies to no machine (never
+  to all); the preview says "applies to no machine now". Variants or overrides
+  naming it are listed as notes, not edited. The preview lists each assignment and
+  every file whose applicability changes. This machine cannot be retired.
+- **`dw machine use NAME`** (human only) re-points this computer's `machine.toml`
+  and generated chezmoi config to an existing registry entry whose platform and
+  distribution match, for when the machine was renamed on another computer.
+  `dw status`, `dw doctor` and the TUI Status panel say when the local name is not
+  in the registry.
 - **Preview as machine** (`dw machine preview NAME [--diff]`, TUI Machines panel
   Enter): `chezmoi managed` (and `diff` against this HOME) with a throwaway
   config, state and cache and the machine name overridden; HOME and the real
