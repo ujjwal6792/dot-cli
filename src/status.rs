@@ -80,20 +80,16 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         .stdout
         .lines()
         .count();
-    let upstream = trimmed(
-        store,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-        cancel,
-    );
-    let (ahead, behind) = match upstream {
-        Some(_) => trimmed(
+    let upstream = crate::remote::tracking_ref(store);
+    let (ahead, behind) = match &upstream {
+        Some(u) => trimmed(
             store,
-            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("HEAD...{u}"),
+            ],
             cancel,
         )
         .and_then(|s| {

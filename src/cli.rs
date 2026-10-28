@@ -198,8 +198,101 @@ pub enum Command {
         #[command(subcommand)]
         action: SnapshotCmd,
     },
+    /// Manage the remotes this repository syncs with.
+    ///
+    /// Public remotes are refused (exit 6): secret names, variables and the machine
+    /// registry would be readable by anyone. Adding or removing a remote needs a
+    /// human: from an agent, or without a terminal and without --yes, the request
+    /// goes to the pending list (exit 3).
+    Remote {
+        #[command(subcommand)]
+        action: RemoteCmd,
+    },
+    /// Download new commits from a remote. Never changes HOME or the working tree.
+    Fetch {
+        /// Fetch every remote instead of only the default one.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Fast-forward the branch to the remote's.
+    ///
+    /// Refuses when this machine has commits the remote lacks. Files whose
+    /// committed version changed show as Incoming; `dw apply` writes them to HOME.
+    Pull {
+        /// Remote to pull from (default: the branch's remote, else origin).
+        remote: Option<String>,
+    },
+    /// Write Incoming files to HOME (a snapshot of them is taken first).
+    ///
+    /// Only Incoming files are written. Files changed both here and in the
+    /// repository (conflicts) are never overwritten: a conflict named explicitly
+    /// exits 5, with --all it is skipped and listed.
+    Apply {
+        /// Files or folders to apply.
+        #[arg(num_args = 0..)]
+        paths: Vec<String>,
+        /// Apply every incoming file.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Show what would be written without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Push the branch to a remote (the default one unless named).
+    ///
+    /// Visibility is checked again before every push; a public remote exits 6.
+    /// Needs a human: from an agent, or without a terminal and without --yes, the
+    /// request goes to the pending list (exit 3) and `dw pending apply` runs it.
+    Push {
+        /// Remote to push to (default: the branch's remote, else origin).
+        #[arg(conflicts_with = "all")]
+        remote: Option<String>,
+        /// Push to every remote.
+        #[arg(long)]
+        all: bool,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would be pushed without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Open the terminal UI (the default when no command is given).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum RemoteCmd {
+    /// Add a remote after checking that it is not public.
+    ///
+    /// github.com, gitlab.com, codeberg.org and bitbucket.org are probed
+    /// anonymously over HTTPS. Other hosts need you to confirm in a terminal that
+    /// the repository is private; the answer is remembered for that URL.
+    Add {
+        /// Name of the remote, for example origin.
+        name: String,
+        /// Repository URL (https, ssh, scp-style, file or a path).
+        url: String,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove a remote.
+    Remove {
+        /// Name of the remote.
+        name: String,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List the remotes and how their visibility is verified.
+    List,
 }
 
 #[derive(Debug, Subcommand)]
@@ -445,6 +538,33 @@ fn run(cli: Cli) -> Result<ExitCode> {
             yes,
             dry_run,
         } => return cmds::discard_cmd(&store, &paths, yes, dry_run, json),
+        Command::Remote { action } => {
+            return match action {
+                RemoteCmd::Add {
+                    name,
+                    url,
+                    yes,
+                    dry_run,
+                } => cmds::remote_add(&store, &name, &url, yes, dry_run, json),
+                RemoteCmd::Remove { name, yes, dry_run } => {
+                    cmds::remote_remove(&store, &name, yes, dry_run, json)
+                }
+                RemoteCmd::List => cmds::remote_list(&store, json),
+            };
+        }
+        Command::Fetch { all } => return cmds::fetch_cmd(&store, all, json),
+        Command::Pull { remote } => return cmds::pull_cmd(&store, remote.as_deref(), json),
+        Command::Apply {
+            paths,
+            all,
+            dry_run,
+        } => return cmds::apply_cmd(&store, &paths, all, dry_run, json),
+        Command::Push {
+            remote,
+            all,
+            yes,
+            dry_run,
+        } => return cmds::push_cmd(&store, remote.as_deref(), all, yes, dry_run, json),
         Command::Snapshot { action } => {
             return match action {
                 SnapshotCmd::List { path } => cmds::snapshot_list(&store, path.as_deref(), json),

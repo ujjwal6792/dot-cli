@@ -460,6 +460,21 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 g.home.insert(f.clone(), home_fingerprint(&home.join(f)));
             }
         }
+        Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
+            g.repo
+                .insert(format!("remote:{name}"), remote_state(store, name));
+        }
+        Action::Push { remotes } => {
+            for r in remotes {
+                g.repo.insert(format!("remote:{r}"), remote_state(store, r));
+            }
+            g.repo.insert(
+                "head:HEAD".into(),
+                store
+                    .git(&["rev-parse", "HEAD"])
+                    .map_or("-".into(), |o| o.stdout.trim().to_string()),
+            );
+        }
         Action::HideAdd { pattern } | Action::HideRemove { pattern } => {
             g.repo.insert(
                 format!("rule:{pattern}"),
@@ -468,6 +483,13 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         }
     }
     Ok(g)
+}
+
+fn remote_state(store: &Store, name: &str) -> String {
+    crate::remote::remote_url(store, name)
+        .ok()
+        .flatten()
+        .unwrap_or_else(|| "-".into())
 }
 
 fn describe_key(home_side: bool, key: &str) -> String {
@@ -480,6 +502,8 @@ fn describe_key(home_side: bool, key: &str) -> String {
         Some(("folder", p)) => format!("the tracked folder ~/{p}"),
         Some(("assignment", p)) => format!("the assignment of ~/{p}"),
         Some(("rule", p)) => format!("the hide rule `{p}`"),
+        Some(("remote", p)) => format!("the remote {p}"),
+        Some(("head", _)) => "the repository's latest commit".to_string(),
         _ => key.to_string(),
     }
 }
@@ -1288,7 +1312,12 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             }
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
         }
-        Action::Discard { .. } => unreachable!("discards are run by apply_items"),
+        Action::Discard { .. }
+        | Action::RemoteAdd { .. }
+        | Action::RemoteRemove { .. }
+        | Action::Push { .. } => {
+            unreachable!("run by apply_items")
+        }
         Action::HideAdd { pattern } => {
             hide::add_rule(&repo, pattern)?;
             verify_and_stage(store, &BTreeSet::from([hide::HIDE_FILE.to_string()]), &[])
@@ -1355,6 +1384,9 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
                     };
                     (Vec::new(), Some(note))
                 })
+            }
+            Action::RemoteAdd { .. } | Action::RemoteRemove { .. } | Action::Push { .. } => {
+                crate::remote::exec_action(store, &item.action).map(|note| (Vec::new(), Some(note)))
             }
             _ => exec_item(store, &ctx, item).map(|staged| (staged, None)),
         };

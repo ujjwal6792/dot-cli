@@ -40,13 +40,13 @@ const HELP: &[(&str, &str)] = &[
     ),
     (
         "Space/a (Changes)",
-        "stage or unstage the change / all; [ ] switch tab",
+        "stage, unstage, apply incoming (y/n); a = all; [ ] tabs",
     ),
     (
         "c A d (Changes)",
-        "commit, amend (Ctrl+J: new line), discard",
+        "commit, amend (Ctrl+J: new line), discard; Enter diff",
     ),
-    ("Enter (Changes)", "show the diff of the change (delta)"),
+    ("f p P", "fetch, pull (fast-forward), push (y/n)"),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
     ("Enter (Pending)", "review and apply all checked items"),
@@ -564,6 +564,32 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             ));
             (if b.amend { " Amend " } else { " Commit " }, l)
         }
+        Dialog::ConfirmApply(sel) => (
+            " Apply ",
+            vec![
+                Line::from(match sel {
+                    Some(p) if p.len() == 1 => format!("Write ~/{} to HOME?", p[0]),
+                    Some(p) => format!("Write {} files to HOME?", p.len()),
+                    None => "Write every incoming file to HOME?".to_string(),
+                }),
+                Line::from("A snapshot is taken first."),
+                Line::styled(
+                    "y applies · n / Esc cancels",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        ),
+        Dialog::ConfirmPush => (
+            " Push ",
+            vec![
+                Line::from("Push the branch to its remote?"),
+                Line::from("Public remotes are refused."),
+                Line::styled(
+                    "y pushes · n / Esc cancels",
+                    Style::default().fg(Color::Yellow),
+                ),
+            ],
+        ),
         Dialog::ConfirmDiscard(paths) => (
             " Discard ",
             vec![

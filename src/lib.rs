@@ -14,6 +14,7 @@ pub mod machine;
 pub mod paths;
 pub mod pending;
 pub mod pins;
+pub mod remote;
 pub mod repo;
 pub mod snapshot;
 pub mod source;

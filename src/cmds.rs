@@ -10,6 +10,7 @@ use serde_json::json;
 use crate::changes::{self, CommitOpts};
 use crate::error::{self, DwError, Kind};
 use crate::pending::{self, Item};
+use crate::remote;
 use crate::snapshot;
 use crate::store::Store;
 use crate::track::{self, Ctx, ItemResult, Outcome, Plan};
@@ -663,4 +664,204 @@ pub fn snapshot_restore(
         }
     }
     Ok(ExitCode::SUCCESS)
+}
+
+// ---- remotes, fetch, pull, apply, push ------------------------------------
+
+/// Dry run, or the approval gate (agents and non-terminals go to the pending
+/// list, exit 3), then `run`. `run` may itself ask for approval (exit 3).
+fn gated(
+    store: &Store,
+    item: Item,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+    run: impl FnOnce() -> Result<ExitCode>,
+) -> Result<ExitCode> {
+    if dry_run {
+        return submit(store, vec![item], false, true, json);
+    }
+    let outcome = match approval_gate(store, &[&item], yes, json) {
+        Ok(()) => run(),
+        Err(e) => Err(e),
+    };
+    match outcome {
+        Err(e) if error::classify(&e).0 == Kind::NeedsApproval => {
+            if !json {
+                eprintln!("{e:#}");
+            }
+            submit(store, vec![item], false, false, json)?;
+            if !json {
+                println!("Approve it with `dw pending apply` in a terminal.");
+            }
+            Ok(ExitCode::from(Kind::NeedsApproval.code()))
+        }
+        other => other,
+    }
+}
+
+pub fn remote_add(
+    store: &Store,
+    name: &str,
+    url: &str,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let item = remote::plan_add_item(store, name, url, &pending::requester(store))?;
+    gated(store, item, yes, dry_run, json, || {
+        let _lock = store.lock()?;
+        let warning = remote::add_locked(store, name, url, Some(&remote::ask_tty))?;
+        if json {
+            print_json(&json!({"added": name, "url": url, "warning": warning}))?;
+        } else {
+            println!("Added remote {name} ({url})");
+            if let Some(w) = warning {
+                println!("warning: {w}");
+            }
+        }
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+pub fn remote_remove(
+    store: &Store,
+    name: &str,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let item = remote::plan_remove_item(store, name, &pending::requester(store))?;
+    gated(store, item, yes, dry_run, json, || {
+        let _lock = store.lock()?;
+        remote::remove_locked(store, name)?;
+        if json {
+            print_json(&json!({"removed": name}))?;
+        } else {
+            println!("Removed remote {name}");
+        }
+        Ok(ExitCode::SUCCESS)
+    })
+}
+
+pub fn remote_list(store: &Store, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let list = remote::list(store)?;
+    if json {
+        print_json(&json!({"remotes": list}))?;
+    } else if list.is_empty() {
+        println!("No remotes. Add one with `dw remote add NAME URL`.");
+    } else {
+        for r in &list {
+            println!("{:<10} {}  [{}]", r.name, r.url, r.visibility);
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn fetch_cmd(store: &Store, all: bool, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let f = remote::fetch(store, all, None)?;
+    if json {
+        print_json(&f)?;
+    } else {
+        print!("Fetched {}.", f.remotes.join(", "));
+        if let (Some(a), Some(b)) = (f.ahead, f.behind) {
+            print!(" Ahead {a}, behind {b}.");
+        }
+        println!();
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn pull_cmd(store: &Store, from: Option<&str>, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let p = remote::pull(store, from)?;
+    let incoming = changes::classify(store)?
+        .iter()
+        .filter(|c| c.state == changes::State::Incoming)
+        .count();
+    if json {
+        print_json(&json!({"pulled": p, "incoming": incoming}))?;
+    } else if p.commits == 0 {
+        println!("Already up to date with {}.", p.remote);
+    } else {
+        println!(
+            "Fast-forwarded {} commit(s) from {} ({} file(s) changed). {incoming} incoming; apply with `dw apply`.",
+            p.commits, p.remote, p.files
+        );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn apply_cmd(
+    store: &Store,
+    paths: &[String],
+    all: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let sel = home_selectors(store, paths, all, "apply")?;
+    let a = changes::apply_incoming(store, sel.as_deref(), dry_run)?;
+    if json {
+        print_json(&a)?;
+    } else {
+        let verb = if dry_run { "would apply" } else { "applied" };
+        for f in &a.applied {
+            println!("{verb} ~/{f}");
+        }
+        for f in &a.conflicts {
+            println!("skipped ~/{f}: conflict (changed here and in the repository)");
+        }
+        for f in &a.failed {
+            println!("FAILED  ~/{f}");
+        }
+        if let Some(id) = &a.snapshot {
+            println!("snapshot {id} taken first");
+        }
+        if a.applied.is_empty() && a.failed.is_empty() {
+            println!("Nothing incoming to apply.");
+        }
+        if let Some(e) = &a.error {
+            eprintln!("{e}");
+        }
+    }
+    Ok(if !a.failed.is_empty() {
+        ExitCode::from(Kind::Error.code())
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+pub fn push_cmd(
+    store: &Store,
+    target: Option<&str>,
+    all: bool,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let targets = match (target, all) {
+        (Some(r), _) => vec![r.to_string()],
+        (None, true) => remote::names(store)?,
+        (None, false) => vec![remote::default_remote(store)?],
+    };
+    let item = remote::plan_push_item(store, &targets, &pending::requester(store))?;
+    gated(store, item, yes, dry_run, json, || {
+        let done = remote::push(store, &targets)?;
+        if json {
+            print_json(&json!({"pushed": done}))?;
+        } else {
+            for p in &done {
+                println!("Pushed {} to {}", p.branch, p.remote);
+                if let Some(w) = &p.warning {
+                    println!("warning: {w}");
+                }
+            }
+        }
+        Ok(ExitCode::SUCCESS)
+    })
 }

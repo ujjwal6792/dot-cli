@@ -63,6 +63,17 @@ pub enum Action {
     HideRemove {
         pattern: String,
     },
+    RemoteAdd {
+        name: String,
+        url: String,
+    },
+    RemoteRemove {
+        name: String,
+    },
+    /// Push the branch to these remotes (every remote when empty).
+    Push {
+        remotes: Vec<String>,
+    },
 }
 
 impl Action {
@@ -73,13 +84,22 @@ impl Action {
             Action::Discard { .. } => "discard",
             Action::HideAdd { .. } => "hide_add",
             Action::HideRemove { .. } => "hide_remove",
+            Action::RemoteAdd { .. } => "remote_add",
+            Action::RemoteRemove { .. } => "remote_remove",
+            Action::Push { .. } => "push",
         }
     }
 
     /// Whether only a human may apply this item (spec §8): agents cannot approve
-    /// their own requests. Push and the like join discard here.
+    /// their own requests: discard, push and remote changes.
     pub fn needs_approval(&self) -> bool {
-        matches!(self, Action::Discard { .. })
+        matches!(
+            self,
+            Action::Discard { .. }
+                | Action::RemoteAdd { .. }
+                | Action::RemoteRemove { .. }
+                | Action::Push { .. }
+        )
     }
 
     /// Two items with the same key request the same thing.
@@ -89,6 +109,8 @@ impl Action {
             | Action::Untrack { path, .. }
             | Action::Discard { path, .. } => path,
             Action::HideAdd { pattern } | Action::HideRemove { pattern } => pattern,
+            Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => name,
+            Action::Push { remotes } => remotes.first().map_or("", String::as_str),
         };
         (self.kind_name(), what)
     }
