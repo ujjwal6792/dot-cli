@@ -316,12 +316,30 @@ Exact template code (written once into every repository; the files in
 - **Specificity** (variants and values): machine > distribution > family >
   platform > default. Two matches at the same level are an error shown in the UI
   and block apply of that file only.
-- **Rename** a machine: updates every assignment, variant and value override in one
-  reviewed change. **Retire**: removes it from all targets via a review listing
-  every affected file and value; the registry keeps it as retired.
-- **Preview as machine**: render the managed set and diffs for another registry
-  machine using an isolated chezmoi state and overridden machine data. Secrets are
-  masked in previews.
+- **Assigning** (`dw assign`, TUI `m`) is one pending item per request holding the
+  final lists of each path; any agent may add it. A path must be tracked or a
+  folder holding tracked files. A folder's assignment covers everything below
+  it; a file applies only when its own assignment and those of all folders above
+  it allow it. Targets are checked against the registry: unknown platform or
+  machine (and retired machines) are refused; a distribution or family no
+  registered machine has is accepted with a warning. The preview lists which
+  tracked files start or stop applying on which registry machines.
+- **Add** (`dw machine add`) pre-registers another machine through a pending item.
+- **Rename** a machine: one pending item that renames the registry file and
+  rewrites every `machine:<old>` string or key in the data file (assignments,
+  variants, value overrides). Renaming this machine also rewrites `machine.toml`
+  and the generated chezmoi config. Another computer registered under the old
+  name must register again after pulling.
+- **Retire**: approval-required (never an agent). Removes the machine from every
+  assignment include/exclude and marks it retired (the entry is kept); variants
+  or overrides still naming it are listed as notes, not edited. The preview lists
+  each assignment and every file whose applicability changes (removing the only
+  include makes a file apply everywhere). This machine cannot be retired.
+- **Preview as machine** (`dw machine preview NAME [--diff]`, TUI Machines panel
+  Enter): `chezmoi managed` (and `diff` against this HOME) with a throwaway
+  config, state and cache and the machine name overridden; HOME and the real
+  state are never written. Retired machines are refused. Secrets are masked in
+  previews.
 
 ## 5. Change model (ADR 0003)
 

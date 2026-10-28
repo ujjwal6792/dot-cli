@@ -95,6 +95,42 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Assign tracked files or folders to targets (adds one item to the pending list).
+    ///
+    /// A target is `platform:darwin|linux`, `distribution:<id>`, `family:<id>`
+    /// or `machine:<name>`. A file applies when it has no includes or any include
+    /// matches, and no exclude matches (excludes win). A folder's assignment
+    /// covers everything below it. The preview lists which tracked files stop or
+    /// start applying on which registry machines. Without --include, --exclude
+    /// or --unset, only --clear changes the assignment (back to all machines).
+    Assign {
+        /// Tracked files or folders.
+        #[arg(required = true, num_args = 1..)]
+        paths: Vec<String>,
+        /// Add an include (repeatable).
+        #[arg(long, value_name = "TARGET")]
+        include: Vec<String>,
+        /// Add an exclude (repeatable).
+        #[arg(long, value_name = "TARGET")]
+        exclude: Vec<String>,
+        /// Take a target out of both lists (repeatable).
+        #[arg(long, value_name = "TARGET")]
+        unset: Vec<String>,
+        /// Remove the existing assignment first (before --include and --exclude).
+        #[arg(long)]
+        clear: bool,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List, register, rename, retire or preview machines of the registry.
+    Machine {
+        #[command(subcommand)]
+        action: MachineCmd,
+    },
     /// List, show, drop or apply pending items (lists when no subcommand is given).
     Pending {
         #[command(subcommand)]
@@ -259,6 +295,69 @@ pub enum Command {
     },
     /// Open the terminal UI (the default when no command is given).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum MachineCmd {
+    /// List the registry: name, platform, distribution, families, retired.
+    List,
+    /// Register another machine in advance (through the pending list).
+    Add {
+        /// Registry name ([a-z0-9-]).
+        name: String,
+        /// darwin or linux.
+        #[arg(long)]
+        platform: String,
+        /// The os-release ID, or macos.
+        #[arg(long)]
+        distribution: String,
+        /// A distribution family such as arch-like or debian (repeatable).
+        #[arg(long)]
+        family: Vec<String>,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Rename a machine in the registry, every assignment and every override.
+    Rename {
+        /// Current name.
+        old: String,
+        /// New name.
+        new: String,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Retire a machine: remove it from every assignment and mark it retired.
+    ///
+    /// Needs a human: from an agent, or without a terminal and without --yes,
+    /// the request goes to the pending list (exit 3). This machine cannot be retired.
+    Retire {
+        /// Machine to retire.
+        name: String,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List the tracked files a machine would receive.
+    ///
+    /// Uses a throwaway chezmoi state; nothing in HOME or the real state is written.
+    Preview {
+        /// Registry machine to preview.
+        name: String,
+        /// Also show the diff against this machine's HOME.
+        #[arg(long)]
+        diff: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -485,6 +584,60 @@ fn run(cli: Cli) -> Result<ExitCode> {
             apply,
             dry_run,
         } => return cmds::track_cmd(&store, Plan::Untrack, &paths, apply, dry_run, json),
+        Command::Assign {
+            paths,
+            include,
+            exclude,
+            unset,
+            clear,
+            apply,
+            dry_run,
+        } => {
+            let edits = cmds::AssignArgs {
+                include,
+                exclude,
+                unset,
+                clear,
+            };
+            return cmds::assign_cmd(&store, &paths, &edits, apply, dry_run, json);
+        }
+        Command::Machine { action } => {
+            return match action {
+                MachineCmd::List => cmds::machine_list(&store, json),
+                MachineCmd::Add {
+                    name,
+                    platform,
+                    distribution,
+                    family,
+                    apply,
+                    dry_run,
+                } => cmds::machine_add(
+                    &store,
+                    crate::machine::Machine {
+                        name,
+                        platform,
+                        distribution,
+                        families: family,
+                        retired: false,
+                    },
+                    apply,
+                    dry_run,
+                    json,
+                ),
+                MachineCmd::Rename {
+                    old,
+                    new,
+                    apply,
+                    dry_run,
+                } => cmds::machine_rename(&store, &old, &new, apply, dry_run, json),
+                MachineCmd::Retire { name, yes, dry_run } => {
+                    cmds::machine_retire(&store, &name, yes, dry_run, json)
+                }
+                MachineCmd::Preview { name, diff } => {
+                    cmds::machine_preview(&store, &name, diff, json)
+                }
+            };
+        }
         Command::Pending { action } => {
             return match action.unwrap_or(PendingCmd::List) {
                 PendingCmd::List => cmds::pending_list(&store, json),

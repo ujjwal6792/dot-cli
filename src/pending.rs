@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use crate::error::{DwError, Kind};
 use crate::fsutil;
 use crate::lock::Lock;
+use crate::machine::Machine;
 use crate::store::Store;
 
 const FORMAT: u32 = 1;
@@ -74,6 +75,32 @@ pub enum Action {
     Push {
         remotes: Vec<String>,
     },
+    /// Set the assignments of tracked paths (spec §4). Each change holds the
+    /// final lists; empty lists remove the assignment.
+    Assign {
+        /// Identifies the request (paths and lists), so a different request for
+        /// the same paths is a separate item.
+        key: String,
+        changes: Vec<AssignChange>,
+    },
+    MachineAdd {
+        machine: Machine,
+    },
+    MachineRename {
+        old: String,
+        new: String,
+    },
+    MachineRetire {
+        name: String,
+    },
+}
+
+/// The final assignment of one target path.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AssignChange {
+    pub path: String,
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
 }
 
 impl Action {
@@ -87,6 +114,10 @@ impl Action {
             Action::RemoteAdd { .. } => "remote_add",
             Action::RemoteRemove { .. } => "remote_remove",
             Action::Push { .. } => "push",
+            Action::Assign { .. } => "assign",
+            Action::MachineAdd { .. } => "machine_add",
+            Action::MachineRename { .. } => "machine_rename",
+            Action::MachineRetire { .. } => "machine_retire",
         }
     }
 
@@ -99,6 +130,7 @@ impl Action {
                 | Action::RemoteAdd { .. }
                 | Action::RemoteRemove { .. }
                 | Action::Push { .. }
+                | Action::MachineRetire { .. }
         )
     }
 
@@ -111,6 +143,10 @@ impl Action {
             Action::HideAdd { pattern } | Action::HideRemove { pattern } => pattern,
             Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => name,
             Action::Push { remotes } => remotes.first().map_or("", String::as_str),
+            Action::Assign { key, .. } => key,
+            Action::MachineAdd { machine } => &machine.name,
+            Action::MachineRename { old, .. } => old,
+            Action::MachineRetire { name } => name,
         };
         (self.kind_name(), what)
     }
@@ -139,6 +175,9 @@ pub struct Preview {
     /// Hide rule changes.
     pub rules: Vec<String>,
     pub notes: Vec<String>,
+    /// Tracked files that start or stop applying on registry machines.
+    #[serde(default)]
+    pub effects: Vec<String>,
 }
 
 /// What an item's outcome depends on. Applying re-computes it and refuses
@@ -374,6 +413,14 @@ impl Item {
         );
         section(&mut s, "data", self.preview.data.clone());
         section(&mut s, "hide rules", self.preview.rules.clone());
+        const SHOWN: usize = 100;
+        let mut effects = self.preview.effects.clone();
+        if effects.len() > SHOWN {
+            let more = effects.len() - SHOWN;
+            effects.truncate(SHOWN);
+            effects.push(format!("… {more} more (see `dw pending show --json`)"));
+        }
+        section(&mut s, "effects on registry machines", effects);
         section(&mut s, "notes", self.preview.notes.clone());
         s
     }

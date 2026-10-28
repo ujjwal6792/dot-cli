@@ -11,6 +11,7 @@ pub mod fsutil;
 pub mod hide;
 pub mod lock;
 pub mod machine;
+pub mod machines;
 pub mod paths;
 pub mod pending;
 pub mod pins;

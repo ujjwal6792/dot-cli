@@ -481,6 +481,12 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 yes_no(hide::has_rule(&repo, pattern)?),
             );
         }
+        Action::Assign { .. }
+        | Action::MachineAdd { .. }
+        | Action::MachineRename { .. }
+        | Action::MachineRetire { .. } => {
+            g.repo.extend(crate::machines::guard(store, action)?);
+        }
     }
     Ok(g)
 }
@@ -500,7 +506,9 @@ fn describe_key(home_side: bool, key: &str) -> String {
         Some(("tracked", p)) => format!("the repository entry for ~/{p}"),
         Some(("hidden", p)) => format!("the hide rules for ~/{p}"),
         Some(("folder", p)) => format!("the tracked folder ~/{p}"),
-        Some(("assignment", p)) => format!("the assignment of ~/{p}"),
+        Some(("assignment" | "assigned", p)) => format!("the assignment of ~/{p}"),
+        Some(("registry", p)) => format!("the registry entry of {p}"),
+        Some(("data", _)) => "the assignment and variant data".to_string(),
         Some(("rule", p)) => format!("the hide rule `{p}`"),
         Some(("remote", p)) => format!("the remote {p}"),
         Some(("head", _)) => "the repository's latest commit".to_string(),
@@ -728,6 +736,7 @@ pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> R
         data,
         rules: Vec::new(),
         notes,
+        ..Preview::default()
     };
     let action = Action::Track {
         path: hp.rel.clone(),
@@ -795,6 +804,7 @@ pub fn plan_untrack(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) ->
         data,
         rules: Vec::new(),
         notes,
+        ..Preview::default()
     };
     let action = Action::Untrack {
         path: hp.rel.clone(),
@@ -1210,7 +1220,7 @@ pub(crate) fn rollback(store: &Store, tree: &str) -> Result<()> {
 }
 
 /// Check that exactly the previewed repository paths changed, then stage them.
-fn verify_and_stage(
+pub(crate) fn verify_and_stage(
     store: &Store,
     expected: &BTreeSet<String>,
     optional: &[&str],
@@ -1325,6 +1335,15 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
         Action::HideRemove { pattern } => {
             hide::remove_rule(&repo, pattern)?;
             verify_and_stage(store, &BTreeSet::from([hide::HIDE_FILE.to_string()]), &[])
+        }
+        Action::Assign { .. }
+        | Action::MachineAdd { .. }
+        | Action::MachineRename { .. }
+        | Action::MachineRetire { .. } => {
+            let expected = crate::machines::exec(store, &item.action)?;
+            let staged = verify_and_stage(store, &expected, &[DATA_FILE])?;
+            crate::machines::finish(store, &item.action)?;
+            Ok(staged)
         }
     }
 }
