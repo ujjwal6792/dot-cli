@@ -32,3 +32,9 @@ Hand-broken: visibility check removed from push (2 tests failed); apply given no
 - Remote add in the TUI and the privacy question there are not built (CLI/terminal only). Pending push via the TUI review works.
 - Private HTTPS remotes get no credentials (git config is isolated); SSH works. Fetch/push run non-interactive (ssh `BatchMode`).
 - Real network probe is untested (no network in tests); Linux not run.
+
+## Review fixes
+
+1. **Second machine stuck.** (a) The registry is one file per machine, `home/.chezmoidata/dotwarden-machines/<name>.toml` (`[dotwarden.machines.<name>]`); verified that chezmoi deep-merges `.chezmoidata` files, also in subdirectories, into one map. `targets` template, `read_registry`/`write_registry`, spec §3/§4 updated. (b) `dw pull` on diverged history rebases local commits that only touch `home/.chezmoidata/` onto upstream (abort and report diverged on conflict); content divergence still refuses. Test: `a_cloned_machine_pulls_and_pushes_after_another_pushed_and_both_are_registered`.
+2. **Public before pending.** `remote add` and `push` planning probe known hosts first: public exits 6 and adds no pending item. Test: `a_public_remote_exits_6_without_leaving_a_pending_item`.
+3. **Status label.** Incoming files missing from HOME show `incoming (new file)` (checked in the multi-machine test).

@@ -367,8 +367,19 @@ fn item(
     )
 }
 
+/// Refuse a public known-host remote before anything else happens (no pending item).
+fn refuse_public(store: &Store, url: &str) -> Result<()> {
+    match host_of(url) {
+        Host::Known(https) if probe(store, &https) == Visibility::Public => {
+            Err(public_refusal(url))
+        }
+        _ => Ok(()),
+    }
+}
+
 pub fn plan_add_item(store: &Store, name: &str, url: &str, requester: &str) -> Result<Item> {
     plan_add(store, name, url)?;
+    refuse_public(store, url)?;
     let notes = match host_of(url) {
         Host::Local => vec!["a local path: never public".to_string()],
         Host::Known(_) => {
@@ -413,6 +424,7 @@ pub fn plan_push_item(store: &Store, targets: &[String], requester: &str) -> Res
     let mut notes = Vec::new();
     for r in &chosen {
         let url = remote_url(store, r)?.ok_or_else(|| anyhow::anyhow!("no remote named {r}"))?;
+        refuse_public(store, &url)?;
         notes.push(match unpushed(store, r) {
             Some(n) => format!("{r} ({url}): {n} commit(s) to push"),
             None => format!("{r} ({url})"),
@@ -630,20 +642,28 @@ pub fn pull(store: &Store, remote: Option<&str>) -> Result<Pulled> {
             files: 0,
         });
     }
+    let base = text(store, &["merge-base", "HEAD", &reference]).unwrap_or_default();
     if ahead > 0 {
-        return Err(DwError::new(
-            Kind::Error,
-            format!(
-                "diverged: this machine has {ahead} commit(s) {reference} lacks and {reference} has {behind} this machine lacks; \
-                 merge/rebase arrives later — use `G` lazygit"
-            ),
-        )
-        .into());
+        let only_data = store
+            .git(&["diff", "--name-only", &format!("{reference}...HEAD")])?
+            .stdout
+            .lines()
+            .all(|p| p.starts_with("home/.chezmoidata/"));
+        if !only_data || !rebase_onto(store, &reference) {
+            return Err(DwError::new(
+                Kind::Error,
+                format!(
+                    "diverged: this machine has {ahead} commit(s) {reference} lacks and {reference} has {behind} this machine lacks; \
+                     merge/rebase arrives later — use `G` lazygit"
+                ),
+            )
+            .into());
+        }
+    } else {
+        store.git(&["merge", "--ff-only", "--quiet", &reference])?;
     }
-    let before = text(store, &["rev-parse", "HEAD"]).unwrap_or_default();
-    store.git(&["merge", "--ff-only", "--quiet", &reference])?;
     let files = store
-        .git(&["diff", "--name-only", &format!("{before}..HEAD")])?
+        .git(&["diff", "--name-only", &format!("{base}..HEAD")])?
         .stdout
         .lines()
         .count();
@@ -652,6 +672,16 @@ pub fn pull(store: &Store, remote: Option<&str>) -> Result<Pulled> {
         commits: behind,
         files,
     })
+}
+
+/// Replay the local commits on `reference`; on any conflict abort so the
+/// repository is exactly as before. Only used for commits that touch metadata.
+fn rebase_onto(store: &Store, reference: &str) -> bool {
+    if store.git(&["rebase", "--quiet", reference]).is_ok() {
+        return true;
+    }
+    let _ = store.git(&["rebase", "--abort"]);
+    false
 }
 
 // ---- push ----------------------------------------------------------------

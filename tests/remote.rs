@@ -431,3 +431,54 @@ fn pull_refuses_diverged_history_and_leaves_it_alone() {
         (Some(1), Some(1))
     );
 }
+
+#[test]
+fn a_cloned_machine_pulls_and_pushes_after_another_pushed_and_both_are_registered() {
+    let (a, remote) = machine_a();
+    let b = TestEnv::new();
+    b.dw_ok(&["clone", remote.to_str().unwrap(), "--name", "beta"]);
+    // A pushes new work while B's registration is still only local.
+    write(&a, ".c", "see\n");
+    a.dw_ok(&["track", ".c", "--apply"]);
+    a.dw_ok(&["commit", "-m", "add c"]);
+    a.dw_ok(&["push", "--yes"]);
+
+    let p = b.dw_ok(&["pull"]);
+    assert!(p.contains("1 commit"), "{p}");
+    b.dw_ok(&["push", "--yes"]);
+    a.dw_ok(&["pull"]);
+    let names: Vec<String> = dotwarden::repo::read_registry(&repo(&a))
+        .unwrap()
+        .into_iter()
+        .map(|m| m.name)
+        .collect();
+    assert_eq!(names, ["alpha", "beta"]);
+
+    // The new file is labelled as incoming, not as a New file.
+    let status = b.dw_ok(&["status"]);
+    assert!(status.contains("incoming (new file)"), "{status}");
+}
+
+#[test]
+fn a_public_remote_exits_6_without_leaving_a_pending_item() {
+    let mut t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "alpha"]);
+    fake_probe(&mut t, 0);
+    let r = dw(
+        &t,
+        &["remote", "add", "origin", "git@github.com:me/dots.git"],
+    );
+    assert_eq!(r.code, 6, "{}{}", r.out, r.err);
+    let r = run_with(
+        &t,
+        true,
+        &["remote", "add", "origin", "git@github.com:me/dots.git"],
+    );
+    assert_eq!(r.code, 6);
+    assert!(
+        t.dw_json(&["pending", "list"])["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

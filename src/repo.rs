@@ -16,6 +16,9 @@ pub const DEFAULT_BRANCH: &str = "main";
 
 /// Registry and other Dotwarden data, relative to the repository root.
 pub const DATA_FILE: &str = "home/.chezmoidata/dotwarden.toml";
+/// One file per machine, so registrations made on different computers never
+/// conflict textually; chezmoi deep-merges them into `dotwarden.machines`.
+pub const MACHINES_DIR: &str = "home/.chezmoidata/dotwarden-machines";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Registration {
@@ -55,7 +58,8 @@ pub fn write_layout(root: &Path, branch: &str) -> Result<()> {
         root,
         DATA_FILE,
         &format!(
-            "# Machine registry, assignments, variants and values (see docs/spec.md §4).\n\
+            "# Assignments, variants and values (see docs/spec.md §4). The machine registry\n\
+             # lives in dotwarden-machines/, one file per machine.\n\
              # Edited by dotwarden and by hand; comments and ordering are preserved.\n\
              [dotwarden]\nformat = {FORMAT_VERSION}\n"
         ),
@@ -148,21 +152,44 @@ pub fn clone(store: &Store, url: &str) -> Result<()> {
 
 // ---- machine registry -------------------------------------------------
 
-fn load_data(repo: &Path) -> Result<toml::Table> {
-    let path = repo.join(DATA_FILE);
-    let text = fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
-    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
-}
-
-/// Read the machine registry from a repository checkout.
+/// Read the machine registry (one file per machine), sorted by name.
 pub fn read_registry(repo: &Path) -> Result<Vec<Machine>> {
-    let data = load_data(repo)?;
-    let list = data
-        .get("dotwarden")
-        .and_then(|d| d.get("machines"))
-        .cloned()
-        .unwrap_or_else(|| toml::Value::Array(vec![]));
-    list.try_into().context("parsing the machine registry")
+    let dir = repo.join(MACHINES_DIR);
+    let mut out = Vec::new();
+    let entries = match fs::read_dir(&dir) {
+        Ok(e) => e,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+        Err(e) => return Err(e).with_context(|| format!("reading {}", dir.display())),
+    };
+    for entry in entries {
+        let path = entry?.path();
+        if path.extension().is_none_or(|x| x != "toml") {
+            continue;
+        }
+        let text =
+            fs::read_to_string(&path).with_context(|| format!("reading {}", path.display()))?;
+        let doc: toml::Table =
+            toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))?;
+        let table = doc
+            .get("dotwarden")
+            .and_then(|d| d.get("machines"))
+            .and_then(toml::Value::as_table)
+            .with_context(|| {
+                format!(
+                    "{} has no [dotwarden.machines.<name>] table",
+                    path.display()
+                )
+            })?;
+        for (_, v) in table {
+            out.push(
+                v.clone()
+                    .try_into::<Machine>()
+                    .with_context(|| format!("parsing the machine in {}", path.display()))?,
+            );
+        }
+    }
+    out.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(out)
 }
 
 /// Edit the data file as a TOML document: comments, ordering and formatting
@@ -188,57 +215,53 @@ pub fn dotwarden_table(doc: &mut toml_edit::DocumentMut) -> Result<&mut toml_edi
         .context("`dotwarden` in the data file is not a table")
 }
 
-fn set_str(t: &mut toml_edit::Table, key: &str, v: &str) {
-    if t.get(key).and_then(toml_edit::Item::as_str) != Some(v) {
-        t[key] = toml_edit::value(v);
-    }
+fn machine_file(m: &Machine) -> Result<String> {
+    let mut t = toml::Table::new();
+    t.insert("name".into(), m.name.clone().into());
+    t.insert("platform".into(), m.platform.clone().into());
+    t.insert("distribution".into(), m.distribution.clone().into());
+    t.insert(
+        "families".into(),
+        toml::Value::Array(
+            m.families
+                .iter()
+                .cloned()
+                .map(toml::Value::String)
+                .collect(),
+        ),
+    );
+    t.insert("retired".into(), m.retired.into());
+    let mut machines = toml::Table::new();
+    machines.insert(m.name.clone(), toml::Value::Table(t));
+    let mut dw = toml::Table::new();
+    dw.insert("machines".into(), toml::Value::Table(machines));
+    let mut root = toml::Table::new();
+    root.insert("dotwarden".into(), toml::Value::Table(dw));
+    Ok(toml::to_string(&root)?)
 }
 
-/// Replace the registry (`[[dotwarden.machines]]`) in place, leaving every other
-/// key, comment and the order of the file untouched.
+/// Make the registry files match `machines`: one file per machine, rewritten only
+/// when its text changes, files of machines no longer listed removed.
 pub fn write_registry(repo: &Path, machines: &[Machine]) -> Result<()> {
-    edit_data(repo, |doc| {
-        let dw = dotwarden_table(doc)?;
-        let item = dw
-            .entry("machines")
-            .or_insert_with(|| toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new()));
-        if !item.is_array_of_tables() {
-            *item = toml_edit::Item::ArrayOfTables(toml_edit::ArrayOfTables::new());
+    let dir = repo.join(MACHINES_DIR);
+    fs::create_dir_all(&dir)?;
+    let mut keep = Vec::new();
+    for m in machines {
+        machine::validate_name(&m.name)?;
+        let file = dir.join(format!("{}.toml", m.name));
+        let text = machine_file(m)?;
+        if fs::read_to_string(&file).ok().as_deref() != Some(text.as_str()) {
+            crate::fsutil::write_atomic(&file, text)?;
         }
-        let list = item.as_array_of_tables_mut().expect("just ensured");
-        while list.len() > machines.len() {
-            list.remove(list.len() - 1);
+        keep.push(file);
+    }
+    for entry in fs::read_dir(&dir)? {
+        let path = entry?.path();
+        if path.extension().is_some_and(|x| x == "toml") && !keep.contains(&path) {
+            fs::remove_file(path)?;
         }
-        for (i, m) in machines.iter().enumerate() {
-            if i >= list.len() {
-                list.push(toml_edit::Table::new());
-            }
-            let t = list.get_mut(i).expect("in range");
-            set_str(t, "name", &m.name);
-            set_str(t, "platform", &m.platform);
-            set_str(t, "distribution", &m.distribution);
-            let same = t
-                .get("families")
-                .and_then(toml_edit::Item::as_array)
-                .is_some_and(|a| {
-                    a.iter()
-                        .filter_map(toml_edit::Value::as_str)
-                        .eq(m.families.iter().map(String::as_str))
-                });
-            if !same {
-                t["families"] = toml_edit::value(
-                    m.families
-                        .iter()
-                        .map(String::as_str)
-                        .collect::<toml_edit::Array>(),
-                );
-            }
-            if t.get("retired").and_then(toml_edit::Item::as_bool) != Some(m.retired) {
-                t["retired"] = toml_edit::value(m.retired);
-            }
-        }
-        Ok(())
-    })
+    }
+    Ok(())
 }
 
 /// Register this computer under `name` (spec §4) and commit the registry.
@@ -332,7 +355,8 @@ mod tests {
         };
         write_registry(dir.path(), std::slice::from_ref(&m)).unwrap();
         assert_eq!(read_registry(dir.path()).unwrap(), vec![m]);
-        let data = load_data(dir.path()).unwrap();
+        let data: toml::Table =
+            toml::from_str(&fs::read_to_string(dir.path().join(DATA_FILE)).unwrap()).unwrap();
         assert!(data["dotwarden"]["assignments"][".zshrc"]["include"].is_array());
     }
 

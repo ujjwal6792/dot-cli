@@ -208,7 +208,12 @@ impl Status {
                 } else {
                     format!("~/{}", c.path)
                 };
-                s.push_str(&format!("  {:<9} {shown}\n", c.kind));
+                let kind = if state == State::Incoming && c.kind == "new" {
+                    "incoming (new file)"
+                } else {
+                    c.kind
+                };
+                s.push_str(&format!("  {kind:<9} {shown}\n"));
             }
             if list.len() > 20 {
                 s.push_str(&format!("  … and {} more\n", list.len() - 20));

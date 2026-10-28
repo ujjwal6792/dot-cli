@@ -105,9 +105,14 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    `{{ include "home/.dotwarden/variants/x" }}` fails with "no such file".
 4. **Machine data.** The generated chezmoi config exposes only the registry name:
    `[data.dotwardenMachine] name = "<registry name>"`. Everything else (platform,
-   distribution, families) is looked up in the registry
-   (`.chezmoidata/dotwarden.toml`, key `dotwarden.machines`) by the `targets`
-   helper, so every plain-chezmoi evaluation agrees with the registry. An unknown
+   distribution, families) is looked up in the registry by the `targets`
+   helper. The registry is one file per machine,
+   `.chezmoidata/dotwarden-machines/<name>.toml` holding
+   `[dotwarden.machines.<name>]`, so registrations made on different computers
+   never conflict textually. Verified with the pinned chezmoi: `.chezmoidata`
+   files, also in subdirectories, deep-merge maps, so the files together form the
+   map `dotwarden.machines` (keyed by name; the `targets` helper looks the name
+   up with `dig`), so every plain-chezmoi evaluation agrees with the registry. An unknown
    name fails with `machine "<name>" is not in the machine registry`; running
    chezmoi without the generated config fails with a message naming
    `dotwardenMachine`. chezmoi runs templates with `missingkey=error`, so
@@ -244,18 +249,12 @@ Exact template code (written once into every repository; the files in
 {{- fail "dotwarden: chezmoi data 'dotwardenMachine' is missing; run chezmoi through dotwarden" -}}
 {{- end -}}
 {{- $name := .dotwardenMachine.name -}}
-{{- $machine := dict -}}
-{{- $retired := false -}}
-{{- range (dig "dotwarden" "machines" (list) .) -}}
-{{- if eq .name $name -}}
-{{- if get . "retired" | default false }}{{ $retired = true }}{{ else }}{{ $machine = . }}{{ end -}}
-{{- end -}}
-{{- end -}}
-{{- if $retired -}}
-{{- fail (printf "dotwarden: machine %q is retired and has no targets" $name) -}}
-{{- end -}}
+{{- $machine := dig "dotwarden" "machines" $name (dict) . -}}
 {{- if not $machine -}}
 {{- fail (printf "dotwarden: machine %q is not in the machine registry" $name) -}}
+{{- end -}}
+{{- if get $machine "retired" | default false -}}
+{{- fail (printf "dotwarden: machine %q is retired and has no targets" $name) -}}
 {{- end -}}
 {{- $targets := list (printf "platform:%s" $machine.platform) (printf "distribution:%s" $machine.distribution) (printf "machine:%s" $machine.name) -}}
 {{- range $machine.families }}{{ $targets = append $targets (printf "family:%s" .) }}{{ end -}}
@@ -302,7 +301,7 @@ Exact template code (written once into every repository; the files in
 
 ## 4. Machines and targeting (ADR 0005)
 
-- The **machine registry** lists machines: `name`, `platform` (darwin|linux),
+- The **machine registry** (one data file per machine, §3 item 4) lists machines: `name`, `platform` (darwin|linux),
   `distribution` (`/etc/os-release` `ID`; `macos` on darwin), `families` (from
   `ID_LIKE`, e.g. `arch` → target `arch-like`), and `retired`.
 - Each machine stores its registry name locally; the generated chezmoi config
