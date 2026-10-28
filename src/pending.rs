@@ -117,6 +117,26 @@ pub enum Action {
         last: bool,
         source: String,
     },
+    /// Set the default (`target` None) or one override of a variable.
+    ValueSet {
+        /// Identifies the request (`NAME` or `NAME@target`).
+        key: String,
+        name: String,
+        target: Option<String>,
+        value: String,
+    },
+    /// Remove one override, or (no target) the whole variable.
+    ValueUnset {
+        key: String,
+        name: String,
+        target: Option<String>,
+    },
+    /// Replace this machine's value of a variable in a tracked file by references.
+    ValueWire {
+        key: String,
+        path: String,
+        name: String,
+    },
 }
 
 /// The final assignment of one target path.
@@ -144,6 +164,9 @@ impl Action {
             Action::MachineRetire { .. } => "machine_retire",
             Action::VariantAdd { .. } => "variant_add",
             Action::VariantRemove { .. } => "variant_remove",
+            Action::ValueSet { .. } => "value_set",
+            Action::ValueUnset { .. } => "value_unset",
+            Action::ValueWire { .. } => "value_wire",
         }
     }
 
@@ -174,6 +197,9 @@ impl Action {
             Action::MachineRename { old, .. } => old,
             Action::MachineRetire { name } => name,
             Action::VariantAdd { file, .. } | Action::VariantRemove { file, .. } => file,
+            Action::ValueSet { key, .. }
+            | Action::ValueUnset { key, .. }
+            | Action::ValueWire { key, .. } => key,
         };
         (self.kind_name(), what)
     }
@@ -430,7 +456,11 @@ impl Item {
                 .map(|f| {
                     format!(
                         "{} {}  ({}, {})",
-                        if f.action == "add" { "+" } else { "-" },
+                        match f.action.as_str() {
+                            "add" => "+",
+                            "change" => "~",
+                            _ => "-",
+                        },
                         f.source,
                         f.kind,
                         f.target

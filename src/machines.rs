@@ -620,7 +620,9 @@ pub fn exec(store: &Store, action: &Action) -> Result<BTreeSet<String>> {
                 rename_refs(doc, &from, &to);
                 Ok(())
             })?;
-            Ok(BTreeSet::from([registry_file(old), registry_file(new)]))
+            let mut files = crate::values::rename_machine(&repo, old, new)?;
+            files.extend([registry_file(old), registry_file(new)]);
+            Ok(files)
         }
         Action::MachineRetire { name } => {
             let m = registry

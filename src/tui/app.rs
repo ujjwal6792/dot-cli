@@ -110,6 +110,37 @@ pub enum ActionReq {
     Assign(Vec<String>, Vec<crate::machines::Edit>),
     /// Add a pending variant of this HOME-relative file for a target.
     Variant(String, String),
+    /// Set a variable's default (no target) or one override, as a pending item.
+    Value {
+        name: String,
+        target: Option<String>,
+        value: String,
+    },
+}
+
+/// What the Values input box is editing.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ValueEdit {
+    /// The default of this variable.
+    Default(String),
+    /// "TARGET VALUE" for an override of this variable.
+    Override(String),
+    /// "NAME VALUE" for a new variable.
+    New,
+}
+
+#[derive(Debug, Clone)]
+pub struct ValueInput {
+    pub edit: ValueEdit,
+    pub text: String,
+}
+
+/// The Values screen (`V`).
+#[derive(Debug, Default)]
+pub struct ValuesScreen {
+    pub rows: Vec<crate::values::Row>,
+    pub selected: usize,
+    pub input: Option<ValueInput>,
 }
 
 /// The assignment editor: one checkbox row per target, with the state over
@@ -230,6 +261,8 @@ pub struct App {
     /// The machine registry and the assignments; `None` until first loaded.
     pub registry: Option<Arc<RegistryView>>,
     pub machines_selected: usize,
+    /// The Values screen, open while `Some`.
+    pub values: Option<ValuesScreen>,
     /// The preview of the machine last opened with Enter in the Machines panel.
     pub machine_preview: Option<(String, Load<String>)>,
     /// Change marker of the `hide` file last loaded (`None` until the first load).
@@ -264,6 +297,7 @@ impl App {
             changes_selected: 0,
             diff: Load::Ready(ratatui::text::Text::default()),
             registry: None,
+            values: None,
             machines_selected: 0,
             machine_preview: None,
             hide_stamp: None,
@@ -522,6 +556,7 @@ impl App {
                     }
                     Err(e) => self.message = Some(e),
                 }
+                self.reload_values();
                 self.refresh_tracking();
                 self.refresh_hide();
                 self.refresh_status();
@@ -918,6 +953,12 @@ impl App {
                 _ => self.dialog_key(key),
             };
         }
+        if self.values.is_some() {
+            return match key.code {
+                KeyCode::Char('c') if ctrl => self.quit = true,
+                _ => self.values_key(key),
+            };
+        }
         match key.code {
             KeyCode::Char('c') if ctrl => return self.quit = true,
             KeyCode::Char('q') => return self.quit = true,
@@ -930,6 +971,10 @@ impl App {
                 return self.focus = Panel::ALL[c as usize - '1' as usize];
             }
             KeyCode::Char('0') => return self.focus = Panel::Pending,
+            KeyCode::Char('V') => {
+                self.values = Some(ValuesScreen::default());
+                return self.reload_values();
+            }
             KeyCode::Char('f') => return self.request_action(ActionReq::Fetch),
             KeyCode::Char('p') => return self.request_action(ActionReq::Pull),
             KeyCode::Char('P') => return self.dialog = Some(Dialog::ConfirmPush),
@@ -951,6 +996,91 @@ impl App {
                 KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
                 _ => {}
             },
+        }
+    }
+
+    /// Re-read the variables for the open Values screen.
+    fn reload_values(&mut self) {
+        let Some(v) = &mut self.values else { return };
+        match crate::values::list(&self.store) {
+            Ok(rows) => {
+                v.selected = v.selected.min(rows.len().saturating_sub(1));
+                v.rows = rows;
+            }
+            Err(e) => self.message = Some(format!("{e:#}")),
+        }
+    }
+
+    fn values_key(&mut self, key: KeyEvent) {
+        let Some(v) = &mut self.values else { return };
+        if let Some(input) = &mut v.input {
+            match key.code {
+                KeyCode::Esc => v.input = None,
+                KeyCode::Backspace => {
+                    input.text.pop();
+                }
+                KeyCode::Char(c) => input.text.push(c),
+                KeyCode::Enter => {
+                    let input = v.input.take().expect("checked");
+                    let text = input.text.trim().to_string();
+                    let req = match &input.edit {
+                        ValueEdit::Default(name) => Some((name.clone(), None, text)),
+                        ValueEdit::Override(name) => text
+                            .split_once(' ')
+                            .map(|(t, val)| (name.clone(), Some(t.to_string()), val.trim().into())),
+                        ValueEdit::New => text
+                            .split_once(' ')
+                            .map(|(n, val)| (n.to_string(), None, val.trim().into())),
+                    };
+                    match req {
+                        Some((name, target, value)) => {
+                            self.request_action(ActionReq::Value {
+                                name,
+                                target,
+                                value,
+                            });
+                        }
+                        None => {
+                            self.message = Some(match input.edit {
+                                ValueEdit::New => "type: NAME VALUE".to_string(),
+                                _ => "type: TARGET VALUE (for example machine:mac 14)".to_string(),
+                            });
+                        }
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        let last = v.rows.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Esc => self.values = None,
+            KeyCode::Char('j') | KeyCode::Down => v.selected = (v.selected + 1).min(last),
+            KeyCode::Char('k') | KeyCode::Up => v.selected = v.selected.saturating_sub(1),
+            KeyCode::Char('n') => {
+                v.input = Some(ValueInput {
+                    edit: ValueEdit::New,
+                    text: String::new(),
+                })
+            }
+            KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('o') => {
+                if let Some(row) = v.rows.get(v.selected) {
+                    let over = key.code == KeyCode::Char('o');
+                    v.input = Some(ValueInput {
+                        edit: if over {
+                            ValueEdit::Override(row.name.clone())
+                        } else {
+                            ValueEdit::Default(row.name.clone())
+                        },
+                        text: if over {
+                            String::new()
+                        } else {
+                            row.default.clone()
+                        },
+                    });
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1087,6 +1217,9 @@ fn done_message(verb: &str, d: &changes::Done) -> String {
     };
     if !d.skipped.is_empty() {
         m.push_str(&format!(" ({} skipped)", d.skipped.len()));
+    }
+    if let Some(n) = d.notes.first() {
+        m.push_str(&format!("; {n}"));
     }
     m
 }
@@ -1311,6 +1444,22 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let hp = track::resolve_home_path(store, &path, &store.dirs.home)?;
             let ctx = track::Ctx::load(store)?;
             let item = crate::variants::plan_add(store, &ctx, &hp, &target, "human")?;
+            let lock = store.lock()?;
+            track::recheck(store, &lock, std::slice::from_ref(&item))?;
+            let ctx = track::Ctx::load(store)?;
+            let check = track::stale_checker(store, &ctx);
+            let mut added = pending::add(store, &lock, vec![item], &check)?;
+            let item = added.remove(0).item;
+            Ok(report(format!("Added {}: {}", item.label(), item.summary)))
+        }
+        ActionReq::Value {
+            name,
+            target,
+            value,
+        } => {
+            let ctx = track::Ctx::load(store)?;
+            let item =
+                crate::values::plan_set(store, &ctx, &name, target.as_deref(), &value, "human")?;
             let lock = store.lock()?;
             track::recheck(store, &lock, std::slice::from_ref(&item))?;
             let ctx = track::Ctx::load(store)?;

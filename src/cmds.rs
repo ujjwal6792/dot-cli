@@ -452,6 +452,9 @@ pub fn stage_cmd(
         for s in &done.skipped {
             println!("skipped {}: {}", s.path, s.reason);
         }
+        for n in &done.notes {
+            println!("{n}");
+        }
     }
     Ok(ExitCode::SUCCESS)
 }
@@ -985,6 +988,108 @@ pub fn variant_list(store: &Store, path: Option<&str>, json: bool) -> Result<Exi
             let here = s.receives.as_deref() == Some(t.as_str());
             println!("  {t}{}", if here { "  <- this machine" } else { "" });
         }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn values_set(
+    store: &Store,
+    name: &str,
+    value: &str,
+    target: Option<&str>,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item =
+        crate::values::plan_set(store, &ctx, name, target, value, &pending::requester(store))?;
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn values_unset(
+    store: &Store,
+    name: &str,
+    target: Option<&str>,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::values::plan_unset(store, &ctx, name, target, &pending::requester(store))?;
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn values_wire(
+    store: &Store,
+    path: &str,
+    name: &str,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let hp = track::resolve_home_path(store, path, &cwd()?)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::values::plan_wire(store, &ctx, &hp, name, &pending::requester(store))?;
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn values_list(store: &Store, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let rows = crate::values::list(store)?;
+    if json {
+        print_json(&json!({"values": rows}))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    if rows.is_empty() {
+        println!("No values.");
+    }
+    for r in &rows {
+        println!("{} ({})  default {}", r.name, r.kind, r.default);
+        for o in &r.overrides {
+            println!("  {} = {}", o.target, o.value);
+        }
+        if let (Some(v), Some(from)) = (&r.here, &r.here_from) {
+            println!("  this machine: {v} ({from})");
+        }
+        if !r.files.is_empty() {
+            println!(
+                "  used by {}",
+                r.files
+                    .iter()
+                    .map(|f| format!("~/{f}"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn values_show(store: &Store, name: &str, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let rows = crate::values::list(store)?;
+    let Some(r) = rows.iter().find(|r| r.name == name) else {
+        return Err(track::refuse(format!("variable {name} does not exist")));
+    };
+    if json {
+        print_json(&json!({"value": r}))?;
+        return Ok(ExitCode::SUCCESS);
+    }
+    println!("{} ({})", r.name, r.kind);
+    println!("  default: {}", r.default);
+    for o in &r.overrides {
+        println!("  {}: {}", o.target, o.value);
+    }
+    match (&r.here, &r.here_from) {
+        (Some(v), Some(from)) => println!("  this machine receives {v} ({from})"),
+        _ => println!("  this machine is not in the registry"),
+    }
+    for f in &r.files {
+        println!("  used by ~/{f}");
     }
     Ok(ExitCode::SUCCESS)
 }
