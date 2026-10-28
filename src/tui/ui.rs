@@ -20,7 +20,7 @@ pub fn is_single_panel(area: Rect) -> bool {
 }
 
 const FOOTER: &str =
-    " q quit · ? help · 1-5 · 0 pending · Space track · m assign · v range · r refresh";
+    " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · v range · r refresh";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
@@ -34,7 +34,7 @@ const HELP: &[(&str, &str)] = &[
         "Files: track / untrack (adds or drops a pending item)",
     ),
     ("v", "Files: start / end a range selection, then Space"),
-    ("m", "Files/Changes: assign targets (Space/i/x/-, Enter)"),
+    ("m / t", "Files/Changes: assign (m), add a variant ◆ (t)"),
     (
         "i",
         "Files: hide (or un-hide) the path through a pending hide item",
@@ -245,6 +245,20 @@ fn assignment_badge(a: &crate::assign::Assignment) -> String {
     }
 }
 
+/// `◆2`: the file has 2 versions (default and one variant); `!` when they clash here.
+fn variant_badge(app: &App, rel: &str) -> Option<Span<'static>> {
+    let Load::Ready(s) = &app.status else {
+        return None;
+    };
+    let v = s.variants.iter().find(|v| v.path == rel)?;
+    let (text, colour) = if v.clash.is_some() {
+        (format!(" ◆{}!", v.targets.len() + 1), Color::Red)
+    } else {
+        (format!(" ◆{}", v.targets.len() + 1), Color::Magenta)
+    };
+    Some(Span::styled(text, Style::default().fg(colour)))
+}
+
 fn status_lines(app: &App) -> Vec<Line<'static>> {
     match &app.status {
         Load::Loading => vec![Line::from("loading…")],
@@ -283,10 +297,18 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
 /// `local 2 · staged 1 · incoming 0 · conflicts 0` (New files count as local).
 fn counts_text(app: &App) -> String {
     let n = app.change_counts();
-    format!(
+    let blocked = match &app.status {
+        Load::Ready(s) => s.variants.iter().filter(|v| v.clash.is_some()).count(),
+        _ => 0,
+    };
+    let mut text = format!(
         "local {} · staged {} · incoming {} · conflicts {}",
         n[0], n[1], n[2], n[3]
-    )
+    );
+    if blocked > 0 {
+        text.push_str(&format!(" · blocked {blocked}"));
+    }
+    text
 }
 
 fn draw_changes(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect, expanded: bool) {
@@ -324,10 +346,14 @@ fn draw_changes(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect,
             } else {
                 format!("~/{}", c.path)
             };
-            ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(format!("{mark} "), Style::default().fg(colour)),
                 Span::raw(name),
-            ]))
+            ];
+            if c.kind != "repo" {
+                spans.extend(variant_badge(app, &c.path));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     if items.is_empty() {
@@ -402,6 +428,9 @@ fn draw_files(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect) {
                     Style::default().fg(Color::Cyan),
                 ));
             }
+            if let Some(b) = variant_badge(app, &rel) {
+                spans.push(b);
+            }
             let item = ListItem::new(Line::from(spans));
             if range.is_some_and(|(lo, hi)| (lo..=hi).contains(&row)) {
                 item.style(Style::default().bg(Color::DarkGray))
@@ -447,6 +476,34 @@ fn state_text(app: &App, e: &super::files::Entry) -> String {
     }
 }
 
+/// The versions of a variant file and the one this machine receives (empty for other entries).
+fn variant_lines(app: &App, e: &super::files::Entry) -> String {
+    let Load::Ready(s) = &app.status else {
+        return String::new();
+    };
+    let rel = app.files.rel_of(e);
+    let Some(v) = s.variants.iter().find(|v| v.path == rel) else {
+        return String::new();
+    };
+    let mut out = String::from("Versions (t adds one):\n");
+    let mark = |t: &str| {
+        if v.receives.as_deref() == Some(t) {
+            "  ← this machine receives this"
+        } else {
+            ""
+        }
+    };
+    out.push_str(&format!("  default{}\n", mark("default")));
+    for t in &v.targets {
+        out.push_str(&format!("  {t}{}\n", mark(t)));
+    }
+    if let Some(c) = &v.clash {
+        out.push_str(&format!("  BLOCKED on this machine: {c}\n"));
+    }
+    out.push('\n');
+    out
+}
+
 fn draw_main(f: &mut Frame, app: &App, area: Rect) {
     let title = match (app.focus, app.files.selected_entry(), app.selected_item()) {
         (Panel::Files, Some(e), _) => format!(" {} ", e.display()),
@@ -471,10 +528,9 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
     }
     let text: String = match app.focus {
         Panel::Files => {
-            let head = app
-                .files
-                .selected_entry()
-                .map_or(String::new(), |e| format!("{}\n\n", state_text(app, e)));
+            let head = app.files.selected_entry().map_or(String::new(), |e| {
+                format!("{}\n{}\n", state_text(app, e), variant_lines(app, e))
+            });
             let body = match &app.preview {
                 Load::Loading => "loading…".into(),
                 Load::Failed(e) => e.clone(),
@@ -676,6 +732,7 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                     body.push(Line::styled(group, Style::default().fg(Color::Blue)));
                 }
                 let (mark, colour) = match r.state {
+                    _ if e.variant => ("      ", Color::Reset),
                     crate::assign::Tri::None => ("[ ] —  ", Color::DarkGray),
                     crate::assign::Tri::Include => ("[+] incl", Color::Green),
                     crate::assign::Tri::Exclude => ("[x] excl", Color::Red),
@@ -701,16 +758,24 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 body = body.into_iter().skip(start).take(window).collect();
             }
             let mut l = vec![Line::styled(
-                format!("Assign {what}"),
+                if e.variant {
+                    format!("New variant of {what} from its current content")
+                } else {
+                    format!("Assign {what}")
+                },
                 Style::default().add_modifier(Modifier::BOLD),
             )];
             l.extend(body);
             l.push(Line::from(""));
             l.push(Line::styled(
-                "Space cycle · i incl · x excl · - none · Enter add item · Esc",
+                if e.variant {
+                    "j/k move · Enter add variant item · Esc"
+                } else {
+                    "Space cycle · i incl · x excl · - none · Enter add item · Esc"
+                },
                 Style::default().fg(Color::Yellow),
             ));
-            (" Assign ", l)
+            (if e.variant { " Variant " } else { " Assign " }, l)
         }
         Dialog::ConfirmDiscard(paths) => (
             " Discard ",

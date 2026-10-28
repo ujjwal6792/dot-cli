@@ -108,6 +108,8 @@ pub enum ActionReq {
     Push,
     /// Add one pending assignment item for these HOME-relative paths.
     Assign(Vec<String>, Vec<crate::machines::Edit>),
+    /// Add a pending variant of this HOME-relative file for a target.
+    Variant(String, String),
 }
 
 /// The assignment editor: one checkbox row per target, with the state over
@@ -119,6 +121,8 @@ pub struct AssignEditor {
     /// The state each row had when the editor opened (to find what changed).
     original: Vec<Tri>,
     pub cursor: usize,
+    /// Picks the one target of a new variant instead of editing assignments.
+    pub variant: bool,
 }
 
 impl AssignEditor {
@@ -129,6 +133,7 @@ impl AssignEditor {
             rows,
             original,
             cursor: 0,
+            variant: false,
         }
     }
 
@@ -625,6 +630,24 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmPush),
             },
+            Some(Dialog::Assign(mut e)) if e.variant => {
+                let last = e.rows.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Char('j') | KeyCode::Down => e.cursor = (e.cursor + 1).min(last),
+                    KeyCode::Char('k') | KeyCode::Up => e.cursor = e.cursor.saturating_sub(1),
+                    KeyCode::Enter => {
+                        if let Some(r) = e.rows.get(e.cursor) {
+                            return self.request_action(ActionReq::Variant(
+                                e.paths[0].clone(),
+                                r.target.clone(),
+                            ));
+                        }
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::Assign(e));
+            }
             Some(Dialog::Assign(mut e)) => {
                 let last = e.rows.len().saturating_sub(1);
                 match key.code {
@@ -685,6 +708,40 @@ impl App {
         self.dialog = Some(Dialog::Assign(AssignEditor::new(paths, rows)));
     }
 
+    /// `t`: pick the target of a new variant of this tracked file; targets that
+    /// already have a variant are not offered.
+    fn open_variant_picker(&mut self, path: String) {
+        let Some(reg) = self.registry.clone() else {
+            self.message = Some("the machine registry is still loading".into());
+            return;
+        };
+        if !self.tracked.is_tracked(&path) {
+            self.message = Some(format!("~/{path} is not a tracked file"));
+            return;
+        }
+        let taken: Vec<String> = match &self.status {
+            Load::Ready(s) => s
+                .variants
+                .iter()
+                .filter(|v| v.path == path)
+                .flat_map(|v| v.targets.clone())
+                .collect(),
+            _ => Vec::new(),
+        };
+        let machines: Vec<_> = reg
+            .machines
+            .iter()
+            .filter(|l| !l.machine.retired)
+            .map(|l| l.machine.clone())
+            .collect();
+        let mut rows =
+            assign::editor_rows(&machines, &Default::default(), std::slice::from_ref(&path));
+        rows.retain(|r| !taken.contains(&r.target));
+        let mut editor = AssignEditor::new(vec![path], rows);
+        editor.variant = true;
+        self.dialog = Some(Dialog::Assign(editor));
+    }
+
     fn machines_key(&mut self, key: KeyEvent) {
         let n = self.machine_count();
         match key.code {
@@ -712,8 +769,8 @@ impl App {
                         .map(|p| {
                             let mut s =
                                 format!("{} would receive {} file(s):\n\n", name, p.files.len());
-                            for f in &p.files {
-                                s.push_str(&format!("~/{f}\n"));
+                            for l in p.lines() {
+                                s.push_str(&format!("{l}\n"));
                             }
                             s
                         })
@@ -818,6 +875,10 @@ impl App {
                 }
             }
             KeyCode::Char('A') => self.request_action(ActionReq::LoadAmend),
+            KeyCode::Char('t') => match selected {
+                Some(c) if c.kind != "repo" => self.open_variant_picker(c.path),
+                _ => {}
+            },
             KeyCode::Char('m') => match selected {
                 Some(c) if c.kind != "repo" => self.open_assign_editor(vec![c.path]),
                 Some(_) => self.message = Some("repository files have no assignment".into()),
@@ -952,6 +1013,13 @@ impl App {
                 if let Some(e) = self.files.selected_entry() {
                     let (path, is_dir) = (self.files.cwd.join(&e.name), e.is_dir);
                     self.request_action(ActionReq::Hide(path, is_dir));
+                }
+                return;
+            }
+            KeyCode::Char('t') => {
+                if let Some(e) = self.files.selected_entry() {
+                    let rel = self.files.rel_of(e);
+                    return self.open_variant_picker(rel);
                 }
                 return;
             }
@@ -1231,6 +1299,18 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             }
             let ctx = track::Ctx::load(store)?;
             let item = crate::machines::plan_assign(store, &ctx, &homes, &edits, false, "human")?;
+            let lock = store.lock()?;
+            track::recheck(store, &lock, std::slice::from_ref(&item))?;
+            let ctx = track::Ctx::load(store)?;
+            let check = track::stale_checker(store, &ctx);
+            let mut added = pending::add(store, &lock, vec![item], &check)?;
+            let item = added.remove(0).item;
+            Ok(report(format!("Added {}: {}", item.label(), item.summary)))
+        }
+        ActionReq::Variant(path, target) => {
+            let hp = track::resolve_home_path(store, &path, &store.dirs.home)?;
+            let ctx = track::Ctx::load(store)?;
+            let item = crate::variants::plan_add(store, &ctx, &hp, &target, "human")?;
             let lock = store.lock()?;
             track::recheck(store, &lock, std::slice::from_ref(&item))?;
             let ctx = track::Ctx::load(store)?;

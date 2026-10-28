@@ -54,6 +54,8 @@ pub struct Status {
     pub new_files: Vec<String>,
     /// Local, new, staged, incoming and conflicting changes.
     pub changes: Vec<crate::changes::Change>,
+    /// Variant files and what this machine receives; a clash blocks that file only.
+    pub variants: Vec<crate::variants::Summary>,
     pub vault: &'static str,
 }
 
@@ -76,6 +78,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             tracked_folders: 0,
             new_files: Vec::new(),
             changes: Vec::new(),
+            variants: Vec::new(),
             vault: "none",
         });
     }
@@ -129,6 +132,12 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
     } else {
         Vec::new()
     };
+    let variants = match crate::variants::this_targets(store)? {
+        Some(mine) => {
+            crate::variants::summaries(&crate::variants::Variants::read(&store.repo())?, &mine)
+        }
+        None => Vec::new(),
+    };
     Ok(Status {
         initialised: true,
         repo_path,
@@ -147,6 +156,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         tracked_folders: tracked.folders.len(),
         new_files,
         changes,
+        variants,
         vault: "none",
     })
 }
@@ -234,6 +244,17 @@ impl Status {
             }
             if list.len() > 20 {
                 s.push_str(&format!("  … and {} more\n", list.len() - 20));
+            }
+        }
+        let blocked: Vec<_> = self.variants.iter().filter(|v| v.clash.is_some()).collect();
+        if !blocked.is_empty() {
+            s.push_str(&format!("Blocked by variant clashes: {}\n", blocked.len()));
+            for v in blocked {
+                s.push_str(&format!(
+                    "  ~/{}: {}\n",
+                    v.path,
+                    v.clash.as_deref().unwrap_or_default()
+                ));
             }
         }
         s.push_str(&format!("Vault:      {}\n", self.vault));

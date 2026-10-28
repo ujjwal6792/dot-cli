@@ -126,6 +126,17 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Keep different content of one tracked file per target (platform, distribution, family, machine).
+    ///
+    /// `add` stores the file's current HOME content as the variant for TARGET;
+    /// the content stored so far becomes the default variant. A machine receives
+    /// the most specific variant that matches it (machine > distribution >
+    /// family > platform > default). Two matches at the same level block that
+    /// file only. Each change is one pending item with an exact preview.
+    Variant {
+        #[command(subcommand)]
+        action: VariantCmd,
+    },
     /// List, register, rename, retire or preview machines of the registry.
     Machine {
         #[command(subcommand)]
@@ -295,6 +306,43 @@ pub enum Command {
     },
     /// Open the terminal UI (the default when no command is given).
     Tui,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum VariantCmd {
+    /// Store the current HOME content of a tracked file as the variant for a target.
+    Add {
+        /// A tracked file.
+        path: String,
+        /// platform:darwin|linux, distribution:<id>, family:<id> or machine:<name>.
+        #[arg(long, value_name = "TARGET")]
+        target: String,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// List variant files, their targets and the variant this machine receives.
+    List {
+        /// Only this tracked file.
+        path: Option<String>,
+    },
+    /// Remove the variant for a target; the last one turns the file back into a plain file.
+    Remove {
+        /// A tracked file with variants.
+        path: String,
+        /// The target whose variant is removed.
+        #[arg(long, value_name = "TARGET")]
+        target: String,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -608,6 +656,23 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 clear,
             };
             return cmds::assign_cmd(&store, &paths, &edits, apply, dry_run, json);
+        }
+        Command::Variant { action } => {
+            return match action {
+                VariantCmd::Add {
+                    path,
+                    target,
+                    apply,
+                    dry_run,
+                } => cmds::variant_edit(&store, true, &path, &target, apply, dry_run, json),
+                VariantCmd::Remove {
+                    path,
+                    target,
+                    apply,
+                    dry_run,
+                } => cmds::variant_edit(&store, false, &path, &target, apply, dry_run, json),
+                VariantCmd::List { path } => cmds::variant_list(&store, path.as_deref(), json),
+            };
         }
         Command::Machine { action } => {
             return match action {

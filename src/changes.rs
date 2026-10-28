@@ -82,7 +82,14 @@ fn sha256(bytes: &[u8]) -> String {
 
 /// Files and symlinks that apply to this machine, with their rendered content.
 fn targets(store: &Store) -> Result<BTreeMap<String, Target>> {
-    let args = ["dump", "--format", "json", "--include=files,symlinks"];
+    let mut args: Vec<String> = ["dump", "--format", "json", "--include=files,symlinks"]
+        .map(String::from)
+        .into();
+    match crate::variants::render_scope(store)? {
+        Some(paths) if paths.is_empty() => return Ok(BTreeMap::new()),
+        Some(paths) => args.extend(paths),
+        None => {}
+    }
     let out = store.chezmoi(&args)?;
     let v: Value = serde_json::from_str(&out.stdout).context("reading chezmoi dump")?;
     let mut map = BTreeMap::new();
@@ -126,7 +133,15 @@ fn last_written(store: &Store) -> Result<BTreeMap<String, (String, String)>> {
 
 /// `chezmoi status` columns per target path.
 fn status_columns(store: &Store) -> Result<BTreeMap<String, (char, char)>> {
-    let out = store.chezmoi(&["status", "--include=files,symlinks"])?;
+    let mut args: Vec<String> = ["status", "--include=files,symlinks"]
+        .map(String::from)
+        .into();
+    match crate::variants::render_scope(store)? {
+        Some(paths) if paths.is_empty() => return Ok(BTreeMap::new()),
+        Some(paths) => args.extend(paths),
+        None => {}
+    }
+    let out = store.chezmoi(&args)?;
     Ok(out
         .stdout
         .lines()
@@ -160,6 +175,8 @@ fn staged_paths(store: &Store) -> Result<Vec<(char, String)>> {
 
 pub struct Scan {
     pub changes: Vec<Change>,
+    /// Files whose variants clash on this machine (path, reason): not classified.
+    pub clashes: BTreeMap<String, String>,
     targets: BTreeMap<String, Target>,
 }
 
@@ -170,14 +187,16 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
     let targets = targets(store)?;
     let columns = status_columns(store)?;
     let last = last_written(store)?;
+    let clashes = crate::variants::clashes(store)?;
+    let vars = crate::variants::Variants::read(&repo)?;
     let mut changes = Vec::new();
 
     let mut staged: BTreeMap<String, &'static str> = BTreeMap::new();
     for (letter, path) in staged_paths(store)? {
-        match decode_source_path(&repo, &path) {
-            Some((target, _)) => {
+        match repo_target(&repo, &vars, &path) {
+            Some(target) => {
                 let present = fs::symlink_metadata(repo.join(&path)).is_ok();
-                if present && !targets.contains_key(&target) {
+                if present && !targets.contains_key(&target) && !clashes.contains_key(&target) {
                     continue; // assigned to other machines
                 }
                 let kind = match letter {
@@ -244,7 +263,19 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
         });
     }
     changes.sort_by(|a, b| (a.state, &a.path).cmp(&(b.state, &b.path)));
-    Ok(Scan { changes, targets })
+    Ok(Scan {
+        changes,
+        clashes,
+        targets,
+    })
+}
+
+/// The tracked path a repository file stands for: a source file, or a variant
+/// file of a tracked path.
+fn repo_target(repo: &Path, vars: &crate::variants::Variants, path: &str) -> Option<String> {
+    decode_source_path(repo, path)
+        .map(|(t, _)| t)
+        .or_else(|| vars.target_of(path))
 }
 
 pub fn classify(store: &Store) -> Result<Vec<Change>> {
@@ -309,6 +340,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     let mut deleted = Vec::new();
     let mut skipped = Vec::new();
     let mut refusals = Vec::new();
+    let vars = crate::variants::Variants::read(&store.repo())?;
+    let mine = crate::variants::this_targets(store)?;
+    // (HOME path, variant file) of variant files: their content goes to the variant received here.
+    let mut variant_files: Vec<(String, String)> = Vec::new();
+    for s in sel.unwrap_or_default() {
+        if let Some(why) = scan.clashes.get(s) {
+            return Err(refuse(format!("~/{s}: {why}")));
+        }
+    }
     let matched_any = |p: &str| {
         scan.changes
             .iter()
@@ -322,6 +362,19 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             continue;
         }
         let explicit = sel.is_some_and(|s| s.contains(&c.path));
+        if c.state == State::Local && c.kind != "deleted" && vars.0.contains_key(&c.path) {
+            match variant_for_stage(store, &vars, mine.as_deref(), &c.path) {
+                Ok(f) => variant_files.push((c.path.clone(), f)),
+                Err(reason) if explicit => {
+                    refusals.push((Kind::Error, format!("~/{}: {reason}", c.path)))
+                }
+                Err(reason) => skipped.push(Skipped {
+                    path: track::tilde(&c.path),
+                    reason,
+                }),
+            }
+            continue;
+        }
         let problem: Option<(Kind, String)> = match c.state {
             State::Staged => continue,
             State::Incoming => Some((
@@ -368,10 +421,11 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .join("; ");
         return Err(DwError::new(*kind, msg).into());
     }
-    if files.is_empty() && deleted.is_empty() && skipped.is_empty() {
+    let nothing = files.is_empty() && deleted.is_empty() && variant_files.is_empty();
+    if nothing && skipped.is_empty() {
         bail!("nothing to stage");
     }
-    if !(dry_run || files.is_empty() && deleted.is_empty()) {
+    if !(dry_run || nothing) {
         track::ensure_repo_clean(store)?;
         let tree = track::index_tree(store)?;
         let backup = track::state_backup(store)?;
@@ -381,6 +435,17 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
                 args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
                 store.chezmoi_locked(&args)?;
+            }
+            for (rel, file) in &variant_files {
+                let dest = store.dirs.home.join(rel);
+                let bytes = fs::read(&dest).with_context(|| format!("reading ~/{rel}"))?;
+                let to = store.repo().join(crate::variants::repo_path(file));
+                fs::write(&to, bytes).with_context(|| format!("writing {}", to.display()))?;
+            }
+            if !variant_files.is_empty() {
+                // The rendered file now equals HOME, which is what was last written.
+                let rels: BTreeSet<&str> = variant_files.iter().map(|(r, _)| r.as_str()).collect();
+                restore_last_written(store, &rels)?;
             }
             let changed: Vec<String> = track::unstaged(store)?.into_iter().collect();
             track::stage(store, &changed)?;
@@ -418,6 +483,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     Ok(Done {
         paths: files
             .iter()
+            .chain(variant_files.iter().map(|(rel, _)| rel))
             .map(|f| track::tilde(f))
             .chain(
                 deleted
@@ -428,6 +494,35 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
         skipped,
         dry_run,
     })
+}
+
+/// The variant file that receives the HOME content of `rel` when staging on this
+/// machine: the variant this machine currently receives, else the default.
+fn variant_for_stage(
+    store: &Store,
+    vars: &crate::variants::Variants,
+    mine: Option<&[String]>,
+    rel: &str,
+) -> Result<String, String> {
+    use crate::variants::{Pick, default_file, pick, repo_path};
+    let meta = fs::symlink_metadata(store.dirs.home.join(rel)).map_err(|e| e.to_string())?;
+    if !meta.is_file() {
+        return Err("is not a regular file; variants hold file content".into());
+    }
+    let mine = mine.ok_or("this machine is not in the registry")?;
+    let file = match pick(vars.get(rel), mine) {
+        Pick::One(v) => v.file.clone(),
+        Pick::Default => default_file(rel),
+        Pick::Clash(t) => return Err(format!("variants clash: {}", t.join(", "))),
+    };
+    let stored = fs::read(store.repo().join(repo_path(&file))).ok();
+    if stored.is_some() && stored == fs::read(store.dirs.home.join(rel)).ok() {
+        Err("only its mode differs; mode changes of variant files are not supported".into())
+    } else if stored.is_some() {
+        Ok(file)
+    } else {
+        Err(format!("its variant file {} is missing", repo_path(&file)))
+    }
 }
 
 fn prune_empty_dirs(repo: &Path, file: &Path) {
@@ -448,6 +543,7 @@ pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<D
     let _lock = if dry_run { None } else { Some(store.lock()?) };
     let repo = store.repo();
     let ctx = Ctx::load(store)?;
+    let vars = crate::variants::Variants::read(&repo)?;
     let changes: Vec<Change> = scan(store, &ctx)?
         .changes
         .into_iter()
@@ -473,8 +569,8 @@ pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<D
     let sources: Vec<String> = staged_paths(store)?
         .into_iter()
         .map(|(_, p)| p)
-        .filter(|p| match decode_source_path(&repo, p) {
-            Some((t, _)) => selected_targets.contains(t.as_str()),
+        .filter(|p| match repo_target(&repo, &vars, p) {
+            Some(t) => selected_targets.contains(t.as_str()),
             None => repo_paths.contains(p.as_str()),
         })
         .collect();
@@ -542,7 +638,7 @@ pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<D
 /// Put chezmoi's last-written record of each target back to the committed
 /// version (or drop it for files that are no longer tracked), so the file shows
 /// as Local rather than Incoming.
-fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> Result<()> {
+pub(crate) fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> Result<()> {
     if targets.is_empty() {
         return Ok(());
     }
@@ -584,7 +680,8 @@ fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> Result<()> {
 pub fn discard_files(store: &Store, files: &[String], actor: &str) -> Result<Option<String>> {
     let snap = snapshot::take(store, files, "discard", actor)?.map(|s| s.id);
     for chunk in files.chunks(CHUNK) {
-        let mut args: Vec<std::ffi::OsString> = vec!["apply".into(), "--force".into()];
+        let mut args: Vec<std::ffi::OsString> =
+            vec!["apply".into(), "--force".into(), "--parent-dirs".into()];
         args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
         store.chezmoi_locked(&args)?;
     }
@@ -725,7 +822,11 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
     out.snapshot = snapshot::take(store, &files, "apply", &actor)?.map(|s| s.id);
     let mut errors = Vec::new();
     for chunk in files.chunks(CHUNK) {
-        let mut args: Vec<std::ffi::OsString> = vec!["apply".into(), "--keep-going".into()];
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "apply".into(),
+            "--keep-going".into(),
+            "--parent-dirs".into(),
+        ];
         args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
         if let Err(e) = store.chezmoi_locked(&args) {
             errors.push(format!("{e:#}"));
@@ -987,6 +1088,7 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
     let ctx = Ctx::load(store)?;
     let scan = scan(store, &ctx)?;
     let staged = staged_paths(store)?;
+    let vars = crate::variants::Variants::read(&repo)?;
     let mut out = Vec::new();
     for c in &scan.changes {
         let wanted = if c.kind == "repo" {
@@ -1017,31 +1119,43 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
                 .stdout
             }
             State::Staged => {
-                let mut old = None;
-                let mut new = None;
+                let mut parts = Vec::new();
                 for (letter, p) in &staged {
-                    if decode_source_path(&repo, p).is_none_or(|(t, _)| t != c.path) {
+                    if repo_target(&repo, &vars, p).is_none_or(|t| t != c.path) {
                         continue;
                     }
-                    if *letter != 'A' {
-                        old = exec::run_ok(
-                            {
-                                let mut cmd = store.git_command(&repo);
-                                cmd.args(["show", &format!("HEAD:{p}")]);
-                                cmd
-                            },
-                            None,
-                        )
-                        .ok()
-                        .map(|o| o.stdout);
-                    }
-                    if *letter != 'D' {
-                        new = fs::read(repo.join(p))
+                    let old = (*letter != 'A')
+                        .then(|| {
+                            exec::run_ok(
+                                {
+                                    let mut cmd = store.git_command(&repo);
+                                    cmd.args(["show", &format!("HEAD:{p}")]);
+                                    cmd
+                                },
+                                None,
+                            )
                             .ok()
-                            .map(|b| String::from_utf8_lossy(&b).into_owned());
-                    }
+                            .map(|o| o.stdout)
+                        })
+                        .flatten();
+                    let new = (*letter != 'D')
+                        .then(|| {
+                            fs::read(repo.join(p))
+                                .ok()
+                                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                        })
+                        .flatten();
+                    parts.push((p.as_str(), old, new));
                 }
-                unified(&c.path, old.as_deref(), new.as_deref())
+                // A variant file has several staged sources; each is shown under its own name.
+                let one = parts.len() == 1;
+                parts
+                    .iter()
+                    .map(|(p, old, new)| {
+                        let label = if one { c.path.as_str() } else { *p };
+                        unified(label, old.as_deref(), new.as_deref())
+                    })
+                    .collect::<String>()
             }
             _ => continue,
         };

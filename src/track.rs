@@ -345,7 +345,7 @@ fn content_hash(path: &Path, len: u64) -> String {
     format!("{h:016x}")
 }
 
-fn home_fingerprint(abs: &Path) -> String {
+pub(crate) fn home_fingerprint(abs: &Path) -> String {
     let Ok(m) = fs::symlink_metadata(abs) else {
         return "missing".into();
     };
@@ -369,7 +369,7 @@ fn home_fingerprint(abs: &Path) -> String {
     )
 }
 
-fn repo_fingerprint(repo: &Path, source: &str) -> String {
+pub(crate) fn repo_fingerprint(repo: &Path, source: &str) -> String {
     match fs::metadata(repo.join(source)) {
         Ok(m) => format!("{source}:{}:{}", m.len(), unix_nanos(&m)),
         Err(_) => "-".into(),
@@ -432,9 +432,14 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
             files,
             forget_folders,
             assignments: keys,
+            variants: with_variants,
             ..
         } => {
             let assigned = assignments(&repo)?;
+            let vars = crate::variants::Variants::read(&repo)?;
+            for p in with_variants {
+                g.repo.insert(format!("variants:{p}"), vars.fingerprint(p));
+            }
             for t in files {
                 g.repo.insert(
                     format!("tracked:{t}"),
@@ -459,6 +464,14 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
             for f in files {
                 g.home.insert(f.clone(), home_fingerprint(&home.join(f)));
             }
+        }
+        Action::VariantAdd { path, .. } => {
+            g.home
+                .insert(path.clone(), home_fingerprint(&home.join(path)));
+            g.repo.extend(crate::variants::guard(store, action)?);
+        }
+        Action::VariantRemove { .. } => {
+            g.repo.extend(crate::variants::guard(store, action)?);
         }
         Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
             g.repo
@@ -507,6 +520,7 @@ fn describe_key(home_side: bool, key: &str) -> String {
         Some(("hidden", p)) => format!("the hide rules for ~/{p}"),
         Some(("folder", p)) => format!("the tracked folder ~/{p}"),
         Some(("assignment" | "assigned", p)) => format!("the assignment of ~/{p}"),
+        Some(("variants", p)) => format!("the variants of ~/{p}"),
         Some(("registry", p)) => format!("the registry entry of {p}"),
         Some(("data", _)) => "the assignment and variant data".to_string(),
         Some(("rule", p)) => format!("the hide rule `{p}`"),
@@ -778,7 +792,7 @@ pub fn plan_untrack(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) ->
         ));
     }
     let files: Vec<String> = entries.iter().map(|(t, _)| (*t).clone()).collect();
-    let changes = entries
+    let mut changes: Vec<FileChange> = entries
         .iter()
         .map(|(t, e)| FileChange {
             action: "remove".into(),
@@ -787,6 +801,26 @@ pub fn plan_untrack(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) ->
             kind: if e.symlink { "symlink" } else { "file" }.into(),
         })
         .collect();
+    let vars = crate::variants::Variants::read(&store.repo())?;
+    let with_variants: Vec<String> = files
+        .iter()
+        .filter(|t| !vars.get(t).is_empty())
+        .cloned()
+        .collect();
+    for t in &with_variants {
+        for f in vars.files_of(&store.repo(), t) {
+            changes.push(FileChange {
+                action: "remove".into(),
+                target: t.clone(),
+                source: f,
+                kind: "file".into(),
+            });
+        }
+        data.push(format!(
+            "remove the {} variant(s) of ~/{t} from {DATA_FILE}",
+            vars.get(t).len()
+        ));
+    }
     let is_folder =
         !forget_folders.is_empty() || entries.len() > 1 || !ctx.tracked.is_tracked(&hp.rel);
     let summary = if is_folder {
@@ -811,6 +845,7 @@ pub fn plan_untrack(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) ->
         files,
         forget_folders,
         assignments: removed_assignments,
+        variants: with_variants,
     };
     new_item(store, requester, action, summary, preview, ctx)
 }
@@ -1283,8 +1318,10 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             files,
             forget_folders,
             assignments: keys,
+            variants: with_variants,
             ..
         } => {
+            crate::variants::remove_all(store, with_variants)?;
             let root = repo.join(source::source_root(&repo));
             for t in files {
                 let entry = ctx
@@ -1335,6 +1372,16 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
         Action::HideRemove { pattern } => {
             hide::remove_rule(&repo, pattern)?;
             verify_and_stage(store, &BTreeSet::from([hide::HIDE_FILE.to_string()]), &[])
+        }
+        Action::VariantAdd { path, target, .. } => {
+            let expected = crate::variants::exec(store, &item.action)?;
+            let staged = verify_and_stage(store, &expected, &[DATA_FILE])?;
+            crate::variants::after_add(store, path, target)?;
+            Ok(staged)
+        }
+        Action::VariantRemove { .. } => {
+            let expected = crate::variants::exec(store, &item.action)?;
+            verify_and_stage(store, &expected, &[DATA_FILE])
         }
         Action::Assign { .. }
         | Action::MachineAdd { .. }
@@ -1392,7 +1439,10 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
             continue;
         }
         let tree = index_tree(store)?;
-        let tracks = matches!(item.action, Action::Track { .. });
+        let tracks = matches!(
+            item.action,
+            Action::Track { .. } | Action::VariantAdd { .. }
+        );
         let backup = if tracks { state_backup(store)? } else { None };
         let outcome = match &item.action {
             Action::Discard { files, .. } => {

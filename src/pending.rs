@@ -50,6 +50,9 @@ pub enum Action {
         /// folder, the folder path itself and anything below it.
         #[serde(default)]
         assignments: Vec<String>,
+        /// Tracked paths whose variants (data and files) are removed too.
+        #[serde(default)]
+        variants: Vec<String>,
     },
     /// Write the committed version of local changes back to HOME (after a snapshot).
     Discard {
@@ -93,6 +96,27 @@ pub enum Action {
     MachineRetire {
         name: String,
     },
+    /// Make the tracked file `path` a variant file (if it is not yet) and store
+    /// its HOME content as the variant for `target`.
+    VariantAdd {
+        path: String,
+        target: String,
+        /// The variant's file under `home/.dotwarden/variants/`.
+        file: String,
+        /// Whether the file is not a variant file yet (its stored content becomes
+        /// the default variant).
+        first: bool,
+        /// The current source file of `path`.
+        source: String,
+    },
+    VariantRemove {
+        path: String,
+        target: String,
+        file: String,
+        /// The last variant: the file turns back into a plain file.
+        last: bool,
+        source: String,
+    },
 }
 
 /// The final assignment of one target path.
@@ -118,6 +142,8 @@ impl Action {
             Action::MachineAdd { .. } => "machine_add",
             Action::MachineRename { .. } => "machine_rename",
             Action::MachineRetire { .. } => "machine_retire",
+            Action::VariantAdd { .. } => "variant_add",
+            Action::VariantRemove { .. } => "variant_remove",
         }
     }
 
@@ -147,6 +173,7 @@ impl Action {
             Action::MachineAdd { machine } => &machine.name,
             Action::MachineRename { old, .. } => old,
             Action::MachineRetire { name } => name,
+            Action::VariantAdd { file, .. } | Action::VariantRemove { file, .. } => file,
         };
         (self.kind_name(), what)
     }

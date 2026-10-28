@@ -25,3 +25,4 @@ pub mod templates;
 pub mod toolchain;
 pub mod track;
 pub mod tui;
+pub mod variants;
