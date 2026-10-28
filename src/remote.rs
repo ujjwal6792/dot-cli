@@ -356,6 +356,7 @@ fn item(
         data: Vec::new(),
         rules: Vec::new(),
         notes,
+        ..Preview::default()
     };
     track::new_item(
         store,

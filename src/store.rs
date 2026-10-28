@@ -77,6 +77,16 @@ impl Store {
     /// same git isolation as [`Store::git_command`] for the git chezmoi runs
     /// itself. Callers append the subcommand and its arguments.
     pub fn chezmoi_command(&self) -> Command {
+        self.chezmoi_command_with(
+            &self.dirs.chezmoi_config(),
+            &self.dirs.chezmoi_state(),
+            &self.dirs.chezmoi_cache(),
+        )
+    }
+
+    /// Like [`Store::chezmoi_command`] with another config, state and cache
+    /// (preview as another machine uses throwaway ones).
+    pub fn chezmoi_command_with(&self, config: &Path, state: &Path, cache: &Path) -> Command {
         let mut cmd = Command::new(self.tools.chezmoi());
         cmd.env_clear();
         for (k, v) in &self.env {
@@ -94,13 +104,13 @@ impl Store {
             cmd.env("PATH", joined);
         }
         cmd.arg("--config")
-            .arg(self.dirs.chezmoi_config())
+            .arg(config)
             .arg("--source")
             .arg(self.repo())
             .arg("--persistent-state")
-            .arg(self.dirs.chezmoi_state())
+            .arg(state)
             .arg("--cache")
-            .arg(self.dirs.chezmoi_cache())
+            .arg(cache)
             .arg("--destination")
             .arg(&self.dirs.home)
             .arg("--no-tty");

@@ -779,10 +779,17 @@ pub fn fetch_cmd(store: &Store, all: bool, json: bool) -> Result<ExitCode> {
 pub fn pull_cmd(store: &Store, from: Option<&str>, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
     let p = remote::pull(store, from)?;
-    let incoming = changes::classify(store)?
-        .iter()
-        .filter(|c| c.state == changes::State::Incoming)
-        .count();
+    let incoming = match changes::classify(store) {
+        Ok(c) => c
+            .iter()
+            .filter(|c| c.state == changes::State::Incoming)
+            .count(),
+        Err(_) => {
+            // Typically this computer's machine was renamed elsewhere (`dw status` says so).
+            eprintln!("warning: incoming files could not be classified; run `dw status`");
+            0
+        }
+    };
     if json {
         print_json(&json!({"pulled": p, "incoming": incoming}))?;
     } else if p.commits == 0 {
@@ -864,4 +871,179 @@ pub fn push_cmd(
         }
         Ok(ExitCode::SUCCESS)
     })
+}
+
+// ---- assignments and machines -------------------------------------------------
+
+pub struct AssignArgs {
+    pub include: Vec<String>,
+    pub exclude: Vec<String>,
+    pub unset: Vec<String>,
+    pub clear: bool,
+}
+
+pub fn assign_cmd(
+    store: &Store,
+    paths: &[String],
+    args: &AssignArgs,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    use crate::assign::Side;
+    require_initialised(store)?;
+    let mut edits: Vec<crate::machines::Edit> = Vec::new();
+    edits.extend(
+        args.include
+            .iter()
+            .map(|t| (t.clone(), Some(Side::Include))),
+    );
+    edits.extend(
+        args.exclude
+            .iter()
+            .map(|t| (t.clone(), Some(Side::Exclude))),
+    );
+    edits.extend(args.unset.iter().map(|t| (t.clone(), None)));
+    if edits.is_empty() && !args.clear {
+        return Err(
+            DwError::usage("nothing to do: give --include, --exclude, --unset or --clear").into(),
+        );
+    }
+    let cwd = cwd()?;
+    let mut homes = Vec::new();
+    for p in paths {
+        homes.push(track::resolve_home_path(store, p, &cwd)?);
+    }
+    let ctx = Ctx::load(store)?;
+    let item = crate::machines::plan_assign(
+        store,
+        &ctx,
+        &homes,
+        &edits,
+        args.clear,
+        &pending::requester(store),
+    )?;
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn machine_list(store: &Store, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let machines = crate::machines::list(store)?;
+    if json {
+        print_json(&json!({"machines": machines}))?;
+    } else {
+        for l in &machines {
+            let m = &l.machine;
+            println!(
+                "{}{:<16} {:<7} {:<12} {}{}",
+                if l.this_machine { "* " } else { "  " },
+                m.name,
+                m.platform,
+                m.distribution,
+                if m.families.is_empty() {
+                    "-".to_string()
+                } else {
+                    m.families.join(",")
+                },
+                if m.retired { "  (retired)" } else { "" }
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn machine_add(
+    store: &Store,
+    machine: crate::machine::Machine,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::machines::plan_add(store, &ctx, machine, &pending::requester(store))?;
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn machine_rename(
+    store: &Store,
+    old: &str,
+    new: &str,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::machines::plan_rename(store, &ctx, old, new, &pending::requester(store))?;
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn machine_retire(
+    store: &Store,
+    name: &str,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::machines::plan_retire(store, &ctx, name, &pending::requester(store))?;
+    let run_item = item.clone();
+    gated(store, item, yes, dry_run, json, || {
+        let results = track::apply_now(store, &[run_item])?;
+        if json {
+            print_json(&json!({"dry_run": false, "applied": results}))?;
+        } else {
+            print_results(&results);
+        }
+        Ok(results_exit(&results))
+    })
+}
+
+pub fn machine_preview(store: &Store, name: &str, diff: bool, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let p = crate::machines::preview_as(store, name, diff)?;
+    if json {
+        print_json(&p)?;
+    } else {
+        println!(
+            "{} would receive {} tracked file(s):",
+            p.machine.name,
+            p.files.len()
+        );
+        for f in &p.files {
+            println!("  ~/{f}");
+        }
+        if let Some(d) = &p.diff {
+            println!();
+            if d.trim().is_empty() {
+                println!("No difference from this machine's HOME.");
+            } else {
+                print!("{d}");
+            }
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn machine_use(store: &Store, name: &str, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    if changes::agent(store).is_some() {
+        return Err(DwError::new(
+            Kind::NeedsApproval,
+            "needs a human: choosing which machine this computer is cannot be done by an agent",
+        )
+        .into());
+    }
+    let m = crate::machines::use_machine(store, name)?;
+    if json {
+        print_json(&json!({"machine": m}))?;
+    } else {
+        println!(
+            "This computer is now {name} ({}/{})",
+            m.platform, m.distribution
+        );
+    }
+    Ok(ExitCode::SUCCESS)
 }

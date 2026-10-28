@@ -643,6 +643,7 @@ pub fn plan_discard(store: &Store, rel: &str, requester: &str) -> Result<Item> {
         data: Vec::new(),
         rules: Vec::new(),
         notes: vec!["a snapshot of the current files is taken first (`dw snapshot list`)".into()],
+        ..Preview::default()
     };
     let summary = format!(
         "Discard local changes to {} (requested by {requester})",

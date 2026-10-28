@@ -20,7 +20,7 @@ pub fn is_single_panel(area: Rect) -> bool {
 }
 
 const FOOTER: &str =
-    " q quit · ? help · 1-5 · 0 pending · Space track · v range · . hidden · r refresh";
+    " q quit · ? help · 1-5 · 0 pending · Space track · m assign · v range · r refresh";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
@@ -34,6 +34,7 @@ const HELP: &[(&str, &str)] = &[
         "Files: track / untrack (adds or drops a pending item)",
     ),
     ("v", "Files: start / end a range selection, then Space"),
+    ("m", "Files/Changes: assign targets (Space/i/x/-, Enter)"),
     (
         "i",
         "Files: hide (or un-hide) the path through a pending hide item",
@@ -169,11 +170,9 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
         }
         Panel::Pending => draw_pending_list(f, app, block, area),
         Panel::Changes => draw_changes(f, app, block, area, expanded),
-        other => {
-            let text = match other {
-                Panel::Git => "Commits · Branches · Remotes · Stash\n(arrives with git support)",
-                _ => "Registry · assignments · preview as\n(arrives with machine management)",
-            };
+        Panel::Machines => draw_machines(f, app, block, area, expanded),
+        Panel::Git => {
+            let text = "Commits · Branches · Remotes · Stash\n(arrives with git support)";
             let shown = if expanded {
                 text
             } else {
@@ -189,6 +188,63 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
     }
 }
 
+fn draw_machines(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect, expanded: bool) {
+    let Some(reg) = app.registry.clone() else {
+        return f.render_widget(Paragraph::new("loading…").block(block), area);
+    };
+    if !expanded {
+        let n = reg.machines.len();
+        return f.render_widget(Paragraph::new(format!("{n} machine(s)")).block(block), area);
+    }
+    let items: Vec<ListItem> = reg
+        .machines
+        .iter()
+        .map(|l| {
+            let m = &l.machine;
+            let mut text = format!(
+                "{}{} {}/{}",
+                if l.this_machine { "* " } else { "  " },
+                m.name,
+                m.platform,
+                m.distribution
+            );
+            if m.retired {
+                text.push_str(" (retired)");
+            }
+            let style = if m.retired {
+                Style::default().fg(Color::DarkGray)
+            } else {
+                Style::default()
+            };
+            ListItem::new(Line::styled(text, style))
+        })
+        .collect();
+    if items.is_empty() {
+        return f.render_widget(Paragraph::new("(no machines)").block(block), area);
+    }
+    let mut state = ListState::default().with_selected(Some(app.machines_selected));
+    f.render_stateful_widget(
+        List::new(items)
+            .block(block)
+            .highlight_style(Style::default().add_modifier(Modifier::REVERSED)),
+        area,
+        &mut state,
+    );
+}
+
+/// `[darwin,!srv1]`: the values of the includes, then `!` and the excludes.
+fn assignment_badge(a: &crate::assign::Assignment) -> String {
+    let value = |t: &String| t.split_once(':').map_or(t.as_str(), |(_, v)| v).to_string();
+    let mut parts: Vec<String> = a.include.iter().map(value).collect();
+    parts.extend(a.exclude.iter().map(|t| format!("!{}", value(t))));
+    let joined = parts.join(",");
+    if joined.chars().count() > 18 {
+        format!("[{}…]", joined.chars().take(17).collect::<String>())
+    } else {
+        format!("[{joined}]")
+    }
+}
+
 fn status_lines(app: &App) -> Vec<Line<'static>> {
     match &app.status {
         Load::Loading => vec![Line::from("loading…")],
@@ -200,7 +256,7 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
             let machine = match &s.machine {
                 Some(m) => match &m.registered {
                     Some(r) => format!("{} ({}/{})", m.name, r.platform, r.distribution),
-                    None => format!("{} (unregistered)", m.name),
+                    None => format!("{} NOT IN REGISTRY: dw machine use", m.name),
                 },
                 None => "no machine".into(),
             };
@@ -306,6 +362,7 @@ fn draw_files(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect) {
         );
     }
     let marks = app.pending_marks();
+    let assignments = app.registry.as_ref().map(|r| r.assignments.clone());
     let range = app.range_rows();
     let items: Vec<ListItem> = app
         .files
@@ -333,12 +390,19 @@ fn draw_files(f: &mut Frame, app: &mut App, block: Block<'static>, area: Rect) {
             if e.hidden {
                 style = style.fg(Color::DarkGray).add_modifier(Modifier::DIM);
             }
-            let item = ListItem::new(Line::from(vec![
+            let mut spans = vec![
                 Span::styled(marker, marker_style),
                 pending,
                 Span::raw(" "),
                 Span::styled(name, style),
-            ]));
+            ];
+            if let Some(a) = assignments.as_ref().and_then(|a| a.get(&rel)) {
+                spans.push(Span::styled(
+                    format!(" {}", assignment_badge(a)),
+                    Style::default().fg(Color::Cyan),
+                ));
+            }
+            let item = ListItem::new(Line::from(spans));
             if range.is_some_and(|(lo, hi)| (lo..=hi).contains(&row)) {
                 item.style(Style::default().bg(Color::DarkGray))
             } else {
@@ -424,7 +488,12 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         Panel::Status => "Machine, branch and sync state of this computer.".into(),
         Panel::Changes => String::new(),
         Panel::Git => "Commit and branch details will appear here.".into(),
-        Panel::Machines => "Assignments of the selected machine will appear here.".into(),
+        Panel::Machines => match &app.machine_preview {
+            Some((_, Load::Loading)) => "loading…".into(),
+            Some((_, Load::Failed(e))) => e.clone(),
+            Some((_, Load::Ready(t))) => t.clone(),
+            None => "Enter previews the tracked files the selected machine would receive.".into(),
+        },
     };
     f.render_widget(
         Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
@@ -503,7 +572,9 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                         Style::default().fg(Color::DarkGray),
                     ));
                 }
-                for d in i.preview.data.iter().chain(&i.preview.rules) {
+                for d in (i.preview.data.iter().chain(&i.preview.rules))
+                    .chain(i.preview.effects.iter().take(8))
+                {
                     l.push(Line::styled(
                         format!("    {d}"),
                         Style::default().fg(Color::DarkGray),
@@ -590,6 +661,57 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 ),
             ],
         ),
+        Dialog::Assign(e) => {
+            let what = if e.paths.len() == 1 {
+                format!("~/{}", e.paths[0])
+            } else {
+                format!("{} paths", e.paths.len())
+            };
+            let mut body: Vec<Line> = Vec::new();
+            let mut cursor_line = 0;
+            let mut group = "";
+            for (i, r) in e.rows.iter().enumerate() {
+                if r.group != group {
+                    group = r.group;
+                    body.push(Line::styled(group, Style::default().fg(Color::Blue)));
+                }
+                let (mark, colour) = match r.state {
+                    crate::assign::Tri::None => ("[ ] —  ", Color::DarkGray),
+                    crate::assign::Tri::Include => ("[+] incl", Color::Green),
+                    crate::assign::Tri::Exclude => ("[x] excl", Color::Red),
+                    crate::assign::Tri::Mixed => ("[~] mixed", Color::Yellow),
+                };
+                let value = r.target.split_once(':').map_or("", |(_, v)| v);
+                let mut style = Style::default().fg(colour);
+                if i == e.cursor {
+                    style = style.add_modifier(Modifier::REVERSED);
+                    cursor_line = body.len();
+                }
+                body.push(Line::from(Span::styled(
+                    format!("  {mark:<10} {value}"),
+                    style,
+                )));
+            }
+            // Title, blank and footer take 3 lines; the rest scrolls around the cursor.
+            let window = usize::from(area.height.saturating_sub(4 + 3)).max(1);
+            if body.len() > window {
+                let start = cursor_line
+                    .saturating_sub(window / 2)
+                    .min(body.len() - window);
+                body = body.into_iter().skip(start).take(window).collect();
+            }
+            let mut l = vec![Line::styled(
+                format!("Assign {what}"),
+                Style::default().add_modifier(Modifier::BOLD),
+            )];
+            l.extend(body);
+            l.push(Line::from(""));
+            l.push(Line::styled(
+                "Space cycle · i incl · x excl · - none · Enter add item · Esc",
+                Style::default().fg(Color::Yellow),
+            ));
+            (" Assign ", l)
+        }
         Dialog::ConfirmDiscard(paths) => (
             " Discard ",
             vec![

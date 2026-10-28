@@ -29,6 +29,15 @@ pub const KEY_DIFF: &str = "diff";
 pub const KEY_ACTION: &str = "action";
 /// The background fetch; a newer one cancels an older.
 pub const KEY_FETCH: &str = "fetch";
+pub const KEY_REGISTRY: &str = "registry";
+pub const KEY_MACHINE: &str = "machine";
+
+/// The machine registry and the assignments, as the TUI shows them.
+#[derive(Debug, Default, Clone)]
+pub struct RegistryView {
+    pub machines: Vec<crate::machines::Listed>,
+    pub assignments: crate::assign::Assignments,
+}
 
 /// The outcome of a mutation (toggle, drop, apply).
 #[derive(Debug)]
@@ -60,6 +69,12 @@ pub enum Payload {
     Action(Result<ActionReport, String>),
     /// A background fetch: `None` when there was nothing to fetch from.
     Fetch(Result<Option<String>, String>),
+    Registry(Result<Box<RegistryView>, String>),
+    /// What a registry machine would receive.
+    MachinePreview {
+        name: String,
+        text: Result<String, String>,
+    },
 }
 
 #[derive(Debug)]

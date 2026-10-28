@@ -139,11 +139,7 @@ pub fn run(store: &Store) -> Report {
                         true,
                         format!("{} is in the machine registry", m.name),
                     ),
-                    Some(m) => check(
-                        "machine",
-                        false,
-                        format!("{} is not in the machine registry", m.name),
-                    ),
+                    Some(m) => check("machine", false, m.problem().unwrap_or_default()),
                     None => check(
                         "machine",
                         false,

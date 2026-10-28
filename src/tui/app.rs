@@ -10,9 +10,10 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
-    ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING, KEY_PENDING,
-    KEY_PREVIEW, KEY_STATUS, KEY_TRACKED, Payload,
+    ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING, KEY_MACHINE,
+    KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STATUS, KEY_TRACKED, Payload, RegistryView,
 };
+use crate::assign::{self, Side, TargetRow, Tri};
 use crate::changes::{self, Change, CommitOpts, State};
 use crate::hide::HideRules;
 use crate::pending::{self, Item, List};
@@ -105,6 +106,58 @@ pub enum ActionReq {
     Fetch,
     Pull,
     Push,
+    /// Add one pending assignment item for these HOME-relative paths.
+    Assign(Vec<String>, Vec<crate::machines::Edit>),
+}
+
+/// The assignment editor: one checkbox row per target, with the state over
+/// the selected paths.
+#[derive(Debug, Clone)]
+pub struct AssignEditor {
+    pub paths: Vec<String>,
+    pub rows: Vec<TargetRow>,
+    /// The state each row had when the editor opened (to find what changed).
+    original: Vec<Tri>,
+    pub cursor: usize,
+}
+
+impl AssignEditor {
+    pub fn new(paths: Vec<String>, rows: Vec<TargetRow>) -> Self {
+        let original = rows.iter().map(|r| r.state).collect();
+        Self {
+            paths,
+            rows,
+            original,
+            cursor: 0,
+        }
+    }
+
+    fn cycle(&mut self) {
+        if let Some(r) = self.rows.get_mut(self.cursor) {
+            r.state = match r.state {
+                Tri::None | Tri::Mixed => Tri::Include,
+                Tri::Include => Tri::Exclude,
+                Tri::Exclude => Tri::None,
+            };
+        }
+    }
+
+    /// The edits that differ from what the editor opened with.
+    pub fn edits(&self) -> Vec<crate::machines::Edit> {
+        self.rows
+            .iter()
+            .zip(&self.original)
+            .filter(|(r, o)| r.state != **o)
+            .map(|(r, _)| {
+                let side = match r.state {
+                    Tri::Include => Some(Side::Include),
+                    Tri::Exclude => Some(Side::Exclude),
+                    Tri::None | Tri::Mixed => None,
+                };
+                (r.target.clone(), side)
+            })
+            .collect()
+    }
 }
 
 /// The commit message being typed.
@@ -132,6 +185,8 @@ pub enum Dialog {
     ConfirmApply(Option<Vec<String>>),
     /// `P`: y/n before pushing.
     ConfirmPush,
+    /// `m`: the assignment editor.
+    Assign(AssignEditor),
 }
 
 #[derive(Debug)]
@@ -167,6 +222,11 @@ pub struct App {
     pub changes_selected: usize,
     /// The diff shown for the selected change.
     pub diff: Load<ratatui::text::Text<'static>>,
+    /// The machine registry and the assignments; `None` until first loaded.
+    pub registry: Option<Arc<RegistryView>>,
+    pub machines_selected: usize,
+    /// The preview of the machine last opened with Enter in the Machines panel.
+    pub machine_preview: Option<(String, Load<String>)>,
     /// Change marker of the `hide` file last loaded (`None` until the first load).
     hide_stamp: Option<crate::hide::HideStamp>,
     actions: VecDeque<ActionReq>,
@@ -198,6 +258,9 @@ impl App {
             changes_tab: 0,
             changes_selected: 0,
             diff: Load::Ready(ratatui::text::Text::default()),
+            registry: None,
+            machines_selected: 0,
+            machine_preview: None,
             hide_stamp: None,
             actions: VecDeque::new(),
             action_running: false,
@@ -262,6 +325,18 @@ impl App {
                 source::load(&repo)
                     .map(Box::new)
                     .map_err(|e| format!("{e:#}")),
+            )
+        });
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_REGISTRY, move |_| {
+            Payload::Registry(
+                (|| {
+                    Ok(Box::new(RegistryView {
+                        machines: crate::machines::list(&store)?,
+                        assignments: assign::read_assignments(&store.repo())?,
+                    }))
+                })()
+                .map_err(|e: anyhow::Error| format!("{e:#}")),
             )
         });
         let store = Arc::clone(&self.store);
@@ -401,6 +476,29 @@ impl App {
                     self.tracked = Arc::new(*t);
                 }
             }
+            Payload::Registry(r) => {
+                if let Ok(v) = r {
+                    self.registry = Some(Arc::new(*v));
+                    self.machines_selected = self
+                        .machines_selected
+                        .min(self.machine_count().saturating_sub(1));
+                }
+            }
+            Payload::MachinePreview { name, text } => {
+                if self
+                    .machine_preview
+                    .as_ref()
+                    .is_some_and(|(n, _)| *n == name)
+                {
+                    self.machine_preview = Some((
+                        name,
+                        match text {
+                            Ok(t) => Load::Ready(t),
+                            Err(e) => Load::Failed(e),
+                        },
+                    ));
+                }
+            }
             Payload::Pending(r) => match r {
                 Ok(list) => self.set_pending(*list),
                 Err(e) => self.message = Some(e),
@@ -527,7 +625,103 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmPush),
             },
+            Some(Dialog::Assign(mut e)) => {
+                let last = e.rows.len().saturating_sub(1);
+                match key.code {
+                    KeyCode::Esc => return,
+                    KeyCode::Char('j') | KeyCode::Down => e.cursor = (e.cursor + 1).min(last),
+                    KeyCode::Char('k') | KeyCode::Up => e.cursor = e.cursor.saturating_sub(1),
+                    KeyCode::Char(' ') => e.cycle(),
+                    KeyCode::Char(c @ ('i' | 'x' | '-')) => {
+                        if let Some(r) = e.rows.get_mut(e.cursor) {
+                            r.state = match c {
+                                'i' => Tri::Include,
+                                'x' => Tri::Exclude,
+                                _ => Tri::None,
+                            };
+                        }
+                    }
+                    KeyCode::Enter => {
+                        let edits = e.edits();
+                        if edits.is_empty() {
+                            self.message = Some("no changes to the assignment".into());
+                            self.dialog = Some(Dialog::Assign(e));
+                            return;
+                        }
+                        return self.request_action(ActionReq::Assign(e.paths, edits));
+                    }
+                    _ => {}
+                }
+                self.dialog = Some(Dialog::Assign(e));
+            }
             Some(Dialog::Result(_)) | None => {}
+        }
+    }
+
+    pub fn machine_count(&self) -> usize {
+        self.registry.as_ref().map_or(0, |r| r.machines.len())
+    }
+
+    /// `m`: open the assignment editor for these HOME-relative paths. Each must
+    /// be tracked, or a folder holding tracked files.
+    fn open_assign_editor(&mut self, paths: Vec<String>) {
+        let Some(reg) = self.registry.clone() else {
+            self.message = Some("the machine registry is still loading".into());
+            return;
+        };
+        if paths.is_empty() {
+            return;
+        }
+        if let Some(bad) = paths.iter().find(|p| {
+            !(self.tracked.is_tracked(p)
+                || self.tracked.folders.contains(*p)
+                || self.tracked.under(p).next().is_some())
+        }) {
+            self.message = Some(format!("~/{bad} is not tracked: track it first (Space)"));
+            return;
+        }
+        let machines: Vec<_> = reg.machines.iter().map(|l| l.machine.clone()).collect();
+        let rows = assign::editor_rows(&machines, &reg.assignments, &paths);
+        self.dialog = Some(Dialog::Assign(AssignEditor::new(paths, rows)));
+    }
+
+    fn machines_key(&mut self, key: KeyEvent) {
+        let n = self.machine_count();
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.machines_selected = (self.machines_selected + 1).min(n.saturating_sub(1));
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.machines_selected = self.machines_selected.saturating_sub(1);
+            }
+            KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            KeyCode::Enter => {
+                let Some(name) = self
+                    .registry
+                    .as_ref()
+                    .and_then(|r| r.machines.get(self.machines_selected))
+                    .map(|l| l.machine.name.clone())
+                else {
+                    return;
+                };
+                self.machine_preview = Some((name.clone(), Load::Loading));
+                let store = Arc::clone(&self.store);
+                self.jobs.spawn(KEY_MACHINE, move |_| {
+                    let text = crate::machines::preview_as(&store, &name, false)
+                        .map(|p| {
+                            let mut s =
+                                format!("{} would receive {} file(s):\n\n", name, p.files.len());
+                            for f in &p.files {
+                                s.push_str(&format!("~/{f}\n"));
+                            }
+                            s
+                        })
+                        .map_err(|e| format!("{e:#}"));
+                    Payload::MachinePreview { name, text }
+                });
+            }
+            _ => {}
         }
     }
 
@@ -624,6 +818,11 @@ impl App {
                 }
             }
             KeyCode::Char('A') => self.request_action(ActionReq::LoadAmend),
+            KeyCode::Char('m') => match selected {
+                Some(c) if c.kind != "repo" => self.open_assign_editor(vec![c.path]),
+                Some(_) => self.message = Some("repository files have no assignment".into()),
+                None => {}
+            },
             KeyCode::Char('d') => match selected {
                 Some(c) if c.state == State::Local => {
                     self.dialog = Some(Dialog::ConfirmDiscard(vec![c.path]))
@@ -685,6 +884,7 @@ impl App {
             Panel::Files => self.files_key(key),
             Panel::Pending => self.pending_key(key),
             Panel::Changes => self.changes_key(key),
+            Panel::Machines => self.machines_key(key),
             _ => match key.code {
                 KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
                 KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
@@ -754,6 +954,18 @@ impl App {
                     self.request_action(ActionReq::Hide(path, is_dir));
                 }
                 return;
+            }
+            KeyCode::Char('m') => {
+                let visible = self.files.visible();
+                let (lo, hi) = self
+                    .range_rows()
+                    .unwrap_or((self.files.selected, self.files.selected));
+                let paths: Vec<String> = (lo..=hi)
+                    .filter_map(|i| visible.get(i))
+                    .map(|e| self.files.rel_of(e))
+                    .collect();
+                self.range_anchor = None;
+                return self.open_assign_editor(paths);
             }
             KeyCode::Char('v') => {
                 self.range_anchor = match self.range_anchor {
@@ -1011,6 +1223,21 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 "Pushed {} to {}",
                 done[0].branch, done[0].remote
             )))
+        }
+        ActionReq::Assign(paths, edits) => {
+            let mut homes = Vec::new();
+            for p in &paths {
+                homes.push(track::resolve_home_path(store, p, &store.dirs.home)?);
+            }
+            let ctx = track::Ctx::load(store)?;
+            let item = crate::machines::plan_assign(store, &ctx, &homes, &edits, false, "human")?;
+            let lock = store.lock()?;
+            track::recheck(store, &lock, std::slice::from_ref(&item))?;
+            let ctx = track::Ctx::load(store)?;
+            let check = track::stale_checker(store, &ctx);
+            let mut added = pending::add(store, &lock, vec![item], &check)?;
+            let item = added.remove(0).item;
+            Ok(report(format!("Added {}: {}", item.label(), item.summary)))
         }
         ActionReq::Apply(ids) => {
             let results = track::apply_pending(store, Some(&ids))?;
