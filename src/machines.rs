@@ -491,9 +491,15 @@ pub fn plan_retire(store: &Store, ctx: &Ctx, name: &str, requester: &str) -> Res
         .into_iter()
         .filter(|r| !r.starts_with("assignments / "))
         .map(|r| {
-            format!(
-                "{r} still names {target}; it never matches a retired machine, remove it by hand"
-            )
+            if r.contains("variants / ") {
+                format!(
+                    "{r} names {target}: the variant stays in place but is unused (a retired machine never matches); `dw variant remove` deletes it"
+                )
+            } else {
+                format!(
+                    "{r} still names {target}; it never matches a retired machine, remove it by hand"
+                )
+            }
         })
         .collect();
     let active: Vec<Machine> = registry
@@ -684,6 +690,28 @@ pub struct PreviewAs {
     pub files: Vec<String>,
     /// chezmoi's diff of those files against this HOME, when asked for.
     pub diff: Option<String>,
+    /// Variant files and the variant this machine would receive of each.
+    pub variants: Vec<crate::variants::Summary>,
+}
+
+impl PreviewAs {
+    /// One line per file, naming the variant the machine receives.
+    pub fn lines(&self) -> Vec<String> {
+        self.files
+            .iter()
+            .map(|f| {
+                let note = match self.variants.iter().find(|v| &v.path == f) {
+                    Some(v) => match (&v.receives, &v.clash) {
+                        (_, Some(c)) => format!("  [BLOCKED: {c}]"),
+                        (Some(r), _) => format!("  [variant: {r}]"),
+                        _ => String::new(),
+                    },
+                    None => String::new(),
+                };
+                format!("~/{f}{note}")
+            })
+            .collect()
+    }
 }
 
 struct TempDir(PathBuf);
@@ -733,13 +761,38 @@ pub fn preview_as(store: &Store, name: &str, diff: bool) -> Result<PreviewAs> {
     .map(str::to_string)
     .collect();
     files.sort();
+    let variants = crate::variants::summaries(
+        &crate::variants::Variants::read(&store.repo())?,
+        &assign::machine_targets(m),
+    );
     let diff = if diff {
-        Some(run(&[
+        let mut args: Vec<String> = [
             "diff",
             "--include=files,symlinks",
             "--use-builtin-diff",
             "--no-pager",
-        ])?)
+        ]
+        .map(String::from)
+        .into();
+        if variants.iter().any(|v| v.clash.is_some()) {
+            // chezmoi cannot render a clashing file: diff the others only.
+            let home = store.dirs.home.display().to_string();
+            let rest: Vec<String> = files
+                .iter()
+                .filter(|f| !variants.iter().any(|v| v.clash.is_some() && &v.path == *f))
+                .map(|f| format!("{home}/{f}"))
+                .collect();
+            if rest.is_empty() {
+                None
+            } else {
+                args.extend(rest);
+                Some(args)
+            }
+        } else {
+            Some(args)
+        }
+        .map(|a| run(&a.iter().map(String::as_str).collect::<Vec<_>>()))
+        .transpose()?
     } else {
         None
     };
@@ -747,5 +800,6 @@ pub fn preview_as(store: &Store, name: &str, diff: bool) -> Result<PreviewAs> {
         machine: m.clone(),
         files,
         diff,
+        variants,
     })
 }

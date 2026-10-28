@@ -926,6 +926,69 @@ pub fn assign_cmd(
     submit(store, vec![item], apply, dry_run, json)
 }
 
+pub fn variant_edit(
+    store: &Store,
+    add: bool,
+    path: &str,
+    target: &str,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let hp = track::resolve_home_path(store, path, &cwd()?)?;
+    let ctx = Ctx::load(store)?;
+    let requester = pending::requester(store);
+    let item = if add {
+        crate::variants::plan_add(store, &ctx, &hp, target, &requester)?
+    } else {
+        crate::variants::plan_remove(store, &ctx, &hp, target, &requester)?
+    };
+    submit(store, vec![item], apply, dry_run, json)
+}
+
+pub fn variant_list(store: &Store, path: Option<&str>, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let only = match path {
+        Some(p) => Some(track::resolve_home_path(store, p, &cwd()?)?.rel),
+        None => None,
+    };
+    let list = crate::variants::list(store, only.as_deref())?;
+    if json {
+        print_json(&json!({"variants": list}))?;
+    } else if list.is_empty() {
+        println!("No variants.");
+    }
+    for s in &list {
+        if json {
+            break;
+        }
+        println!(
+            "~/{}: {}",
+            s.path,
+            match (&s.receives, &s.clash) {
+                (_, Some(c)) => format!("BLOCKED, {c}"),
+                (Some(r), None) => format!("this machine receives {r}"),
+                _ => String::new(),
+            }
+        );
+        let default_here = s.receives.as_deref() == Some("default");
+        println!(
+            "  default{}",
+            if default_here {
+                "  <- this machine"
+            } else {
+                ""
+            }
+        );
+        for t in &s.targets {
+            let here = s.receives.as_deref() == Some(t.as_str());
+            println!("  {t}{}", if here { "  <- this machine" } else { "" });
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn machine_list(store: &Store, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
     let machines = crate::machines::list(store)?;
@@ -1012,8 +1075,8 @@ pub fn machine_preview(store: &Store, name: &str, diff: bool, json: bool) -> Res
             p.machine.name,
             p.files.len()
         );
-        for f in &p.files {
-            println!("  ~/{f}");
+        for l in p.lines() {
+            println!("  {l}");
         }
         if let Some(d) = &p.diff {
             println!();

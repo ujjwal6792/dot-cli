@@ -318,3 +318,49 @@ fn the_editor_scrolls_to_keep_the_cursor_visible_with_many_machines() {
         [(".b".to_string(), vec![], vec!["machine:srv".to_string()])]
     );
 }
+
+#[test]
+fn variant_files_show_a_badge_list_their_versions_and_t_adds_a_pending_variant() {
+    let t = setup();
+    fs::write(t.home.join(".b"), "b for srv\n").unwrap();
+    t.dw_ok(&["variant", "add", ".b", "--target", "machine:srv", "--apply"]);
+    t.dw_ok(&["commit", "-m", "variant"]);
+    let mut tui = Tui::open(t);
+    tui.select(".b");
+    let screen = tui.screen();
+    assert!(screen.contains(".b ◆2"), "badge in Files:\n{screen}");
+    assert!(
+        screen.contains("default  ← this machine receives this") && screen.contains("machine:srv"),
+        "versions in the main view:\n{screen}"
+    );
+
+    tui.select(".a");
+    tui.press('t');
+    let Some(Dialog::Assign(e)) = &tui.app.dialog else {
+        panic!("the picker is open")
+    };
+    let at = e
+        .rows
+        .iter()
+        .position(|r| r.target == "machine:alpha")
+        .unwrap();
+    assert!(tui.screen().contains("New variant of ~/.a"));
+    for _ in 0..at {
+        tui.press('j');
+    }
+    tui.press_key(KeyCode::Enter);
+    let pending = tui.t.dw_ok(&["pending", "list"]);
+    assert!(
+        pending.contains("Add variant machine:alpha for ~/.a"),
+        "{pending}"
+    );
+    tui.select(".b");
+    tui.press('t');
+    let Some(Dialog::Assign(e)) = &tui.app.dialog else {
+        panic!("the picker is open")
+    };
+    assert!(
+        e.rows.iter().all(|r| r.target != "machine:srv"),
+        "targets that have a variant are not offered"
+    );
+}

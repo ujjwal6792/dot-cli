@@ -187,6 +187,21 @@ pub fn run(store: &Store) -> Report {
                     Ok(_) => {}
                     Err(e) => checks.push(check("targets", false, format!("{e:#}"))),
                 }
+                match crate::variants::clashes(store) {
+                    Ok(c) if !c.is_empty() => {
+                        let list: Vec<String> =
+                            c.iter().map(|(p, why)| format!("~/{p}: {why}")).collect();
+                        let mut w = check(
+                            "variants",
+                            true,
+                            format!("blocked until resolved: {}", list.join("; ")),
+                        );
+                        w.warning = true;
+                        checks.push(w);
+                    }
+                    Ok(_) => {}
+                    Err(e) => checks.push(check("variants", false, format!("{e:#}"))),
+                }
                 if config_ok {
                     checks.push(match store.chezmoi(&["managed"]) {
                         Ok(o) => check(

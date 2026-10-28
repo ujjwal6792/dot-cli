@@ -160,15 +160,25 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    entry with an unknown target kind never matches and does not affect other
    entries or files. Retired machines have no targets: chezmoi on a retired
    machine fails with `machine "<name>" is retired and has no targets`. A tracked file
-   using variants is a template such as `home/dot_gitconfig.tmpl`:
+   using variants is a template such as `home/dot_gitconfig.tmpl`; the default
+   content is a variant file too (`include` returns file content raw, so
+   `{{` in a variant is never evaluated):
    ```
    {{- $v := includeTemplate "dotwarden/variant" (dict "data" . "path" ".gitconfig") | trim -}}
-   {{- if $v }}{{ include (printf ".dotwarden/variants/%s" $v) }}{{ else }}…default content…{{ end -}}
+   {{- if $v }}{{ include (printf ".dotwarden/variants/%s" $v) }}{{ else }}{{ include ".dotwarden/variants/.gitconfig/default" }}{{ end -}}
    ```
-   An ambiguity is an error for that file only: `chezmoi apply` stops at the
+   Variant files are `home/.dotwarden/variants/<target path>/<target with : as ->`
+   (`.gitconfig/machine-mac`) and `<target path>/default`; a name already taken
+   (after a machine rename) gets `-2`, `-3`, … appended. A source file's other
+   attributes (`executable_`, `private_`) stay in the template's name.
+   Dotwarden mirrors the selection in Rust (`variants::pick`) because chezmoi
+   fails `dump`, `status` and `diff` as a whole on one ambiguity, even with
+   `--keep-going`; for status, classification and staging it renders everything
+   except the clashed files by naming the other managed files explicitly. An
+   ambiguity is an error for that file only: `chezmoi apply` stops at the
    first error, but `chezmoi apply --keep-going` writes every other file and
-   reports the failing one, so dotwarden must apply with `--keep-going` to
-   "block apply of that file only".
+   reports the failing one, so dotwarden applies with `--keep-going` and never
+   names a clashed file.
 7. **Git isolation.** Dotwarden's git (and the git chezmoi runs, which gets the
    bundled git first on `PATH`) runs with `GIT_CONFIG_NOSYSTEM=1` and
    `GIT_CONFIG_GLOBAL=/dev/null`; only `user.name`, `user.email`,
@@ -314,8 +324,24 @@ Exact template code (written once into every repository; the files in
   template evaluates them for the current machine, so plain chezmoi enforces them.
   Assigning never rewrites `.chezmoiignore`.
 - **Specificity** (variants and values): machine > distribution > family >
-  platform > default. Two matches at the same level are an error shown in the UI
-  and block apply of that file only.
+  platform > default. Two matches at the same level are a clash, shown in
+  `dw status`, `dw doctor`, `dw variant list` and the TUI (`◆N!`, Status panel);
+  it blocks that file only (not classified, not staged, not applied) while all
+  other files stay usable.
+- **Variants** (`dw variant add|list|remove`, TUI `t`; pending items, any agent
+  may add them). `add PATH --target T` makes a tracked regular file a variant
+  file: its stored content becomes the `default` variant and the *current HOME
+  content* becomes the variant for `T` (checked like assignment targets;
+  one variant per target). `remove` deletes one; removing the last turns the
+  file back into a plain file with the default content. The preview lists every
+  repository file added or removed and, per registry machine, which variant it
+  receives before and after. Untracking removes all variants; renaming a machine
+  rewrites variant targets (files keep their names); retiring one leaves its
+  variant in place but unused (noted in the preview; `variant remove` still
+  works). `dw machine preview` marks the variant each file would get. The TUI
+  shows `◆N` (N stored versions, default included) in Files and Changes, lists
+  the versions with the one this machine receives in the main view, and `t`
+  opens the target picker for a new variant of the selected file.
 - **Assigning** (`dw assign`, TUI `m`) is one pending item per request holding the
   final lists of each path; any agent may add it. A path must be tracked or a
   folder holding tracked files. A folder's assignment covers everything below
@@ -372,7 +398,10 @@ Actions:
 - **Stage** (`Space`): write HOME content into source (plain files via chezmoi
   `add`/`re-add`; files with references via dotwarden's reverse mapping, §7) and
   `git add`. Hunk/line staging writes only the selected hunks. **Unstage** restores
-  the source entry from HEAD.
+  the source entry from HEAD. A variant file is staged by writing the HOME content
+  into the variant file this machine currently receives (the default when it
+  receives the default), never into another; the classifier, `dw diff` and
+  discard use the rendered variant this machine receives.
 - **Commit** (`c`), **amend** (`A`), multi-line messages. Commits by agents get an
   `Agent: <name>` trailer.
 - **Discard** (`d`): snapshot HOME, then write the committed version to HOME.
@@ -496,7 +525,7 @@ Default keys (lazygit-compatible, remappable in preferences): `Space` stage/trac
 `a` stage all, `v` range select, `c` commit, `A` amend, `P` push, `p` pull,
 `f` fetch, `d` discard, `e` `$EDITOR`, `o` open, `i` hide, `/` filter, `[` `]`
 tabs, `h`/`l` panels, `1`–`5` panels, `x` menu, `z` undo, `?` help, `@` command log,
-`+`/`_` screen mode, `y` copy path, `m` assign, `E` encrypt, `.` show hidden,
+`+`/`_` screen mode, `y` copy path, `m` assign, `t` add a variant, `E` encrypt, `.` show hidden,
 `V` values, `G` open lazygit on the repository (suspends dotwarden), `Enter` drill
 in / staging view, `Esc` back, `q` quit.
 
