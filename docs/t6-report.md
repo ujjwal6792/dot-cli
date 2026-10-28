@@ -30,3 +30,9 @@ Hand-broken: stage always writes the default (1 failed); clash scope disabled (1
 - No TUI flow for removing a variant (CLI only); no hunk-level variant staging.
 - `retire` note filter `starts_with("assignments / ")` (T5) never matches because paths start with `dotwarden / `; not touched.
 - Linux not run.
+
+## Review fixes
+
+1. **Nested apply on a fresh machine.** `apply_incoming` and `discard_files` pass `--parent-dirs` (verified in the pinned chezmoi; snapshot restore already creates parents). Test `applying_on_a_fresh_machine_creates_missing_parent_directories` (3 levels deep, two machines, plus discard after removing the folders). Hand-broken: flag removed from apply (test failed).
+2. **Retire note filter** now `contains("assignments / ")` (paths start with `dotwarden / `). Test `retiring_notes_assignments_and_…`; old filter makes it fail.
+3. **Mode-only change of a variant file** is reported, not staged: `dw stage` refuses it ("only its mode differs; mode changes of variant files are not supported"; skipped and listed with `--all`). Chosen because the mode lives in the template's name, shared by all variants.

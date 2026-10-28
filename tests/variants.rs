@@ -611,3 +611,60 @@ fn preview_as_a_machine_shows_which_variant_it_gets() {
     let v = &diff["variants"][0];
     assert_eq!(v["receives"], "machine:srv");
 }
+
+#[test]
+fn applying_on_a_fresh_machine_creates_missing_parent_directories() {
+    let (a, b) = pair();
+    write(&a, ".config/ghostty/themes/config", "deep\n");
+    a.dw_ok(&["track", ".config/ghostty/themes/config", "--apply"]);
+    a.dw_ok(&["commit", "-m", "deep"]);
+    sync(&a, &b);
+    assert!(!b.home.join(".config").exists());
+    b.dw_ok(&["apply", "--all"]);
+    assert_eq!(read(&b, ".config/ghostty/themes/config"), "deep\n");
+    // Discard of a file whose folders were removed also recreates them.
+    write(&b, ".config/ghostty/themes/config", "edit\n");
+    fs::remove_dir_all(b.home.join(".config/ghostty")).unwrap();
+    b.dw_ok(&["discard", ".config/ghostty/themes/config", "--yes"]);
+    assert_eq!(read(&b, ".config/ghostty/themes/config"), "deep\n");
+}
+
+#[test]
+fn retiring_notes_assignments_and_a_mode_only_change_of_a_variant_file_is_reported() {
+    let t = alpha_with_conf();
+    write(&t, ".conf", "srv\n");
+    t.dw_ok(&[
+        "variant",
+        "add",
+        ".conf",
+        "--target",
+        "machine:srv",
+        "--apply",
+    ]);
+    t.dw_ok(&[
+        "assign",
+        ".conf",
+        "--include",
+        "machine:srv",
+        "--include",
+        "machine:alpha",
+        "--apply",
+    ]);
+    let r = dw(&t, &["machine", "retire", "srv", "--dry-run"]);
+    assert!(
+        !r.out.contains("assignments / ") && r.out.contains("variants / "),
+        "assignments are listed under data, not as leftover notes:\n{}",
+        r.out
+    );
+    // alpha receives the default; make HOME equal to it and change only the mode.
+    t.dw_ok(&["commit", "-m", "x"]);
+    write(&t, ".conf", "base {{ not a template }}\n");
+    use std::os::unix::fs::PermissionsExt;
+    fs::set_permissions(t.home.join(".conf"), fs::Permissions::from_mode(0o755)).unwrap();
+    let r = dw(&t, &["stage", ".conf"]);
+    assert!(
+        r.code != 0 && r.err.contains("only its mode differs"),
+        "{}",
+        r.err
+    );
+}

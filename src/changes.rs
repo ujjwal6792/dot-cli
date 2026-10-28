@@ -515,7 +515,10 @@ fn variant_for_stage(
         Pick::Default => default_file(rel),
         Pick::Clash(t) => return Err(format!("variants clash: {}", t.join(", "))),
     };
-    if store.repo().join(repo_path(&file)).is_file() {
+    let stored = fs::read(store.repo().join(repo_path(&file))).ok();
+    if stored.is_some() && stored == fs::read(store.dirs.home.join(rel)).ok() {
+        Err("only its mode differs; mode changes of variant files are not supported".into())
+    } else if stored.is_some() {
         Ok(file)
     } else {
         Err(format!("its variant file {} is missing", repo_path(&file)))
@@ -677,7 +680,8 @@ pub(crate) fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> R
 pub fn discard_files(store: &Store, files: &[String], actor: &str) -> Result<Option<String>> {
     let snap = snapshot::take(store, files, "discard", actor)?.map(|s| s.id);
     for chunk in files.chunks(CHUNK) {
-        let mut args: Vec<std::ffi::OsString> = vec!["apply".into(), "--force".into()];
+        let mut args: Vec<std::ffi::OsString> =
+            vec!["apply".into(), "--force".into(), "--parent-dirs".into()];
         args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
         store.chezmoi_locked(&args)?;
     }
@@ -818,7 +822,11 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
     out.snapshot = snapshot::take(store, &files, "apply", &actor)?.map(|s| s.id);
     let mut errors = Vec::new();
     for chunk in files.chunks(CHUNK) {
-        let mut args: Vec<std::ffi::OsString> = vec!["apply".into(), "--keep-going".into()];
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "apply".into(),
+            "--keep-going".into(),
+            "--parent-dirs".into(),
+        ];
         args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
         if let Err(e) = store.chezmoi_locked(&args) {
             errors.push(format!("{e:#}"));

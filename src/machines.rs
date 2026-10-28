@@ -489,7 +489,7 @@ pub fn plan_retire(store: &Store, ctx: &Ctx, name: &str, requester: &str) -> Res
     let mut doc = data_doc(store)?;
     let notes = rename_refs(&mut doc, name, name)
         .into_iter()
-        .filter(|r| !r.starts_with("assignments / "))
+        .filter(|r| !r.contains("assignments / "))
         .map(|r| {
             if r.contains("variants / ") {
                 format!(
