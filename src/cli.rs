@@ -137,6 +137,17 @@ pub enum Command {
         #[command(subcommand)]
         action: VariantCmd,
     },
+    /// Variables with per-target overrides, and the references that use them.
+    ///
+    /// A variable has a default and optional overrides per target; a machine
+    /// receives the most specific match (machine > distribution > family >
+    /// platform > default). `wire` replaces this machine's value in a tracked
+    /// file by a reference, so the file renders the right value on every
+    /// machine. Every change is one pending item with an exact preview.
+    Values {
+        #[command(subcommand)]
+        action: ValuesCmd,
+    },
     /// List, register, rename, retire or preview machines of the registry.
     Machine {
         #[command(subcommand)]
@@ -336,6 +347,61 @@ pub enum VariantCmd {
         /// The target whose variant is removed.
         #[arg(long, value_name = "TARGET")]
         target: String,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ValuesCmd {
+    /// List variables: default, overrides, the value this machine receives, files using them.
+    List,
+    /// Show one variable in full.
+    Show {
+        /// The variable's name.
+        name: String,
+    },
+    /// Create a variable, or change its default or one override.
+    SetVariable {
+        /// Letters, digits, `_` and `-`.
+        name: String,
+        /// The value (one line). Use `--` before a value starting with `-`.
+        value: String,
+        /// Set the override for this target instead of the default
+        /// (platform:<p>, distribution:<d>, family:<f> or machine:<name>).
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove one override, or the whole variable when no target is given.
+    UnsetVariable {
+        /// The variable's name.
+        name: String,
+        /// Remove only the override for this target.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Replace this machine's value of a variable in a tracked file by references.
+    Wire {
+        /// A tracked file containing the variable's value.
+        path: String,
+        /// The variable to reference.
+        name: String,
         /// Apply immediately instead of leaving the item in the pending list.
         #[arg(long)]
         apply: bool,
@@ -672,6 +738,39 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     dry_run,
                 } => cmds::variant_edit(&store, false, &path, &target, apply, dry_run, json),
                 VariantCmd::List { path } => cmds::variant_list(&store, path.as_deref(), json),
+            };
+        }
+        Command::Values { action } => {
+            return match action {
+                ValuesCmd::List => cmds::values_list(&store, json),
+                ValuesCmd::Show { name } => cmds::values_show(&store, &name, json),
+                ValuesCmd::SetVariable {
+                    name,
+                    value,
+                    target,
+                    apply,
+                    dry_run,
+                } => cmds::values_set(
+                    &store,
+                    &name,
+                    &value,
+                    target.as_deref(),
+                    apply,
+                    dry_run,
+                    json,
+                ),
+                ValuesCmd::UnsetVariable {
+                    name,
+                    target,
+                    apply,
+                    dry_run,
+                } => cmds::values_unset(&store, &name, target.as_deref(), apply, dry_run, json),
+                ValuesCmd::Wire {
+                    path,
+                    name,
+                    apply,
+                    dry_run,
+                } => cmds::values_wire(&store, &path, &name, apply, dry_run, json),
             };
         }
         Command::Machine { action } => {

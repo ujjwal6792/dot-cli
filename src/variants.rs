@@ -242,14 +242,19 @@ pub fn render_scope(store: &Store) -> Result<Option<Vec<String>>> {
     ))
 }
 
-/// The template a variant file is stored as.
-fn template(path: &str) -> String {
+/// The template a variant file is stored as. A variant file holding references
+/// (it contains `values::MARKER`) is rendered as a template; any other is
+/// included raw.
+pub(crate) fn template(path: &str) -> String {
     let q = |s: &str| serde_json::to_string(s).expect("a string");
     format!(
-        "{{{{- $v := includeTemplate \"dotwarden/variant\" (dict \"data\" . \"path\" {}) | trim -}}}}\n\
-         {{{{- if $v }}}}{{{{ include (printf \".dotwarden/variants/%s\" $v) }}}}{{{{ else }}}}{{{{ include {} }}}}{{{{ end -}}}}\n",
-        q(path),
-        q(&format!(".dotwarden/variants/{}", default_file(path)))
+        "{{{{- $v := includeTemplate \"dotwarden/variant\" (dict \"data\" . \"path\" {p}) | trim -}}}}\n\
+         {{{{- $f := printf \".dotwarden/variants/%s\" (default {d} $v) -}}}}\n\
+         {{{{- $t := include $f -}}}}\n\
+         {{{{- if contains {m} $t }}}}{{{{ includeTemplate $f $ }}}}{{{{ else }}}}{{{{ $t }}}}{{{{ end -}}}}\n",
+        p = q(path),
+        d = q(&default_file(path)),
+        m = q(crate::values::MARKER),
     )
 }
 

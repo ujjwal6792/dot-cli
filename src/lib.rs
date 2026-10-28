@@ -25,4 +25,5 @@ pub mod templates;
 pub mod toolchain;
 pub mod track;
 pub mod tui;
+pub mod values;
 pub mod variants;

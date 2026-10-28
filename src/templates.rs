@@ -11,10 +11,14 @@ pub const SELECT: &str = include_str!("../assets/home/.chezmoitemplates/dotwarde
 /// `home/.chezmoitemplates/dotwarden/variant`: most specific variant selection.
 pub const VARIANT: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/variant");
 
+/// `home/.chezmoitemplates/dotwarden/value`: a variable's value for this machine.
+pub const VALUE: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/value");
+
 /// Files of the fixed template set, relative to the repository root.
 pub const FILES: &[(&str, &str)] = &[
     ("home/.chezmoiignore", CHEZMOIIGNORE),
     ("home/.chezmoitemplates/dotwarden/targets", TARGETS),
     ("home/.chezmoitemplates/dotwarden/select", SELECT),
     ("home/.chezmoitemplates/dotwarden/variant", VARIANT),
+    ("home/.chezmoitemplates/dotwarden/value", VALUE),
 ];

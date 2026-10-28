@@ -56,6 +56,8 @@ pub struct Status {
     pub changes: Vec<crate::changes::Change>,
     /// Variant files and what this machine receives; a clash blocks that file only.
     pub variants: Vec<crate::variants::Summary>,
+    /// Variables whose value HOME holds differently at a reference position.
+    pub value_changes: Vec<crate::values::ValueChange>,
     pub vault: &'static str,
 }
 
@@ -79,6 +81,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             new_files: Vec::new(),
             changes: Vec::new(),
             variants: Vec::new(),
+            value_changes: Vec::new(),
             vault: "none",
         });
     }
@@ -132,6 +135,11 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
     } else {
         Vec::new()
     };
+    let value_changes = if changes.is_empty() {
+        Vec::new()
+    } else {
+        crate::values::value_changes(store, &crate::track::Ctx::load(store)?, &changes)?
+    };
     let variants = match crate::variants::this_targets(store)? {
         Some(mine) => {
             crate::variants::summaries(&crate::variants::Variants::read(&store.repo())?, &mine)
@@ -157,6 +165,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         new_files,
         changes,
         variants,
+        value_changes,
         vault: "none",
     })
 }
@@ -245,6 +254,12 @@ impl Status {
             if list.len() > 20 {
                 s.push_str(&format!("  … and {} more\n", list.len() - 20));
             }
+        }
+        for v in &self.value_changes {
+            s.push_str(&format!(
+                "Variable {} changed: {} → {} (~/{}; staging updates {})\n",
+                v.name, v.from, v.to, v.path, v.updates
+            ));
         }
         let blocked: Vec<_> = self.variants.iter().filter(|v| v.clash.is_some()).collect();
         if !blocked.is_empty() {

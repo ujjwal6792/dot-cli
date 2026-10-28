@@ -327,6 +327,8 @@ pub struct Done {
     pub paths: Vec<String>,
     pub skipped: Vec<Skipped>,
     pub dry_run: bool,
+    /// Variables that staging updates, and wiring it proposes.
+    pub notes: Vec<String>,
 }
 
 /// Stage HOME content of the selected changes (`None` selects everything that
@@ -342,8 +344,11 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     let mut refusals = Vec::new();
     let vars = crate::variants::Variants::read(&store.repo())?;
     let mine = crate::variants::this_targets(store)?;
+    let resolver = crate::values::Resolver::load(store)?;
     // (HOME path, variant file) of variant files: their content goes to the variant received here.
     let mut variant_files: Vec<(String, String)> = Vec::new();
+    // Files with references: their template is rebuilt from HOME (spec §7).
+    let mut ref_files: Vec<crate::values::RefStage> = Vec::new();
     for s in sel.unwrap_or_default() {
         if let Some(why) = scan.clashes.get(s) {
             return Err(refuse(format!("~/{s}: {why}")));
@@ -363,8 +368,26 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
         }
         let explicit = sel.is_some_and(|s| s.contains(&c.path));
         if c.state == State::Local && c.kind != "deleted" && vars.0.contains_key(&c.path) {
-            match variant_for_stage(store, &vars, mine.as_deref(), &c.path) {
-                Ok(f) => variant_files.push((c.path.clone(), f)),
+            let found = variant_for_stage(store, &vars, mine.as_deref(), &c.path).and_then(|f| {
+                match crate::values::stage_plan(
+                    store,
+                    &resolver,
+                    &c.path,
+                    &crate::variants::repo_path(&f),
+                    true,
+                ) {
+                    Ok(Some(p)) if p.unchanged => Err(MODE_ONLY.to_string()),
+                    Ok(Some(p)) => {
+                        ref_files.push(p);
+                        Ok(None)
+                    }
+                    Ok(None) => Ok(Some(f)),
+                    Err(reason) => Err(reason),
+                }
+            });
+            match found {
+                Ok(Some(f)) => variant_files.push((c.path.clone(), f)),
+                Ok(None) => {}
                 Err(reason) if explicit => {
                     refusals.push((Kind::Error, format!("~/{}: {reason}", c.path)))
                 }
@@ -395,10 +418,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 .get(&c.path)
                 .is_some_and(|e| e.source.ends_with(".tmpl")) =>
             {
-                Some((
-                    Kind::Error,
-                    "is a template; staging templates needs references (not supported yet)".into(),
-                ))
+                let src = ctx.tracked.files[&c.path].source.clone();
+                match crate::values::stage_plan(store, &resolver, &c.path, &src, false) {
+                    Ok(Some(p)) if !p.unchanged => {
+                        ref_files.push(p);
+                        continue;
+                    }
+                    Ok(_) => Some((Kind::Error, MODE_ONLY.to_string())),
+                    Err(reason) => Some((Kind::Error, reason)),
+                }
             }
             _ => None,
         };
@@ -421,7 +449,24 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .join("; ");
         return Err(DwError::new(*kind, msg).into());
     }
-    let nothing = files.is_empty() && deleted.is_empty() && variant_files.is_empty();
+    let mut notes: Vec<String> = Vec::new();
+    let mut new_values: BTreeMap<&str, &str> = BTreeMap::new();
+    for ch in ref_files.iter().flat_map(|p| &p.changes) {
+        if let Some(other) = new_values.insert(&ch.name, &ch.new)
+            && other != ch.new
+        {
+            return Err(refuse(format!(
+                "variable {} would get two values ({other:?} and {:?}); stage one file at a time",
+                ch.name, ch.new
+            )));
+        }
+        let line = crate::values::describe(&resolver, ch);
+        if !notes.contains(&line) {
+            notes.push(line);
+        }
+    }
+    let nothing =
+        files.is_empty() && deleted.is_empty() && variant_files.is_empty() && ref_files.is_empty();
     if nothing && skipped.is_empty() {
         bail!("nothing to stage");
     }
@@ -442,9 +487,19 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 let to = store.repo().join(crate::variants::repo_path(file));
                 fs::write(&to, bytes).with_context(|| format!("writing {}", to.display()))?;
             }
-            if !variant_files.is_empty() {
+            for p in &ref_files {
+                let to = store.repo().join(&p.dest);
+                fs::write(&to, &p.bytes).with_context(|| format!("writing {}", to.display()))?;
+            }
+            let all: Vec<_> = ref_files.iter().flat_map(|p| p.changes.clone()).collect();
+            crate::values::apply_changes(store, &all)?;
+            if !(variant_files.is_empty() && ref_files.is_empty()) {
                 // The rendered file now equals HOME, which is what was last written.
-                let rels: BTreeSet<&str> = variant_files.iter().map(|(r, _)| r.as_str()).collect();
+                let rels: BTreeSet<&str> = variant_files
+                    .iter()
+                    .map(|(r, _)| r.as_str())
+                    .chain(ref_files.iter().map(|p| p.rel.as_str()))
+                    .collect();
                 restore_last_written(store, &rels)?;
             }
             let changed: Vec<String> = track::unstaged(store)?.into_iter().collect();
@@ -476,6 +531,16 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             track::state_restore(store, backup)?;
             return Err(e.context("staging failed; the repository was left as before"));
         }
+        let staged: Vec<String> = files
+            .iter()
+            .cloned()
+            .chain(variant_files.iter().map(|(r, _)| r.clone()))
+            .chain(ref_files.iter().map(|p| p.rel.clone()))
+            .collect();
+        if let Some(l) = lock.as_ref() {
+            // Detection only proposes; it never fails a stage that succeeded.
+            notes.extend(crate::values::propose_wires(store, l, &staged).unwrap_or_default());
+        }
         // chezmoi's records of untracked files go once the mutation lock is free.
         drop(lock);
         track::cleanup_state(store, &results);
@@ -484,6 +549,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
         paths: files
             .iter()
             .chain(variant_files.iter().map(|(rel, _)| rel))
+            .chain(ref_files.iter().map(|p| &p.rel))
             .map(|f| track::tilde(f))
             .chain(
                 deleted
@@ -493,8 +559,11 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .collect(),
         skipped,
         dry_run,
+        notes,
     })
 }
+
+const MODE_ONLY: &str = "only its mode differs; mode changes of variant files are not supported";
 
 /// The variant file that receives the HOME content of `rel` when staging on this
 /// machine: the variant this machine currently receives, else the default.
@@ -517,7 +586,7 @@ fn variant_for_stage(
     };
     let stored = fs::read(store.repo().join(repo_path(&file))).ok();
     if stored.is_some() && stored == fs::read(store.dirs.home.join(rel)).ok() {
-        Err("only its mode differs; mode changes of variant files are not supported".into())
+        Err(MODE_ONLY.into())
     } else if stored.is_some() {
         Ok(file)
     } else {
@@ -578,6 +647,7 @@ pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<D
         paths: changes.iter().map(tilde).collect(),
         skipped: Vec::new(),
         dry_run,
+        notes: Vec::new(),
     };
     if dry_run {
         return Ok(done);
@@ -1089,6 +1159,7 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
     let scan = scan(store, &ctx)?;
     let staged = staged_paths(store)?;
     let vars = crate::variants::Variants::read(&repo)?;
+    let vchanges = crate::values::value_changes(store, &ctx, &scan.changes)?;
     let mut out = Vec::new();
     for c in &scan.changes {
         let wanted = if c.kind == "repo" {
@@ -1159,10 +1230,20 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
             }
             _ => continue,
         };
+        let notes: String = vchanges
+            .iter()
+            .filter(|v| v.path == c.path)
+            .map(|v| {
+                format!(
+                    "# variable {} changed: {} → {} (staging updates {})\n",
+                    v.name, v.from, v.to, v.updates
+                )
+            })
+            .collect();
         out.push(FileDiff {
             path: tilde(c),
             state: c.state,
-            diff,
+            diff: notes + &diff,
         });
     }
     Ok(out)

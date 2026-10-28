@@ -1,0 +1,12 @@
+{{- /* Value of a variable for this machine. Call with
+       (dict "data" . "name" "<NAME>"). The most specific matching override wins
+       (dotwarden/select), else the default. Prints the value without a newline.
+       An unknown variable is an error. Tracked files reference a variable with
+       includeTemplate and this same dict (the template action is not available inside included variant files). */ -}}
+{{- $v := dig "dotwarden" "values" .name (dict) .data -}}
+{{- if not $v -}}
+{{- fail (printf "dotwarden: variable %q does not exist" .name) -}}
+{{- end -}}
+{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- $w := includeTemplate "dotwarden/select" (dict "targets" $targets "entries" (get $v "overrides" | default (list)) "what" (printf "overrides of %s" .name)) -}}
+{{- if $w }}{{ (fromJson $w).value }}{{ else }}{{ get $v "default" }}{{ end -}}

@@ -473,6 +473,12 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         Action::VariantRemove { .. } => {
             g.repo.extend(crate::variants::guard(store, action)?);
         }
+        Action::ValueSet { .. } | Action::ValueUnset { .. } => {
+            g.repo.extend(crate::values::guard(store, ctx, action)?);
+        }
+        Action::ValueWire { .. } => {
+            g.repo.extend(crate::values::guard(store, ctx, action)?);
+        }
         Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
             g.repo
                 .insert(format!("remote:{name}"), remote_state(store, name));
@@ -1383,6 +1389,10 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             let expected = crate::variants::exec(store, &item.action)?;
             verify_and_stage(store, &expected, &[DATA_FILE])
         }
+        Action::ValueSet { .. } | Action::ValueUnset { .. } | Action::ValueWire { .. } => {
+            let expected = crate::values::exec(store, &item.action)?;
+            verify_and_stage(store, &expected, &[])
+        }
         Action::Assign { .. }
         | Action::MachineAdd { .. }
         | Action::MachineRename { .. }
@@ -1420,9 +1430,10 @@ pub(crate) fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()
 /// Apply `items` in order, each all-or-nothing. A stale item is skipped and a
 /// failed one is rolled back (repository and chezmoi state); the others still
 /// apply. The caller holds the lock.
-pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<ItemResult>> {
+pub fn apply_items(store: &Store, lock: &Lock, items: &[Item]) -> Result<Vec<ItemResult>> {
     ensure_repo_clean(store)?;
     let mut results = Vec::new();
+    let mut tracked_now: Vec<String> = Vec::new();
     for item in items {
         let result = |status, message: Option<String>, staged| ItemResult {
             id: item.id,
@@ -1465,6 +1476,9 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
                 if let Action::Untrack { files, .. } = &item.action {
                     r.forgotten = files.clone();
                 }
+                if let Action::Track { files, .. } = &item.action {
+                    tracked_now.extend(files.iter().filter(|f| !f.symlink).map(|f| f.path.clone()));
+                }
                 results.push(r);
             }
             Err(e) => {
@@ -1481,6 +1495,10 @@ pub fn apply_items(store: &Store, _lock: &Lock, items: &[Item]) -> Result<Vec<It
                 results.push(result(Outcome::Failed, Some(message), vec![]));
             }
         }
+    }
+    if !tracked_now.is_empty() {
+        // Detection only proposes; a failure here must not fail the apply.
+        let _ = crate::values::propose_wires(store, lock, &tracked_now);
     }
     Ok(results)
 }

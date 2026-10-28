@@ -78,7 +78,8 @@ repo/
   hide                         hide rules (gitignore syntax)
   home/                        chezmoi source state root
     .chezmoiignore             fixed template written by dotwarden (assignment logic)
-    .chezmoidata/dotwarden.toml  registry, assignments, variables, tracked folders, variant index
+    .chezmoidata/dotwarden.toml  assignments, tracked folders, variant index
+    .chezmoidata/dotwarden-values/<NAME>.toml  one variable (default + overrides)
     .chezmoitemplates/dotwarden/ helper templates (variant selection, references)
     .dotwarden/variants/…      variant contents (leading dot: ignored as targets)
     .dotwarden/vault/          recipient.txt, identity.age, recovery.age,
@@ -161,12 +162,18 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    entries or files. Retired machines have no targets: chezmoi on a retired
    machine fails with `machine "<name>" is retired and has no targets`. A tracked file
    using variants is a template such as `home/dot_gitconfig.tmpl`; the default
-   content is a variant file too (`include` returns file content raw, so
-   `{{` in a variant is never evaluated):
+   content is a variant file too. A variant file is included raw (`{{` is never
+   evaluated) unless it contains references (§7): the marker
+   `{{ includeTemplate "dotwarden/value"` makes the template render it:
    ```
    {{- $v := includeTemplate "dotwarden/variant" (dict "data" . "path" ".gitconfig") | trim -}}
-   {{- if $v }}{{ include (printf ".dotwarden/variants/%s" $v) }}{{ else }}{{ include ".dotwarden/variants/.gitconfig/default" }}{{ end -}}
+   {{- $f := printf ".dotwarden/variants/%s" (default ".gitconfig/default" $v) -}}
+   {{- $t := include $f -}}
+   {{- if contains "{{ includeTemplate \"dotwarden/value\"" $t }}{{ includeTemplate $f $ }}{{ else }}{{ $t }}{{ end -}}
    ```
+   Verified in ticket 7: `includeTemplate` accepts any path under the source
+   root and runs the file as a template with the given data, but the `template`
+   action is not defined inside it, so references use `includeTemplate`.
    Variant files are `home/.dotwarden/variants/<target path>/<target with : as ->`
    (`.gitconfig/machine-mac`) and `<target path>/default`; a name already taken
    (after a machine rename) gets `-2`, `-3`, … appended. A source file's other
@@ -215,6 +222,12 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
      overwrite the shared version.
    - Tracked folders are recorded as `dotwarden.tracked_folders = ["<target path>", …]`
      in `.chezmoidata/dotwarden.toml`.
+
+10. **Variables (ticket 7).** `home/.chezmoidata/dotwarden-values/<NAME>.toml`
+    holds `[dotwarden.values.<NAME>]` (`kind = "variable"`, `default`, and
+    `[[…overrides]]` with `target`/`value`); the files deep-merge into
+    `dotwarden.values`. The `dotwarden/value` helper (below) resolves a name
+    through `dotwarden/select`. See §7.
 
 Exact template code (written once into every repository; the files in
 `assets/home/` are the source of truth and are embedded in the binary):
@@ -308,6 +321,18 @@ Exact template code (written once into every repository; the files in
 {{- $winner := includeTemplate "dotwarden/select" (dict "targets" $targets "entries" $entries "what" (printf "variants for %s" .path)) -}}
 {{- if $winner }}{{ (fromJson $winner).file }}{{ end -}}
 ```
+
+`home/.chezmoitemplates/dotwarden/value`
+```
+{{- $v := dig "dotwarden" "values" .name (dict) .data -}}
+{{- if not $v -}}
+{{- fail (printf "dotwarden: variable %q does not exist" .name) -}}
+{{- end -}}
+{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- $w := includeTemplate "dotwarden/select" (dict "targets" $targets "entries" (get $v "overrides" | default (list)) "what" (printf "overrides of %s" .name)) -}}
+{{- if $w }}{{ (fromJson $w).value }}{{ else }}{{ get $v "default" }}{{ end -}}
+```
+(the shipped file also starts with a comment.)
 
 ## 4. Machines and targeting (ADR 0005)
 
@@ -440,7 +465,53 @@ one-time human confirmation that the remote is private, stored per remote in
 
 - **Values** table: entries are `secret` or `variable`, each with a default and
   per-target overrides (specificity as §4).
-- Variables live in plain `.chezmoidata/dotwarden.toml`. Secrets live in
+- **Variables** live in plain data, one file per variable
+  (`.chezmoidata/dotwarden-values/<NAME>.toml`, so two computers editing
+  different variables never conflict textually; a machine rename rewrites
+  `machine:<old>` overrides there). Names are 1–64 of `[A-Za-z0-9_-]`, unique
+  ignoring case (they are file names). A value is 1–1024 characters on one
+  line. A machine receives the most specific matching override, else the
+  default (a clash at one level is an error naming the targets).
+  `dw values list|show NAME|set-variable NAME VALUE [--target T]|
+  unset-variable NAME [--target T]|wire PATH NAME` — each change is one pending
+  item with an exact preview (files, data, the value each registry machine
+  receives before and after, files using the variable); any agent may add and
+  apply them. An override needs a default first; removing a variable that
+  files still reference is refused.
+- **Reference syntax** (what users see in the repository):
+  `{{ includeTemplate "dotwarden/value" (dict "data" . "name" "NAME") }}`.
+  A file with references is stored as a template (`dot_x` → `dot_x.tmpl`);
+  every `{{` of its ordinary text is written as `{{ "{{" }}` (and a final `{`
+  before a reference as `{{ "{" }}`), so literal braces survive. A template
+  holding any other action is not one dotwarden wrote: wiring and staging it are
+  refused. In a variant the references live in the variant file (it is rendered
+  as a template when it contains the marker, else included raw), so only the
+  variants wired gain them; a variant file whose last reference disappears is
+  stored raw again.
+- **Wire** (`dw values wire PATH NAME`): replaces every occurrence of the
+  variable's value *for this machine* in the stored content (for a variant file,
+  the variant this machine receives) by a reference; the preview names the
+  occurrences' lines. HOME is not touched, and the file renders identically
+  here; other machines render their own value.
+- **Reverse mapping on stage.** HOME is diffed (by character) against what the
+  stored template renders on this machine; each reference position that still
+  holds the resolved value stays a reference; edits elsewhere go into the
+  literal text. If the text at a reference position changed, the reference is
+  kept and the variable is reported changed: `dw status` ("Variable NAME
+  changed: a → b"), `dw diff` (a `# variable NAME changed` line) and the stage
+  output. Staging then writes the new value to the variable at the most
+  specific target this machine matched (that override, else the default; the
+  message names which), in the same staged change. Text at a reference position
+  that was deleted drops the reference. Refused: different new text at two
+  positions of one variable, an edit too large to be a value, files that are
+  not UTF-8. Other files that reference the changed variable then show it as
+  Incoming (their HOME holds the old value). The working diff never contains
+  reference text.
+- **Detection**: after `track` and `stage`, when a file's content contains this
+  machine's value of an existing variable (3+ characters), a pending `wire`
+  item is proposed (never applied automatically) and reported.
+- The `secret` kind plugs into the same table and reference mechanism (ticket 8).
+- Secrets live in
   `vault/secrets/<NAME>.age` (default + overrides encrypted together); names are
   visible.
 - **Encrypted files** (e.g. `~/.ssh/id_ed25519`) are stored whole in
@@ -468,8 +539,11 @@ one-time human confirmation that the remote is private, stored per remote in
 - **Masking**: no CLI output, diff, log, pending item, activity record or preview
   ever contains a secret value. When locked, lines of HOME that correspond to
   reference positions are hidden in diffs.
-- The TUI Values screen (`V`) shows names, kinds, targets; secret values only
-  while unlocked and only in the TUI.
+- The TUI Values screen (`V`) shows names, kinds, defaults, overrides per
+  target and the files using each variable (secret rows arrive with ticket 8;
+  their values only while unlocked and only in the TUI). `Enter` edits the
+  default in an input box, `o` adds an override (`TARGET VALUE`), `n` creates a
+  variable (`NAME VALUE`); each becomes a pending item. `Esc` returns.
 - Honest boundary: a value applied to HOME is plaintext on disk and readable by any
   process running as the user. Dotwarden protects the repository, its own outputs
   and logs; it does not sandbox HOME.

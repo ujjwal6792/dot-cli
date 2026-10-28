@@ -19,8 +19,7 @@ pub fn is_single_panel(area: Rect) -> bool {
     area.width < NARROW_WIDTH || area.height < SHORT_HEIGHT
 }
 
-const FOOTER: &str =
-    " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · v range · r refresh";
+const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · V values · v range · r refresh";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
@@ -101,12 +100,77 @@ fn panel_block(app: &App, panel: Panel) -> Block<'static> {
         })
 }
 
+fn draw_values(f: &mut Frame, app: &App, area: Rect) {
+    let Some(v) = &app.values else { return };
+    let input_h = if v.input.is_some() { 3 } else { 0 };
+    let [table, input] =
+        Layout::vertical([Constraint::Min(3), Constraint::Length(input_h)]).areas(area);
+    let mut lines = vec![Line::styled(
+        format!(
+            "{:<18} {:<9} {:<16} {:<34} {}",
+            "NAME", "KIND", "DEFAULT", "OVERRIDES", "FILES"
+        ),
+        Style::default().add_modifier(Modifier::BOLD),
+    )];
+    if v.rows.is_empty() {
+        lines.push(Line::from("No values yet. n creates a variable."));
+    }
+    for (i, r) in v.rows.iter().enumerate() {
+        let overrides = r
+            .overrides
+            .iter()
+            .map(|o| format!("{}={}", o.target, o.value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let files = r
+            .files
+            .iter()
+            .map(|f| format!("~/{f}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let style = if i == v.selected {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(
+            format!(
+                "{:<18} {:<9} {:<16} {:<34} {}",
+                r.name, r.kind, r.default, overrides, files
+            ),
+            style,
+        ));
+    }
+    f.render_widget(
+        Paragraph::new(lines).block(
+            Block::default()
+                .borders(Borders::ALL)
+                .title(" Values · Enter edit default · o add override · n new · Esc back "),
+        ),
+        table,
+    );
+    if let Some(i) = &v.input {
+        let prompt = match &i.edit {
+            super::app::ValueEdit::Default(n) => format!(" {n} default "),
+            super::app::ValueEdit::Override(n) => format!(" {n} override: TARGET VALUE "),
+            super::app::ValueEdit::New => " new variable: NAME VALUE ".to_string(),
+        };
+        f.render_widget(
+            Paragraph::new(format!("{}█", i.text))
+                .block(Block::default().borders(Borders::ALL).title(prompt)),
+            input,
+        );
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.size = (area.width, area.height);
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-    if is_single_panel(area) {
+    if app.values.is_some() {
+        draw_values(f, app, body);
+    } else if is_single_panel(area) {
         draw_panel(f, app, app.focus, body, true);
     } else {
         let left_w = (area.width / 3).clamp(28, 44);
@@ -616,7 +680,11 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                     l.push(Line::styled(
                         format!(
                             "    {} {}",
-                            if c.action == "add" { "+" } else { "-" },
+                            match c.action.as_str() {
+                                "add" => "+",
+                                "change" => "~",
+                                _ => "-",
+                            },
                             c.source
                         ),
                         Style::default().fg(Color::DarkGray),
