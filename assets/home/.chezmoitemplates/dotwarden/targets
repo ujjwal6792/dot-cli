@@ -7,18 +7,12 @@
 {{- fail "dotwarden: chezmoi data 'dotwardenMachine' is missing; run chezmoi through dotwarden" -}}
 {{- end -}}
 {{- $name := .dotwardenMachine.name -}}
-{{- $machine := dict -}}
-{{- $retired := false -}}
-{{- range (dig "dotwarden" "machines" (list) .) -}}
-{{- if eq .name $name -}}
-{{- if get . "retired" | default false }}{{ $retired = true }}{{ else }}{{ $machine = . }}{{ end -}}
-{{- end -}}
-{{- end -}}
-{{- if $retired -}}
-{{- fail (printf "dotwarden: machine %q is retired and has no targets" $name) -}}
-{{- end -}}
+{{- $machine := dig "dotwarden" "machines" $name (dict) . -}}
 {{- if not $machine -}}
 {{- fail (printf "dotwarden: machine %q is not in the machine registry" $name) -}}
+{{- end -}}
+{{- if get $machine "retired" | default false -}}
+{{- fail (printf "dotwarden: machine %q is retired and has no targets" $name) -}}
 {{- end -}}
 {{- $targets := list (printf "platform:%s" $machine.platform) (printf "distribution:%s" $machine.distribution) (printf "machine:%s" $machine.name) -}}
 {{- range $machine.families }}{{ $targets = append $targets (printf "family:%s" .) }}{{ end -}}

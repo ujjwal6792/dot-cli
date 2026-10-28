@@ -27,6 +27,8 @@ pub const KEY_HIDE: &str = "hide";
 /// Mutations never supersede one another: every one runs, in the order requested.
 pub const KEY_DIFF: &str = "diff";
 pub const KEY_ACTION: &str = "action";
+/// The background fetch; a newer one cancels an older.
+pub const KEY_FETCH: &str = "fetch";
 
 /// The outcome of a mutation (toggle, drop, apply).
 #[derive(Debug)]
@@ -56,6 +58,8 @@ pub enum Payload {
     /// The diff of the selected change, styled by delta when available.
     Diff(Result<ratatui::text::Text<'static>, String>),
     Action(Result<ActionReport, String>),
+    /// A background fetch: `None` when there was nothing to fetch from.
+    Fetch(Result<Option<String>, String>),
 }
 
 #[derive(Debug)]

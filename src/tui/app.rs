@@ -10,7 +10,7 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
-    ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_HIDE, KEY_LISTING, KEY_PENDING,
+    ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING, KEY_PENDING,
     KEY_PREVIEW, KEY_STATUS, KEY_TRACKED, Payload,
 };
 use crate::changes::{self, Change, CommitOpts, State};
@@ -100,6 +100,11 @@ pub enum ActionReq {
     /// Read the last commit message to open the amend box with.
     LoadAmend,
     Discard(Vec<String>),
+    /// Write incoming files to HOME: these paths, or all when `None`.
+    ApplyIncoming(Option<Vec<String>>),
+    Fetch,
+    Pull,
+    Push,
 }
 
 /// The commit message being typed.
@@ -123,6 +128,10 @@ pub enum Dialog {
     Commit(CommitBox),
     /// `d` in Changes: y/n before overwriting these HOME paths.
     ConfirmDiscard(Vec<String>),
+    /// Enter / Space / `a` on the Incoming tab: y/n before writing to HOME.
+    ConfirmApply(Option<Vec<String>>),
+    /// `P`: y/n before pushing.
+    ConfirmPush,
 }
 
 #[derive(Debug)]
@@ -162,6 +171,7 @@ pub struct App {
     hide_stamp: Option<crate::hide::HideStamp>,
     actions: VecDeque<ActionReq>,
     action_running: bool,
+    last_fetch: Option<std::time::Instant>,
 }
 
 impl App {
@@ -191,6 +201,7 @@ impl App {
             hide_stamp: None,
             actions: VecDeque::new(),
             action_running: false,
+            last_fetch: None,
         }
     }
 
@@ -209,6 +220,25 @@ impl App {
         self.refresh_tracking();
         self.refresh_hide();
         self.reload_listing(None);
+        self.background_fetch();
+    }
+
+    /// Fetch every remote without blocking; it never pulls or applies.
+    fn background_fetch(&mut self) {
+        self.last_fetch = Some(std::time::Instant::now());
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_FETCH, move |cancel| {
+            Payload::Fetch(
+                (|| {
+                    if !store.is_initialised() || crate::remote::names(&store)?.is_empty() {
+                        return Ok(None);
+                    }
+                    let f = crate::remote::fetch(&store, true, Some(cancel))?;
+                    Ok(Some(format!("Fetched {}", f.remotes.join(", "))))
+                })()
+                .map_err(|e: anyhow::Error| format!("fetch failed: {e:#}")),
+            )
+        });
     }
 
     /// Re-read the hide rules; the result replaces them only when the file changed.
@@ -315,6 +345,9 @@ impl App {
             Event::Input(_) => {}
             Event::Job(done) => self.handle_job(done),
             Event::Tick => {
+                if self.last_fetch.is_none_or(|t| t.elapsed() >= FETCH_EVERY) {
+                    self.background_fetch();
+                }
                 self.refresh_status();
                 self.refresh_tracking();
                 self.refresh_hide();
@@ -391,6 +424,10 @@ impl App {
                 self.refresh_status();
                 self.pump_actions();
             }
+            Payload::Fetch(r) => match r {
+                Ok(_) => self.refresh_status(),
+                Err(e) => self.message = Some(e),
+            },
             Payload::Preview { path, text } => {
                 if self.files.selected_path().as_deref() == Some(path.as_path()) {
                     self.preview = match text {
@@ -480,6 +517,16 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmDiscard(paths)),
             },
+            Some(Dialog::ConfirmApply(sel)) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::ApplyIncoming(sel)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::ConfirmApply(sel)),
+            },
+            Some(Dialog::ConfirmPush) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Push),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::ConfirmPush),
+            },
             Some(Dialog::Result(_)) | None => {}
         }
     }
@@ -543,6 +590,11 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
             KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            KeyCode::Enter if tab == 2 => {
+                if let Some(c) = selected {
+                    self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path])));
+                }
+            }
             KeyCode::Enter => self.request_diff(),
             KeyCode::Char(' ') => match (tab, selected) {
                 (0, Some(c)) => self.request_action(ActionReq::Stage(Some(vec![c.path]))),
@@ -550,13 +602,16 @@ impl App {
                     self.message = Some("repository files are unstaged together: press a".into())
                 }
                 (1, Some(c)) => self.request_action(ActionReq::Unstage(Some(vec![c.path]))),
-                (2 | 3, Some(_)) => self.message = Some(READ_ONLY.into()),
+                (2, Some(c)) => self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path]))),
+                (3, Some(_)) => self.message = Some(CONFLICT_BLOCKED.into()),
                 _ => {}
             },
             KeyCode::Char('a') => match tab {
                 0 => self.request_action(ActionReq::Stage(None)),
                 1 => self.request_action(ActionReq::Unstage(None)),
-                _ => self.message = Some(READ_ONLY.into()),
+                2 if rows > 0 => self.dialog = Some(Dialog::ConfirmApply(None)),
+                2 => {}
+                _ => self.message = Some(CONFLICT_BLOCKED.into()),
             },
             KeyCode::Char('c') => {
                 if self.change_counts()[1] == 0 {
@@ -615,6 +670,9 @@ impl App {
                 return self.focus = Panel::ALL[c as usize - '1' as usize];
             }
             KeyCode::Char('0') => return self.focus = Panel::Pending,
+            KeyCode::Char('f') => return self.request_action(ActionReq::Fetch),
+            KeyCode::Char('p') => return self.request_action(ActionReq::Pull),
+            KeyCode::Char('P') => return self.dialog = Some(Dialog::ConfirmPush),
             KeyCode::Char('r') => {
                 self.refresh_tracking();
                 self.refresh_hide();
@@ -753,7 +811,11 @@ fn done_message(verb: &str, d: &changes::Done) -> String {
     m
 }
 
-const READ_ONLY: &str = "incoming changes and conflicts are read-only for now";
+const CONFLICT_BLOCKED: &str =
+    "conflicts are not applied: they changed here and in the repository (resolving arrives later)";
+
+/// How often the background fetch repeats (the preference comes later).
+const FETCH_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
 
 fn tab_of(s: State) -> usize {
     match s {
@@ -772,11 +834,17 @@ fn render_diff(
     cancel: &crate::exec::CancelToken,
 ) -> anyhow::Result<ratatui::text::Text<'static>> {
     use ansi_to_tui::IntoText;
-    if matches!(c.state, State::Incoming | State::Conflict) {
+    if c.state == State::Incoming {
         return Ok(format!(
-            "~/{} has an {} change.\n\nIt is shown read-only for now; applying and resolving come later.",
-            c.path,
-            c.state.label()
+            "~/{} has an incoming change.\n\nSpace or Enter applies it to HOME (a snapshot is taken first); a applies all.",
+            c.path
+        )
+        .into());
+    }
+    if c.state == State::Conflict {
+        return Ok(format!(
+            "~/{} changed here and in the repository.\n\nIt is not applied; resolving conflicts arrives later.",
+            c.path
         )
         .into());
     }
@@ -901,6 +969,47 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 } else {
                     format!("{} items", paths.len())
                 }
+            )))
+        }
+        ActionReq::ApplyIncoming(sel) => {
+            let a = changes::apply_incoming(store, sel.as_deref(), false)?;
+            if !a.failed.is_empty() {
+                anyhow::bail!(
+                    "could not write {}: {}",
+                    a.failed.join(", "),
+                    a.error.unwrap_or_default()
+                );
+            }
+            let snap = a
+                .snapshot
+                .map_or(String::new(), |id| format!(", snapshot {id}"));
+            Ok(report(format!("Applied {} file(s){snap}", a.applied.len())))
+        }
+        ActionReq::Fetch => {
+            let f = crate::remote::fetch(store, true, None)?;
+            Ok(report(match (f.ahead, f.behind) {
+                (Some(a), Some(b)) => {
+                    format!("Fetched {}: ahead {a}, behind {b}", f.remotes.join(", "))
+                }
+                _ => format!("Fetched {}", f.remotes.join(", ")),
+            }))
+        }
+        ActionReq::Pull => {
+            let p = crate::remote::pull(store, None)?;
+            Ok(report(if p.commits == 0 {
+                format!("Up to date with {}", p.remote)
+            } else {
+                format!(
+                    "Pulled {} commit(s) from {}: see the Incoming tab",
+                    p.commits, p.remote
+                )
+            }))
+        }
+        ActionReq::Push => {
+            let done = crate::remote::push(store, &[crate::remote::default_remote(store)?])?;
+            Ok(report(format!(
+                "Pushed {} to {}",
+                done[0].branch, done[0].remote
             )))
         }
         ActionReq::Apply(ids) => {

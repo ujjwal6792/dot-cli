@@ -280,7 +280,11 @@ impl Store {
 
     pub fn write_local_machine(&self, name: &str) -> Result<()> {
         self.ensure_dirs()?;
-        let mut t = toml::Table::new();
+        // Keep what else lives in machine.toml (confirmed remotes).
+        let mut t = fs::read_to_string(self.dirs.machine_toml())
+            .ok()
+            .and_then(|s| toml::from_str::<toml::Table>(&s).ok())
+            .unwrap_or_default();
         t.insert("name".into(), name.into());
         fsutil::write_atomic(&self.dirs.machine_toml(), toml::to_string(&t)?)
     }

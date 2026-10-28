@@ -659,6 +659,95 @@ pub fn plan_discard(store: &Store, rel: &str, requester: &str) -> Result<Item> {
     track::new_item(store, requester, action, summary, preview, &ctx)
 }
 
+// ---- apply incoming ------------------------------------------------------
+
+#[derive(Debug, Serialize)]
+pub struct Applied {
+    pub dry_run: bool,
+    pub applied: Vec<String>,
+    /// Files changed on both sides: apply is blocked until they are resolved.
+    pub conflicts: Vec<String>,
+    /// Files chezmoi could not write (the others were written regardless).
+    pub failed: Vec<String>,
+    pub snapshot: Option<String>,
+    pub error: Option<String>,
+}
+
+/// Write Incoming files to HOME, snapshotting them first. `paths` selects files
+/// or folders (`None`: all). Only Incoming files are ever written: chezmoi is
+/// given exactly those targets and no `--force`, so a file that changed in HOME
+/// after the scan is refused by chezmoi instead of overwritten. A Conflict named
+/// exactly is refused (exit 5); with `--all` or a folder it is skipped and listed.
+pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) -> Result<Applied> {
+    let _lock = (!dry_run).then(|| store.lock()).transpose()?;
+    let ctx = Ctx::load(store)?;
+    let found = scan(store, &ctx)?;
+    let pick = |state: State| -> Vec<String> {
+        let mut v: Vec<String> = found
+            .changes
+            .iter()
+            .filter(|c| c.state == state && c.kind != "repo" && selected(paths, &c.path))
+            .map(|c| c.path.clone())
+            .collect();
+        v.sort();
+        v
+    };
+    let files = pick(State::Incoming);
+    let conflicts = pick(State::Conflict);
+    for p in paths.unwrap_or_default() {
+        if conflicts.contains(p) {
+            return Err(DwError::new(
+                Kind::Conflict,
+                format!(
+                    "~/{p} changed here and in the repository; applying would lose a side. \
+                     Resolving conflicts arrives later"
+                ),
+            )
+            .into());
+        }
+        if !files.iter().any(|f| covers(p, f)) && !conflicts.iter().any(|f| covers(p, f)) {
+            return Err(refuse(format!("nothing incoming at ~/{p}")));
+        }
+    }
+    let mut out = Applied {
+        dry_run,
+        applied: files.clone(),
+        conflicts,
+        failed: Vec::new(),
+        snapshot: None,
+        error: None,
+    };
+    if dry_run || files.is_empty() {
+        return Ok(out);
+    }
+    let actor = agent(store).unwrap_or_else(|| "human".into());
+    out.snapshot = snapshot::take(store, &files, "apply", &actor)?.map(|s| s.id);
+    let mut errors = Vec::new();
+    for chunk in files.chunks(CHUNK) {
+        let mut args: Vec<std::ffi::OsString> = vec!["apply".into(), "--keep-going".into()];
+        args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
+        if let Err(e) = store.chezmoi_locked(&args) {
+            errors.push(format!("{e:#}"));
+        }
+    }
+    let still: BTreeSet<String> = scan(store, &Ctx::load(store)?)?
+        .changes
+        .into_iter()
+        .filter(|c| c.state == State::Incoming)
+        .map(|c| c.path)
+        .collect();
+    out.failed = files
+        .iter()
+        .filter(|f| still.contains(*f))
+        .cloned()
+        .collect();
+    out.applied.retain(|f| !still.contains(f));
+    if !out.failed.is_empty() {
+        out.error = Some(errors.join("; "));
+    }
+    Ok(out)
+}
+
 // ---- commit ------------------------------------------------------------
 
 pub struct CommitOpts {

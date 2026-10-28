@@ -235,7 +235,7 @@ fn the_main_view_shows_the_selected_diff_styled_by_delta() {
 }
 
 #[test]
-fn incoming_changes_are_listed_read_only() {
+fn incoming_files_are_applied_after_a_y_n_prompt_with_a_snapshot() {
     let t = edited();
     t.dw_ok(&["discard", ".a", "--yes"]);
     let repo = t.dirs().repo();
@@ -250,6 +250,57 @@ fn incoming_changes_are_listed_read_only() {
         "{screen}"
     );
     tui.press(' ');
-    assert!(tui.app.message.as_deref().unwrap().contains("read-only"));
+    assert!(matches!(tui.app.dialog, Some(Dialog::ConfirmApply(_))));
+    tui.press('n');
     assert_eq!(tui.changes(), [".a:incoming"]);
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "one\n");
+
+    tui.press('a');
+    tui.press('y');
+    assert_eq!(
+        fs::read_to_string(tui.t.home.join(".a")).unwrap(),
+        "remote\n"
+    );
+    assert!(tui.changes().is_empty());
+    assert_eq!(
+        tui.t.dw_json(&["snapshot", "list", ".a"])[0]["reason"],
+        "apply"
+    );
+}
+
+#[test]
+fn p_f_and_push_work_from_the_keyboard_and_push_asks_first() {
+    let t = edited();
+    t.dw_ok(&["discard", ".a", "--yes"]);
+    let remote = t.root.path().join("r.git");
+    t.git(
+        &t.home,
+        &[
+            "init",
+            "--bare",
+            "--quiet",
+            "--initial-branch=main",
+            remote.to_str().unwrap(),
+        ],
+    );
+    t.dw_ok(&["remote", "add", "origin", remote.to_str().unwrap(), "--yes"]);
+    let mut tui = open(t);
+    tui.press('P');
+    assert!(matches!(tui.app.dialog, Some(Dialog::ConfirmPush)));
+    tui.press('n');
+    assert!(tui.t.git(&remote, &["branch", "--list"]).is_empty());
+    tui.press('P');
+    tui.press('y');
+    let head = tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]);
+    assert_eq!(tui.t.git(&remote, &["rev-parse", "main"]), head);
+    tui.press('f');
+    assert!(
+        tui.app
+            .message
+            .as_deref()
+            .unwrap()
+            .contains("ahead 0, behind 0")
+    );
+    tui.press('p');
+    assert!(tui.app.message.as_deref().unwrap().contains("Up to date"));
 }

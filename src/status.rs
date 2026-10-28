@@ -80,20 +80,16 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         .stdout
         .lines()
         .count();
-    let upstream = trimmed(
-        store,
-        &[
-            "rev-parse",
-            "--abbrev-ref",
-            "--symbolic-full-name",
-            "@{upstream}",
-        ],
-        cancel,
-    );
-    let (ahead, behind) = match upstream {
-        Some(_) => trimmed(
+    let upstream = crate::remote::tracking_ref(store);
+    let (ahead, behind) = match &upstream {
+        Some(u) => trimmed(
             store,
-            &["rev-list", "--left-right", "--count", "HEAD...@{upstream}"],
+            &[
+                "rev-list",
+                "--left-right",
+                "--count",
+                &format!("HEAD...{u}"),
+            ],
             cancel,
         )
         .and_then(|s| {
@@ -212,7 +208,12 @@ impl Status {
                 } else {
                     format!("~/{}", c.path)
                 };
-                s.push_str(&format!("  {:<9} {shown}\n", c.kind));
+                let kind = if state == State::Incoming && c.kind == "new" {
+                    "incoming (new file)"
+                } else {
+                    c.kind
+                };
+                s.push_str(&format!("  {kind:<9} {shown}\n"));
             }
             if list.len() > 20 {
                 s.push_str(&format!("  … and {} more\n", list.len() - 20));
