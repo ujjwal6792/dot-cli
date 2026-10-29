@@ -432,6 +432,9 @@ pub enum ValuesCmd {
         /// Add the name only; no value.
         #[arg(long)]
         placeholder: bool,
+        /// Apply immediately (the default: a value can never wait in the pending list).
+        #[arg(long)]
+        apply: bool,
         /// Show what would change without changing anything.
         #[arg(long)]
         dry_run: bool,
@@ -849,6 +852,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
                     name,
                     target,
                     placeholder,
+                    apply: _,
                     dry_run,
                 } => vault_cmds::add_secret(
                     &store,

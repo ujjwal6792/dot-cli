@@ -128,7 +128,12 @@ pub fn add_secret(
                 target.map_or(String::new(), |t| format!(" for {t}"))
             )
         };
-        return done(json, &format!("dry run: would {what}"));
+        if json {
+            print_json(&json!({"dry_run": true, "apply": true, "would": what}))?;
+        } else {
+            println!("Dry run: nothing was changed. Would {what}.");
+        }
+        return Ok(ExitCode::SUCCESS);
     }
     if placeholder {
         crate::secrets::add_placeholder(store, name)?;

@@ -666,3 +666,30 @@ fn wiring_a_secret_compares_the_real_value_and_needs_the_unlock() {
         r.all()
     );
 }
+
+#[test]
+fn add_secret_has_apply_and_a_dry_run_that_changes_nothing() {
+    let t = env();
+    t.dw_ok(&["init", "--name", "mac"]);
+    init_vault(&t);
+    let h = [("DOTWARDEN_TEST_SECRET_VALUE", "Dry-Run-Value-123")];
+    let dry: serde_json::Value = serde_json::from_str(&ok(
+        &t,
+        &h,
+        &["values", "add-secret", "NEW", "--dry-run", "--json"],
+    ))
+    .unwrap();
+    assert_eq!(dry["dry_run"], true);
+    assert!(
+        !repo(&t)
+            .join("home/.dotwarden/vault/secrets/NEW.age")
+            .exists()
+    );
+    assert!(!dry.to_string().contains("Dry-Run-Value"));
+    ok(&t, &h, &["values", "add-secret", "NEW", "--apply"]);
+    assert!(
+        repo(&t)
+            .join("home/.dotwarden/vault/secrets/NEW.age")
+            .is_file()
+    );
+}
