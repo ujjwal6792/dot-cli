@@ -73,6 +73,10 @@ pub enum Command {
         /// Files, symlinks or folders to track.
         #[arg(required = true, num_args = 1..)]
         paths: Vec<String>,
+        /// Store files holding detected secrets as they are (humans only; the
+        /// default refuses, or moves the secret to the vault).
+        #[arg(long)]
+        allow_plaintext: bool,
         /// Apply immediately instead of leaving the items in the pending list.
         #[arg(long)]
         apply: bool,
@@ -226,6 +230,10 @@ pub enum Command {
         /// Stage every change that can be staged.
         #[arg(long, conflicts_with = "paths")]
         all: bool,
+        /// Store files holding detected secrets as they are (humans only; the
+        /// default refuses, or moves the secret to the vault).
+        #[arg(long)]
+        allow_plaintext: bool,
         /// Show what would be staged without changing anything.
         #[arg(long)]
         dry_run: bool,
@@ -770,9 +778,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Track {
             paths,
+            allow_plaintext,
             apply,
             dry_run,
-        } => return cmds::track_cmd(&store, Plan::Track, &paths, apply, dry_run, json),
+        } => {
+            cmds::allow_plaintext(&store, allow_plaintext)?;
+            return cmds::track_cmd(&store, Plan::Track, &paths, apply, dry_run, json);
+        }
         Command::Untrack {
             paths,
             apply,
@@ -948,8 +960,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Stage {
             paths,
             all,
+            allow_plaintext,
             dry_run,
-        } => return cmds::stage_cmd(&store, true, &paths, all, dry_run, json),
+        } => {
+            cmds::allow_plaintext(&store, allow_plaintext)?;
+            return cmds::stage_cmd(&store, true, &paths, all, dry_run, json);
+        }
         Command::Unstage {
             paths,
             all,

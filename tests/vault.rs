@@ -432,17 +432,10 @@ fn an_encrypted_ssh_key_round_trips_with_its_mode() {
     )
     .unwrap();
     a.dw_ok(&["track", ".ssh/id_test", "--apply"]);
-    // The tracked plaintext key cannot be committed.
-    let r = dw(&a, &["commit", "-m", "key"]);
-    assert_ne!(r.code, 0);
     assert!(
-        r.all().contains("secrets") && !r.all().contains("Plainkeymaterial"),
-        "{}",
-        r.all()
+        grep_everywhere(&a, "Plainkeymaterial").is_empty(),
+        "never written, not just pruned"
     );
-    // Tracking proposed encrypting it.
-    assert!(a.dw_ok(&["pending"]).contains("encrypted"));
-    a.dw_ok(&["pending", "apply", "1"]);
     a.dw_ok(&["commit", "-m", "key"]);
     let all = grep_everywhere(&a, "Plainkeymaterial");
     assert!(all.is_empty(), "plaintext found in {all:?}");
@@ -502,48 +495,78 @@ fn grep_everywhere(t: &TestEnv, needle: &str) -> Vec<String> {
 }
 
 #[test]
-fn a_secret_found_on_track_is_proposed_moved_and_never_reaches_git() {
+fn a_secret_found_on_track_never_reaches_the_repository_or_git_objects() {
     let t = env();
     t.dw_ok(&["init", "--name", "mac"]);
     init_vault(&t);
     t.dw_ok(&["commit", "-m", "vault"]);
     let found = "Zq8x7Lm2Pq9wRt5vYb3nKd6HfJs1AaGc";
     write(&t, ".env", &format!("host = h\napi_token = {found}\n"));
+    let dry = t.dw_ok(&["track", ".env", "--dry-run"]);
+    assert!(
+        dry.contains("holds a secret") && !dry.contains(found),
+        "{dry}"
+    );
     let out = t.dw_ok(&["track", ".env", "--apply"]);
     assert!(!out.contains(found));
-    let pending = t.dw_ok(&["pending"]);
-    assert!(
-        pending.contains("Move a secret of ~/.env") && !pending.contains(found),
-        "{pending}"
-    );
-    let json = t.dw_ok(&["pending", "--json"]);
-    assert!(!json.contains(found));
-    // Until it moves, the plaintext cannot be committed.
-    let r = dw(&t, &["commit", "-m", "env"]);
-    assert_ne!(r.code, 0);
-    assert!(!r.all().contains(found));
-    let d = t.dw_ok(&["diff"]);
-    assert!(!d.contains(found), "{d}");
-    t.dw_ok(&["pending", "apply", "1"]);
-    t.dw_ok(&["commit", "-m", "env"]);
+    // Not even a loose blob was created: nothing to prune.
     assert!(
         grep_everywhere(&t, found).is_empty(),
         "{:?}",
         grep_everywhere(&t, found)
     );
+    let stored = fs::read_to_string(repo(&t).join("home/dot_env.tmpl")).unwrap();
+    assert!(stored.contains("includeTemplate") && !stored.contains(found));
+    t.dw_ok(&["commit", "-m", "env"]);
     assert_eq!(
         read(&t, ".env"),
         format!("host = h\napi_token = {found}\n"),
         "HOME untouched"
     );
+    assert!(!t.dw_ok(&["status"]).contains("Local"));
     assert!(t.dw_ok(&["values", "list"]).contains("API_TOKEN"));
-    // The same value appearing in another tracked file is matched against the secret.
+    // The same value in another file is matched against the existing secret.
     write(&t, ".other", &format!("x={found}\n"));
     t.dw_ok(&["track", ".other", "--apply"]);
+    let other = fs::read_to_string(repo(&t).join("home/dot_other.tmpl")).unwrap();
     assert!(
-        t.dw_ok(&["pending"])
-            .contains("Wire API_TOKEN into ~/.other")
+        other.contains("\"API_TOKEN\"") && !other.contains(found),
+        "{other}"
     );
+    // Staging an edit that adds a secret to a tracked plain file is sanitized too.
+    write(&t, ".plain", "a = 1\n");
+    t.dw_ok(&["track", ".plain", "--apply"]);
+    t.dw_ok(&["commit", "-m", "plain"]);
+    let second = "Mm4Nn5Bb6Vv7Cc8Xx9Zz0Aa1Ss2Dd3Ff";
+    write(&t, ".plain", &format!("a = 1\npassword = {second}\n"));
+    t.dw_ok(&["stage", ".plain"]);
+    assert!(grep_everywhere(&t, second).is_empty());
+    assert!(
+        repo(&t).join("home/dot_plain.tmpl").is_file() && !repo(&t).join("home/dot_plain").exists()
+    );
+}
+
+#[test]
+fn without_a_vault_a_detected_secret_is_refused_before_anything_is_written() {
+    let t = env();
+    t.dw_ok(&["init", "--name", "mac"]);
+    let key = "fc-1a2b3c4d5e6f7a8b9c0d1e2f3a4b5c6d";
+    write(&t, ".zshrc", &format!("export FIRECRAWL_API_KEY={key}\n"));
+    let r = dw(&t, &["track", ".zshrc", "--apply"]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.all().contains("dw vault init") && !r.all().contains(key));
+    assert!(grep_everywhere(&t, key).is_empty());
+    assert!(!repo(&t).join("home/dot_zshrc").exists());
+    // An agent cannot opt out; a human can.
+    let a = run(
+        &t,
+        &[],
+        true,
+        &["track", ".zshrc", "--allow-plaintext", "--apply"],
+    );
+    assert_eq!(a.code, 2);
+    t.dw_ok(&["track", ".zshrc", "--allow-plaintext", "--apply"]);
+    assert!(repo(&t).join("home/dot_zshrc").is_file());
 }
 
 #[test]
@@ -553,7 +576,6 @@ fn canary_no_command_log_state_file_or_git_object_holds_a_secret_value() {
     assert_eq!(add_secret(&a, "CANARY", None, canary).code, 0);
     write(&a, ".canary", &format!("c = {canary}\n"));
     a.dw_ok(&["track", ".canary", "--apply"]);
-    a.dw_ok(&["values", "wire", ".canary", "CANARY", "--apply"]);
     a.dw_ok(&["commit", "-m", "canary"]);
     write(&a, ".canary", &format!("c = {canary}-changed\nd = 1\n"));
     let mut outputs = String::new();
@@ -603,4 +625,44 @@ fn canary_no_command_log_state_file_or_git_object_holds_a_secret_value() {
         let hits = grep_everywhere(t, canary);
         assert!(hits.is_empty(), "plaintext in {hits:?}");
     }
+}
+
+#[test]
+fn wiring_a_secret_compares_the_real_value_and_needs_the_unlock() {
+    let t = env();
+    t.dw_ok(&["init", "--name", "mac"]);
+    init_vault(&t);
+    let v = "fc-0a1b2c3d4e5f60718293a4b5c6d7e8f9";
+    assert_eq!(add_secret(&t, "FIRECRAWL_API_KEY", None, v).code, 0);
+    t.dw_ok(&["commit", "-m", "vault"]);
+    write(&t, ".zshrc", &format!("export FIRECRAWL_API_KEY={v}\n"));
+    t.dw_ok(&["track", ".zshrc", "--allow-plaintext", "--apply"]);
+    ok(&t, &[], &["vault", "lock"]);
+    let r = dw(
+        &t,
+        &["values", "wire", ".zshrc", "FIRECRAWL_API_KEY", "--apply"],
+    );
+    assert_eq!(r.code, 4, "{}", r.all());
+    unlock(&t);
+    let dry = t.dw_ok(&["values", "wire", ".zshrc", "FIRECRAWL_API_KEY", "--dry-run"]);
+    assert!(
+        dry.contains("«secret:FIRECRAWL_API_KEY»") && !dry.contains(v),
+        "{dry}"
+    );
+    t.dw_ok(&["values", "wire", ".zshrc", "FIRECRAWL_API_KEY", "--apply"]);
+    let stored = fs::read_to_string(repo(&t).join("home/dot_zshrc.tmpl")).unwrap();
+    assert!(stored.contains("\"FIRECRAWL_API_KEY\"") && !stored.contains(v));
+    // A file without the value says so without printing anything secret.
+    write(&t, ".other", "nothing\n");
+    t.dw_ok(&["track", ".other", "--apply"]);
+    let r = dw(
+        &t,
+        &["values", "wire", ".other", "FIRECRAWL_API_KEY", "--apply"],
+    );
+    assert_eq!(r.code, 1);
+    assert!(
+        r.err.contains("does not occur") && !r.all().contains(v),
+        "{}",
+        r.all()
+    );
 }

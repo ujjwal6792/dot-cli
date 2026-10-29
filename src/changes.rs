@@ -350,6 +350,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     let mut deleted = Vec::new();
     let mut skipped = Vec::new();
     let mut refusals = Vec::new();
+    let mut notes_secret: Vec<String> = Vec::new();
     let vars = crate::variants::Variants::read(&store.repo())?;
     let mine = crate::variants::this_targets(store)?;
     let resolver = crate::values::Resolver::load(store)?;
@@ -458,6 +459,56 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             }),
         }
     }
+    // Files that gained secrets are never staged as they are.
+    let mut new_sanitized: Vec<(String, crate::detect::Sanitized)> = Vec::new();
+    {
+        let found = crate::detect::found_in(store, &files);
+        if !found.is_empty() && !crate::vault::exists(store) {
+            let msg = crate::detect::no_vault_message(&found);
+            if found
+                .iter()
+                .any(|f| sel.is_some_and(|s| s.contains(&f.rel)))
+            {
+                refusals.push((Kind::Error, msg));
+            } else {
+                for f in &found {
+                    skipped.push(Skipped {
+                        path: track::tilde(&f.rel),
+                        reason: "holds a secret; run `dw vault init` first (it would be moved to the vault)".into(),
+                    });
+                }
+            }
+            files.retain(|f| !found.iter().any(|x| &x.rel == f));
+        } else if !found.is_empty() && !dry_run {
+            let mut taken = crate::detect::taken(store);
+            for f in &found {
+                let san = crate::detect::sanitize(store, f, &mut taken)?;
+                match ctx.tracked.files.get(&f.rel) {
+                    Some(e) if !e.source.ends_with(".tmpl") && !e.symlink => {
+                        ref_files.push(crate::values::RefStage {
+                            rel: f.rel.clone(),
+                            dest: format!("{}.tmpl", e.source),
+                            bytes: san.bytes,
+                            changes: Vec::new(),
+                            unchanged: false,
+                            extra: san.extra,
+                            remove: Some(e.source.clone()),
+                        });
+                    }
+                    _ => new_sanitized.push((f.rel.clone(), san)),
+                }
+            }
+            files.retain(|f| !found.iter().any(|x| &x.rel == f));
+        } else if !found.is_empty() {
+            for f in &found {
+                notes_secret.push(format!(
+                    "~/{} holds a secret: staging stores it in the vault",
+                    f.rel
+                ));
+            }
+            files.retain(|f| !found.iter().any(|x| &x.rel == f));
+        }
+    }
     if let Some((kind, _)) = refusals.first() {
         let msg = refusals
             .iter()
@@ -466,7 +517,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .join("; ");
         return Err(DwError::new(*kind, msg).into());
     }
-    let mut notes: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = notes_secret;
     let mut new_values: BTreeMap<&str, &str> = BTreeMap::new();
     for ch in ref_files.iter().flat_map(|p| &p.changes) {
         if let Some(other) = new_values.insert(&ch.name, &ch.new)
@@ -489,8 +540,11 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             notes.push(line);
         }
     }
-    let nothing =
-        files.is_empty() && deleted.is_empty() && variant_files.is_empty() && ref_files.is_empty();
+    let nothing = files.is_empty()
+        && deleted.is_empty()
+        && variant_files.is_empty()
+        && ref_files.is_empty()
+        && new_sanitized.is_empty();
     if nothing && skipped.is_empty() {
         bail!("nothing to stage");
     }
@@ -512,8 +566,16 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 fs::write(&to, bytes).with_context(|| format!("writing {}", to.display()))?;
             }
             for p in &ref_files {
+                crate::detect::write_extra(store, &p.extra)?;
                 let to = store.repo().join(&p.dest);
                 fs::write(&to, &p.bytes).with_context(|| format!("writing {}", to.display()))?;
+                if let Some(old) = &p.remove {
+                    fs::remove_file(store.repo().join(old))?;
+                }
+            }
+            for (rel, san) in &new_sanitized {
+                crate::detect::write_extra(store, &san.extra)?;
+                crate::detect::add_sanitized(store, rel, &san.bytes)?;
             }
             let all: Vec<_> = ref_files.iter().flat_map(|p| p.changes.clone()).collect();
             crate::values::apply_changes(store, &all)?;
@@ -522,9 +584,17 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 let rels: BTreeSet<&str> = variant_files
                     .iter()
                     .map(|(r, _)| r.as_str())
-                    .chain(ref_files.iter().map(|p| p.rel.as_str()))
+                    .chain(
+                        ref_files
+                            .iter()
+                            .filter(|p| p.extra.is_empty())
+                            .map(|p| p.rel.as_str()),
+                    )
                     .collect();
                 restore_last_written(store, &rels)?;
+                for p in ref_files.iter().filter(|p| !p.extra.is_empty()) {
+                    crate::detect::set_last_written(store, &p.rel)?;
+                }
             }
             let changed: Vec<String> = track::unstaged(store)?.into_iter().collect();
             track::stage(store, &changed)?;
@@ -560,6 +630,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .cloned()
             .chain(variant_files.iter().map(|(r, _)| r.clone()))
             .chain(ref_files.iter().map(|p| p.rel.clone()))
+            .chain(new_sanitized.iter().map(|(r, _)| r.clone()))
             .collect();
         if let Some(l) = lock.as_ref() {
             // Detection only proposes; it never fails a stage that succeeded.
@@ -574,6 +645,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .iter()
             .chain(variant_files.iter().map(|(rel, _)| rel))
             .chain(ref_files.iter().map(|p| &p.rel))
+            .chain(new_sanitized.iter().map(|(r, _)| r))
             .map(|f| track::tilde(f))
             .chain(
                 deleted

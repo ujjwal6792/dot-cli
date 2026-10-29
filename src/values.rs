@@ -364,7 +364,7 @@ pub fn to_template(segs: &[Seg]) -> String {
 }
 
 /// Replace every occurrence of `value` in literal text by a reference to `name`.
-fn wire_segs(segs: &[Seg], name: &str, value: &str) -> (Vec<Seg>, usize) {
+pub(crate) fn wire_segs(segs: &[Seg], name: &str, value: &str) -> (Vec<Seg>, usize) {
     let mut out = Vec::new();
     let mut count = 0;
     for s in segs {
@@ -628,6 +628,10 @@ pub struct RefStage {
     pub changes: Vec<VarChange>,
     /// Nothing but the file mode differs.
     pub unchanged: bool,
+    /// Vault files written with it (a plain file that gained secrets).
+    pub extra: Vec<(String, Vec<u8>)>,
+    /// The plain source it replaces.
+    pub remove: Option<String>,
 }
 
 /// Plan staging `rel` when its stored file `stored` (a variant file or a
@@ -670,6 +674,8 @@ pub fn stage_plan(
         unchanged: bytes == text && mapped.changes.is_empty(),
         bytes: bytes.into_bytes(),
         changes: mapped.changes,
+        extra: Vec::new(),
+        remove: None,
     }))
 }
 
@@ -1085,7 +1091,13 @@ fn wiring(store: &Store, ctx: &Ctx, path: &str, name: &str, known: Option<&str>)
     let (wired, count) = wire_segs(&segs, name, &value);
     if count == 0 {
         return Err(refuse(format!(
-            "the value of {name} on this machine ({shown:?}) does not occur in {}",
+            "the value of {name} on this machine ({}) does not occur in the stored {} \
+             (a value that only exists in HOME needs `dw stage` first)",
+            if resolver.is_secret(name) {
+                "hidden".to_string()
+            } else {
+                format!("{shown:?}")
+            },
             tilde(path)
         )));
     }

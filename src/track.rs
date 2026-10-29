@@ -742,6 +742,17 @@ pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> R
             hp.rel
         )));
     };
+    let rels: Vec<String> = files
+        .iter()
+        .filter(|f| !f.symlink)
+        .map(|f| f.path.clone())
+        .collect();
+    for f in crate::detect::inspect(store, &rels)? {
+        notes.push(format!(
+            "~/{} holds a secret (hidden): applying stores it in the vault and the file keeps a reference",
+            f.rel
+        ));
+    }
     let changes = preview_add(store, &files)?;
     let want: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let got: BTreeSet<&str> = changes.iter().map(|c| c.target.as_str()).collect();
@@ -1313,17 +1324,44 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
                     bail!("~/{} is hidden by a hide rule", f.path);
                 }
             }
-            for chunk in files.chunks(CHUNK) {
+            // Files holding secrets are never added as they are: they are stored
+            // sanitized (secret in the vault, reference in the file).
+            let rels: Vec<String> = files
+                .iter()
+                .filter(|f| !f.symlink)
+                .map(|f| f.path.clone())
+                .collect();
+            let found = crate::detect::inspect(store, &rels)?;
+            let plain: Vec<&crate::pending::TrackFile> = files
+                .iter()
+                .filter(|f| !found.iter().any(|x| x.rel == f.path))
+                .collect();
+            for chunk in plain.chunks(CHUNK) {
                 let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
                 args.extend(chunk.iter().map(|f| home.join(&f.path).into()));
                 store.chezmoi_locked(&args)?;
+            }
+            let mut expected = expected_sources(item);
+            let mut extra_files: Vec<String> = Vec::new();
+            let mut taken = crate::detect::taken(store);
+            for f in &found {
+                let san = crate::detect::sanitize(store, f, &mut taken)?;
+                crate::detect::write_extra(store, &san.extra)?;
+                extra_files.extend(san.extra.iter().map(|(r, _)| r.clone()));
+                crate::detect::add_sanitized(store, &f.rel, &san.bytes)?;
+                for c in item.preview.files.iter().filter(|c| c.target == f.rel) {
+                    expected.remove(&c.source);
+                    expected.insert(format!("{}.tmpl", c.source));
+                }
             }
             if *record_folder {
                 let mut folders = source::read_folders(&repo)?;
                 folders.insert(path.clone());
                 source::write_folders(&repo, &folders)?;
             }
-            verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
+            let mut optional: Vec<&str> = vec![DATA_FILE];
+            optional.extend(extra_files.iter().map(String::as_str));
+            verify_and_stage(store, &expected, &optional)
         }
         Action::Untrack {
             files,

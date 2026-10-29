@@ -153,5 +153,7 @@ pub fn stage_plan(store: &Store, rel: &str, id: &str) -> Result<RefStage, String
         bytes,
         changes: Vec::new(),
         unchanged: same,
+        extra: Vec::new(),
+        remove: None,
     })
 }

@@ -519,3 +519,221 @@ pub fn known_pairs(store: &Store) -> Vec<(String, String)> {
         .filter(|(_, v)| !v.is_empty())
         .collect()
 }
+
+// ---- never write detected secrets into the repository -----------------
+
+static ALLOW_PLAINTEXT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `--allow-plaintext` (humans only): track and stage files as they are.
+pub fn set_allow_plaintext(v: bool) {
+    ALLOW_PLAINTEXT.store(v, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// A HOME file whose content holds secrets: `values` are (value, existing
+/// secret name if the vault already has it, name hint).
+#[derive(Debug, Clone)]
+pub struct Found {
+    pub rel: String,
+    pub private_key: bool,
+    pub values: Vec<(String, Option<String>, String)>,
+}
+
+/// The files among `rels` that hold secrets. Without a vault (and without
+/// `--allow-plaintext`) this refuses, so nothing is written anywhere; with one
+/// the caller stores them sanitized. Only file names are ever reported.
+pub fn inspect(store: &Store, rels: &[String]) -> Result<Vec<Found>> {
+    let out = found_in(store, rels);
+    if !out.is_empty() && !crate::vault::exists(store) {
+        return Err(refuse(no_vault_message(&out)));
+    }
+    Ok(out)
+}
+
+pub fn no_vault_message(out: &[Found]) -> String {
+    let names: Vec<String> = out.iter().map(|f| tilde(&f.rel)).collect();
+    format!(
+        "{} appear(s) to contain a secret, which must not be written to the repository: \
+         run `dw vault init`, then track again — the secret will be moved to the vault \
+         (a human can pass --allow-plaintext to store the file as it is)",
+        names.join(", ")
+    )
+}
+
+/// Like [`inspect`] without the vault check.
+pub fn found_in(store: &Store, rels: &[String]) -> Vec<Found> {
+    if ALLOW_PLAINTEXT.load(std::sync::atomic::Ordering::SeqCst) {
+        return Vec::new();
+    }
+    let known = known_pairs(store);
+    let mut out = Vec::new();
+    for rel in rels {
+        let p = store.dirs.home.join(rel);
+        if fs::symlink_metadata(&p).is_ok_and(|m| !m.is_file()) {
+            continue;
+        }
+        let Ok(text) = fs::read_to_string(&p) else {
+            continue;
+        };
+        let mut values: Vec<(String, Option<String>, String)> = Vec::new();
+        for (n, v) in &known {
+            if v.chars().count() >= 3 && text.contains(v.as_str()) {
+                values.push((v.clone(), Some(n.clone()), n.clone()));
+            }
+        }
+        for h in scan_text(&text).into_iter().filter(|h| !h.generic) {
+            if let Some(v) = value_at(&text, &h)
+                && !values.iter().any(|(x, _, _)| *x == v)
+            {
+                values.push((v, None, h.hint.clone()));
+            }
+        }
+        let private_key = is_private_key(&text);
+        if private_key || !values.is_empty() {
+            out.push(Found {
+                rel: rel.clone(),
+                private_key,
+                values,
+            });
+        }
+    }
+    out
+}
+
+/// What to store for a file with secrets: its new source content and the vault
+/// files that go with it. The plaintext appears in none of them.
+pub struct Sanitized {
+    pub bytes: Vec<u8>,
+    pub extra: Vec<(String, Vec<u8>)>,
+    /// Names of the secrets created or referenced.
+    pub names: Vec<String>,
+}
+
+pub fn sanitize(store: &Store, f: &Found, taken: &mut BTreeSet<String>) -> Result<Sanitized> {
+    let text = fs::read_to_string(store.dirs.home.join(&f.rel))?;
+    if f.private_key {
+        let raw: [u8; 8] = rand::random();
+        let id: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+        return Ok(Sanitized {
+            bytes: crate::render::file_stub(&id).into_bytes(),
+            extra: vec![(
+                crate::encfile::age_file(&id),
+                crate::vault::encrypt(store, text.as_bytes())?,
+            )],
+            names: Vec::new(),
+        });
+    }
+    let mut segs = vec![crate::values::Seg::Lit(text)];
+    let (mut extra, mut names) = (Vec::new(), Vec::new());
+    for (value, existing, hint) in &f.values {
+        let name = match existing {
+            Some(n) => n.clone(),
+            None => {
+                let n = free_name(taken, hint);
+                taken.insert(n.clone());
+                extra.extend(crate::secrets::prepare(store, &n, None, value, None)?);
+                n
+            }
+        };
+        segs = crate::values::wire_segs(&segs, &name, value).0;
+        names.push(name);
+    }
+    Ok(Sanitized {
+        bytes: crate::values::to_template(&segs).into_bytes(),
+        extra,
+        names,
+    })
+}
+
+pub fn taken(store: &Store) -> BTreeSet<String> {
+    taken_names(store)
+}
+
+pub fn write_extra(store: &Store, extra: &[(String, Vec<u8>)]) -> Result<()> {
+    let repo = store.repo();
+    for (rel, bytes) in extra {
+        let p = repo.join(rel);
+        if let Some(d) = p.parent() {
+            fs::create_dir_all(d)?;
+        }
+        fs::write(&p, bytes)?;
+    }
+    Ok(())
+}
+
+/// Add a new HOME file to the source state with `bytes` as its (template)
+/// content: chezmoi adds a sanitized copy in a throwaway destination, so the
+/// plaintext never reaches the repository; its last-written record is then set
+/// from HOME itself (the template renders to exactly that).
+pub fn add_sanitized(store: &Store, rel: &str, bytes: &[u8]) -> Result<()> {
+    use std::os::unix::fs::{DirBuilderExt, PermissionsExt};
+    let raw: [u8; 8] = rand::random();
+    let name: String = raw.iter().map(|b| format!("{b:02x}")).collect();
+    let tmp = store
+        .dirs
+        .state_dir()
+        .join("run")
+        .join(format!("add-{name}"));
+    let dest = tmp.join("dest");
+    fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(&dest)?;
+    let mut dir = dest.clone();
+    let mut src = store.dirs.home.clone();
+    let parts: Vec<&str> = rel.split('/').collect();
+    for part in &parts[..parts.len() - 1] {
+        dir = dir.join(part);
+        src = src.join(part);
+        let mode = fs::metadata(&src).map_or(0o755, |m| m.permissions().mode() & 0o777);
+        fs::DirBuilder::new()
+            .recursive(true)
+            .mode(mode)
+            .create(&dir)?;
+        fs::set_permissions(&dir, fs::Permissions::from_mode(mode))?;
+    }
+    let result = (|| -> Result<()> {
+        let file = dest.join(rel);
+        fs::write(&file, bytes)?;
+        let mode = fs::metadata(store.dirs.home.join(rel))?
+            .permissions()
+            .mode()
+            & 0o777;
+        fs::set_permissions(&file, fs::Permissions::from_mode(mode))?;
+        let _g = store.chezmoi_guard()?;
+        let mut cmd = store.chezmoi_command_with(
+            &store.dirs.chezmoi_config(),
+            &tmp.join("state.db"),
+            &tmp.join("cache"),
+        );
+        cmd.arg("--destination").arg(&dest);
+        cmd.args(["add", "--template"]).arg(&file);
+        crate::exec::run_ok(cmd, None)?;
+        Ok(())
+    })();
+    let _ = fs::remove_dir_all(&tmp);
+    result?;
+    set_last_written(store, rel)
+}
+
+/// Record HOME's current content as what chezmoi last wrote for `rel`.
+pub fn set_last_written(store: &Store, rel: &str) -> Result<()> {
+    use sha2::{Digest, Sha256};
+    use std::os::unix::fs::PermissionsExt;
+    let p = store.dirs.home.join(rel);
+    let data = fs::read(&p)?;
+    let sha: String = Sha256::digest(&data)
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect();
+    let mode = fs::metadata(&p)?.permissions().mode() & 0o777;
+    let key = p.to_string_lossy().into_owned();
+    let value = serde_json::json!({"type": "file", "mode": mode, "contentsSHA256": sha});
+    store.chezmoi_locked(&[
+        "state".to_string(),
+        "set".into(),
+        "--bucket=entryState".into(),
+        format!("--key={key}"),
+        format!("--value={value}"),
+    ])?;
+    Ok(())
+}

@@ -24,6 +24,15 @@ pub fn require_initialised(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// `--allow-plaintext`: humans only.
+pub fn allow_plaintext(store: &Store, flag: bool) -> Result<()> {
+    if flag && changes::agent(store).is_some() {
+        return Err(DwError::usage("--allow-plaintext is for humans; agents cannot use it").into());
+    }
+    crate::detect::set_allow_plaintext(flag);
+    Ok(())
+}
+
 fn cwd() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
