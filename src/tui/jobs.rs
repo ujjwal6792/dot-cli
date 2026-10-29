@@ -78,6 +78,11 @@ pub struct ActionReport {
 
 #[derive(Debug)]
 pub enum Payload {
+    GitMeta(Result<(Vec<crate::branches::Branch>, Vec<crate::stashes::Stash>), String>),
+    GitPreview {
+        op: super::app::GitOp,
+        preview: Result<(String, String), String>,
+    },
     Commits(Result<Vec<crate::history::Commit>, String>),
     Status(Result<Box<Status>, String>),
     Listing {

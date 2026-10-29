@@ -1054,6 +1054,233 @@ pub fn log_cmd(store: &Store, path: Option<&str>, count: usize, json: bool) -> R
     Ok(ExitCode::SUCCESS)
 }
 
+pub fn branch_cmd(store: &Store, action: crate::cli::BranchCmd, json: bool) -> Result<ExitCode> {
+    use crate::cli::BranchCmd;
+    require_initialised(store)?;
+    let create = matches!(action, BranchCmd::Create { .. });
+    match action {
+        BranchCmd::List => {
+            let branches = crate::branches::list(store)?;
+            if json {
+                print_json(&branches)?;
+            } else {
+                for b in branches {
+                    println!(
+                        "{} {}{}",
+                        if b.current { "*" } else { " " },
+                        b.name,
+                        if b.default {
+                            " (default)"
+                        } else if b.current {
+                            " (warning: non-default branch)"
+                        } else {
+                            ""
+                        }
+                    );
+                }
+            }
+        }
+        BranchCmd::Create { name, dry_run } | BranchCmd::Switch { name, dry_run } => {
+            let files = crate::branches::change(store, &name, create, dry_run)?;
+            let warning = (!create && name != crate::branches::default_name(store))
+                .then_some("non-default branch");
+            if json {
+                print_json(
+                    &json!({"branch":name,"create":create,"dry_run":dry_run,"source_paths":files,"warning":warning}),
+                )?;
+            } else {
+                println!(
+                    "{}{} {name}; source paths: {}. HOME unchanged.{}",
+                    if dry_run { "Would " } else { "" },
+                    if create { "create" } else { "switch to" },
+                    files.join(", "),
+                    warning.map_or(String::new(), |w| format!(" Warning: {w}."))
+                );
+            }
+        }
+        BranchCmd::Delete {
+            name,
+            force,
+            yes,
+            dry_run,
+        } => {
+            let item = crate::branches::plan_delete(store, &name, force)?;
+            let check = item.clone();
+            return gated(store, item, yes, dry_run, json, || {
+                let lock = store.lock()?;
+                track::recheck(store, &lock, &[check])?;
+                crate::branches::delete_locked(store, &name, force)?;
+                if json {
+                    print_json(&json!({"deleted":name}))?;
+                } else {
+                    println!("Deleted {name}");
+                }
+                Ok(ExitCode::SUCCESS)
+            });
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn confirm_stash(s: &crate::stashes::Stash, yes: bool, json: bool) -> Result<()> {
+    use std::io::IsTerminal;
+    if yes {
+        return Ok(());
+    }
+    let message = format!(
+        "HOME: {}; index: {}",
+        s.paths.join(", "),
+        s.index_paths.join(", ")
+    );
+    if json || !std::io::stdin().is_terminal() {
+        return Err(DwError::new(
+            Kind::NeedsApproval,
+            format!("{message}; preview with --dry-run and confirm with --yes"),
+        )
+        .into());
+    }
+    println!("{message}\nProceed after a safety snapshot? y/N");
+    let mut answer = String::new();
+    std::io::stdin().read_line(&mut answer)?;
+    if !matches!(answer.trim(), "y" | "Y" | "yes") {
+        return Err(changes_refuse("cancelled"));
+    }
+    Ok(())
+}
+pub fn stash_cmd(store: &Store, action: crate::cli::StashCmd, json: bool) -> Result<ExitCode> {
+    use crate::cli::StashCmd;
+    require_initialised(store)?;
+    match action {
+        StashCmd::List => {
+            let list = crate::stashes::list(store)?;
+            if json {
+                print_json(&list)?;
+            } else {
+                for s in list {
+                    println!(
+                        "{} HOME: {}; index: {}",
+                        s.id,
+                        s.paths.join(", "),
+                        s.index_paths.join(", ")
+                    );
+                }
+            }
+        }
+        StashCmd::Push { dry_run, yes } => {
+            let guard = crate::git_state::preview_guard(store)?;
+            let preview = crate::stashes::push(store, true)?;
+            let s = if dry_run {
+                preview
+            } else {
+                confirm_stash(&preview, yes, json)?;
+                if crate::git_state::preview_guard(store)? != guard {
+                    return Err(DwError::new(
+                        Kind::Stale,
+                        "state changed since stash preview; review again",
+                    )
+                    .into());
+                }
+                crate::stashes::push(store, false)?
+            };
+            if json {
+                print_json(&json!({"dry_run":dry_run,"stash":s}))?;
+            } else {
+                println!(
+                    "{} stash {}: HOME {}; index {}",
+                    if dry_run { "Would push" } else { "Pushed" },
+                    s.id,
+                    s.paths.join(", "),
+                    s.index_paths.join(", ")
+                );
+            }
+        }
+        StashCmd::Pop { id, dry_run, yes } => {
+            let guard = crate::git_state::preview_guard(store)?;
+            let preview = crate::stashes::pop(store, id.as_deref(), true)?;
+            let s = if dry_run {
+                preview
+            } else {
+                confirm_stash(&preview, yes, json)?;
+                if crate::git_state::preview_guard(store)? != guard {
+                    return Err(DwError::new(
+                        Kind::Stale,
+                        "state changed since stash preview; review again",
+                    )
+                    .into());
+                }
+                crate::stashes::pop(store, id.as_deref(), false)?
+            };
+            if json {
+                print_json(&json!({"dry_run":dry_run,"stash":s}))?;
+            } else {
+                println!(
+                    "{} {}: HOME {}; index {}",
+                    if dry_run { "Would pop" } else { "Popped" },
+                    s.id,
+                    s.paths.join(", "),
+                    s.index_paths.join(", ")
+                );
+            }
+        }
+        StashCmd::Drop { id, dry_run, yes } => {
+            let item = crate::stashes::plan_drop(store, id.as_deref())?;
+            let stash = crate::stashes::get(store, id.as_deref())?;
+            return gated(store, item, yes, dry_run, json, || {
+                let _lock = store.lock()?;
+                crate::stashes::drop_locked(store, &stash.id)?;
+                if json {
+                    print_json(&json!({"dropped":stash.id}))?;
+                } else {
+                    println!("Dropped {}", stash.id);
+                }
+                Ok(ExitCode::SUCCESS)
+            });
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn restore_at_cmd(
+    store: &Store,
+    at: Option<&str>,
+    paths: &[String],
+    all: bool,
+    clear: bool,
+    dry: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let sel = home_selectors(store, paths, all, "restore")?;
+    let result = if clear {
+        crate::restores::clear(store, sel.as_deref(), dry)?
+    } else {
+        crate::restores::plan(store, at.expect("clap requires --at"), sel.as_deref(), dry)?
+    };
+    if json {
+        print_json(&json!({"dry_run":dry,"cleared":clear,"candidates":result}))?;
+    } else {
+        for c in result {
+            println!(
+                "{} ~/{}, from {}{}",
+                if clear {
+                    "Clear candidate"
+                } else {
+                    "Restore candidate"
+                },
+                c.path,
+                c.commit,
+                if c.conflict {
+                    " (Conflict: local edits)"
+                } else {
+                    " (Incoming; review then apply)"
+                }
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn show_cmd(store: &Store, commit: &str, path: Option<&str>, json: bool) -> Result<ExitCode> {
     use std::io::IsTerminal;
     require_initialised(store)?;

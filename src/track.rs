@@ -501,6 +501,28 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 .insert(path.clone(), home_fingerprint(&home.join(path)));
             g.repo.extend(crate::detect::guard(store, ctx, action));
         }
+        Action::StashDrop { id } => {
+            g.repo.insert(
+                format!("stash:{id}"),
+                crate::stashes::get(store, Some(id)).map_or("-".into(), |s| s.index_commit),
+            );
+        }
+        Action::BranchDelete { name, .. } => {
+            g.repo.insert(
+                format!("branch:{name}"),
+                store
+                    .git(&["rev-parse", &format!("refs/heads/{name}")])
+                    .map_or("-".into(), |o| o.stdout),
+            );
+            g.repo.insert(
+                "branch:current".into(),
+                crate::remote::current_branch(store)?,
+            );
+            g.repo.insert(
+                "branch:head".into(),
+                crate::history::resolve(store, "HEAD")?,
+            );
+        }
         Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
             g.repo
                 .insert(format!("remote:{name}"), remote_state(store, name));
@@ -1432,6 +1454,8 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
         }
         Action::Discard { .. }
+        | Action::StashDrop { .. }
+        | Action::BranchDelete { .. }
         | Action::Resolve { .. }
         | Action::RemoteAdd { .. }
         | Action::RemoteRemove { .. }
@@ -1569,6 +1593,12 @@ pub fn apply_items(store: &Store, lock: &Lock, items: &[Item]) -> Result<Vec<Ite
                     };
                     (Vec::new(), Some(note))
                 })
+            }
+            Action::StashDrop { id } => crate::stashes::drop_locked(store, id)
+                .map(|()| (Vec::new(), Some(format!("dropped stash {id}")))),
+            Action::BranchDelete { name, force } => {
+                crate::branches::delete_locked(store, name, *force)
+                    .map(|()| (Vec::new(), Some(format!("deleted branch {name}"))))
             }
             Action::RemoteAdd { .. } | Action::RemoteRemove { .. } | Action::Push { .. } => {
                 crate::remote::exec_action(store, &item.action).map(|note| (Vec::new(), Some(note)))

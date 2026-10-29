@@ -10,6 +10,7 @@ use crate::store::Store;
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 pub struct RepoStatus {
+    pub default_branch: String,
     pub branch: Option<String>,
     pub head: Option<String>,
     /// Number of paths with uncommitted changes in the repository (should be 0).
@@ -184,6 +185,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         repo_path,
         machine,
         repo: Some(RepoStatus {
+            default_branch: crate::branches::default_name(store),
             branch,
             head,
             changed_paths,
@@ -238,6 +240,12 @@ impl Status {
             None => s.push_str("Machine:    not registered on this computer\n"),
         }
         if let Some(r) = &self.repo {
+            if r.branch.as_deref() != Some(&r.default_branch) {
+                s.push_str(&format!(
+                    "Warning: non-default branch (default: {})\n",
+                    r.default_branch
+                ));
+            }
             s.push_str(&format!(
                 "Branch:     {} @ {}\n",
                 r.branch.as_deref().unwrap_or("?"),

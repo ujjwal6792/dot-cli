@@ -63,6 +63,12 @@ const HELP: &[(&str, &str)] = &[
     (".", "show or hide items matched by hide rules"),
     ("r", "Git: revert (y/n); elsewhere: refresh"),
     ("Git M C X", "merge pull, continue merge, abort merge"),
+    ("Git [ ] / R", "tabs; Commits R: review historical restore"),
+    (
+        "Branches n Enter d D",
+        "create, switch, delete, force delete (y/n)",
+    ),
+    ("Stash s Enter d", "push, pop, drop (path preview then y/n)"),
     (
         "E",
         "Files: store the selected tracked file encrypted (pending item)",
@@ -351,6 +357,55 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
         Panel::Changes => draw_changes(f, app, block, area, expanded),
         Panel::Machines => draw_machines(f, app, block, area, expanded),
         Panel::Git => {
+            if app.git_tab != 0 {
+                let (title, rows): (&str, Vec<String>) = if app.git_tab == 1 {
+                    (
+                        " 4 Git · Branches · [ ] tabs ",
+                        app.branches
+                            .iter()
+                            .map(|b| {
+                                format!(
+                                    "{} {}{}",
+                                    if b.current { "*" } else { " " },
+                                    b.name,
+                                    if b.default {
+                                        " (default)"
+                                    } else if b.current {
+                                        " ⚠ non-default"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (
+                        " 4 Git · Stash · [ ] tabs ",
+                        app.stashes
+                            .iter()
+                            .map(|s| {
+                                format!(
+                                    "{} ({} HOME, {} index)",
+                                    s.id,
+                                    s.paths.len(),
+                                    s.index_paths.len()
+                                )
+                            })
+                            .collect(),
+                    )
+                };
+                let mut state = ListState::default().with_selected(Some(app.git_selected));
+                f.render_stateful_widget(
+                    List::new(rows)
+                        .block(block.title(title))
+                        .highlight_style(Style::default().fg(Color::Yellow))
+                        .highlight_symbol("› "),
+                    area,
+                    &mut state,
+                );
+                return;
+            }
             let items: Vec<ListItem> = app
                 .commits
                 .iter()
@@ -472,7 +527,15 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
                         (Some(a), Some(b)) => format!(" ↑{a} ↓{b}"),
                         _ => " (no upstream)".into(),
                     };
-                    format!("{}{sync}", r.branch.as_deref().unwrap_or("?"))
+                    format!(
+                        "{}{sync}{}",
+                        r.branch.as_deref().unwrap_or("?"),
+                        if r.branch.as_deref() != Some(&r.default_branch) {
+                            " ⚠ non-default"
+                        } else {
+                            ""
+                        }
+                    )
                 }
                 None => "not initialised".into(),
             };
@@ -706,6 +769,26 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border(false))
         .title(title);
+    if app.focus == Panel::Git && app.git_tab != 0 {
+        let text = if app.git_tab == 1 {
+            "Branches: n create · Enter switch · d delete · D force delete.\nHOME never changes; staged overlaps refuse the switch.".into()
+        } else {
+            app.stashes.get(app.git_selected).map_or(
+                "s push a stash of tracked HOME and index changes".into(),
+                |s| {
+                    format!(
+                        "HOME: {}\nIndex: {}\nEnter pop · d drop · s push; preview then y/n",
+                        s.paths.join(", "),
+                        s.index_paths.join(", ")
+                    )
+                },
+            )
+        };
+        return f.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
+            area,
+        );
+    }
     if app.focus == Panel::Changes || app.focus == Panel::Git {
         let body = match &app.diff {
             Load::Loading => ratatui::text::Text::from("loading…"),
@@ -909,6 +992,18 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 ),
             ],
         ),
+        Dialog::GitCreate(name) => (
+            " New branch ",
+            vec![
+                Line::from(format!("{name}█")),
+                Line::from("Enter preview · Esc cancel"),
+            ],
+        ),
+        Dialog::GitConfirm { preview, .. } => {
+            let mut lines: Vec<Line> = preview.lines().map(|s| Line::from(s.to_string())).collect();
+            lines.push(Line::from("y confirm · n cancel"));
+            (" Git preview ", lines)
+        }
         Dialog::ConfirmRevert(hash) => (
             " Revert commit ",
             vec![

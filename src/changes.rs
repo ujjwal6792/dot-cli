@@ -318,7 +318,9 @@ pub fn classify(store: &Store) -> Result<Vec<Change>> {
             })
             .collect());
     }
-    Ok(scan(store, &Ctx::load(store)?)?.changes)
+    let mut found = scan(store, &Ctx::load(store)?)?.changes;
+    crate::restores::overlay(store, &mut found)?;
+    Ok(found)
 }
 
 fn covers(selector: &str, path: &str) -> bool {
@@ -994,13 +996,19 @@ pub struct Applied {
 /// exactly is refused (exit 5); with `--all` or a folder it is skipped and listed.
 pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) -> Result<Applied> {
     let _lock = (!dry_run).then(|| store.lock()).transpose()?;
+    let restored = crate::restores::apply(store, paths, dry_run)?;
     let ctx = Ctx::load(store)?;
     let found = scan(store, &ctx)?;
     let pick = |state: State| -> Vec<String> {
         let mut v: Vec<String> = found
             .changes
             .iter()
-            .filter(|c| c.state == state && c.kind != "repo" && selected(paths, &c.path))
+            .filter(|c| {
+                c.state == state
+                    && c.kind != "repo"
+                    && selected(paths, &c.path)
+                    && !restored.contains(&c.path)
+            })
             .map(|c| c.path.clone())
             .collect();
         v.sort();
@@ -1034,13 +1042,16 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
             )
             .into());
         }
-        if !files.iter().any(|f| covers(p, f)) && !conflicts.iter().any(|f| covers(p, f)) {
+        if !files.iter().any(|f| covers(p, f))
+            && !conflicts.iter().any(|f| covers(p, f))
+            && !restored.iter().any(|f| covers(p, f))
+        {
             return Err(refuse(format!("nothing incoming at ~/{p}")));
         }
     }
     let mut out = Applied {
         dry_run,
-        applied: files.clone(),
+        applied: files.iter().chain(&restored).cloned().collect(),
         conflicts,
         failed: Vec::new(),
         vault_locked,
@@ -1282,7 +1293,7 @@ pub struct FileDiff {
     pub diff: String,
 }
 
-fn unified(label: &str, old: Option<&str>, new: Option<&str>) -> String {
+pub(crate) fn unified(label: &str, old: Option<&str>, new: Option<&str>) -> String {
     let mut out = format!("diff --git a/{label} b/{label}\n");
     if old.is_none() {
         out.push_str("new file mode 100644\n");
@@ -1423,6 +1434,19 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
             state: c.state,
             diff: notes + &crate::detect::redact(&diff, &known),
         });
+    }
+    for c in crate::restores::list(store)? {
+        if selected(sel, &c.path) {
+            out.push(FileDiff {
+                path: track::tilde(&c.path),
+                state: if c.conflict {
+                    State::Conflict
+                } else {
+                    State::Incoming
+                },
+                diff: crate::restores::preview(store, &c.path)?,
+            });
+        }
     }
     Ok(out)
 }

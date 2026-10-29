@@ -122,6 +122,97 @@ impl Tui {
 }
 
 #[test]
+fn git_branches_create_switch_and_delete_have_previews() {
+    let mut tui = open(edited());
+    tui.press('4');
+    tui.press(']');
+    tui.press('n');
+    tui.type_text("other");
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(tui.app.dialog, Some(Dialog::GitConfirm { .. })));
+    tui.press('y');
+    assert_eq!(tui.app.branches.len(), 2);
+    tui.press('j');
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    assert!(
+        tui.app
+            .branches
+            .iter()
+            .any(|b| b.name == "other" && b.current)
+    );
+    assert!(tui.screen().contains("non-default"));
+    tui.press('k');
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    tui.press('j');
+    tui.press('d');
+    assert!(tui.screen().contains("Delete"));
+    tui.press('y');
+    assert_eq!(tui.app.branches.len(), 1);
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+}
+
+#[test]
+fn git_stash_confirmation_lists_home_and_round_trips() {
+    let mut tui = open(edited());
+    tui.press('4');
+    tui.press(']');
+    tui.press(']');
+    tui.press('s');
+    let screen = tui.screen();
+    assert!(screen.contains("HOME: .a"), "{screen}");
+    tui.press('n');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+    tui.press('s');
+    fs::write(tui.t.home.join(".a"), "changed after preview\n").unwrap();
+    tui.press('y');
+    assert!(tui.app.stashes.is_empty());
+    assert!(
+        tui.app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed since preview")
+    );
+    fs::write(tui.t.home.join(".a"), "two\n").unwrap();
+    tui.press('s');
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "one\n");
+    assert_eq!(tui.app.stashes.len(), 1);
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+    assert!(tui.app.stashes.is_empty());
+}
+
+#[test]
+fn git_history_restore_is_reviewed_as_incoming_before_apply() {
+    let t = edited();
+    t.dw_ok(&["stage", ".a"]);
+    t.dw_ok(&["commit", "-m", "second"]);
+    let head = t.git(&t.dirs().repo(), &["rev-parse", "HEAD"]);
+    let mut tui = open(t);
+    tui.press('4');
+    tui.press('j');
+    tui.press('R');
+    assert!(tui.screen().contains("Review restore"));
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+    tui.press('3');
+    tui.press(']');
+    tui.press(']');
+    assert!(tui.app.change_rows().iter().any(|c| c.kind == "restore"));
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "one\n");
+    assert_eq!(
+        tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]),
+        head
+    );
+}
+
+#[test]
 fn commits_cursor_diff_paging_and_revert_confirmation() {
     let t = edited();
     t.dw_ok(&["stage", ".a"]);

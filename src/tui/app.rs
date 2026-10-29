@@ -85,6 +85,7 @@ impl Panel {
 /// A mutation waiting for its turn on the action queue.
 #[derive(Debug, Clone)]
 pub enum ActionReq {
+    Git(GitOp, String),
     /// Space: flip the tracked state of these HOME paths (absolute).
     Toggle(Vec<std::path::PathBuf>),
     /// `i`: hide (or un-hide) this absolute path, through a pending hide item.
@@ -134,6 +135,62 @@ pub enum ActionReq {
     Lock,
     /// Write this finished text over the conflicting file (HOME-relative) and stage it.
     Resolve(String, Secret),
+}
+
+#[derive(Debug, Clone)]
+pub enum GitOp {
+    Create(String),
+    Switch(String),
+    Delete(String, bool),
+    StashPush,
+    StashPop(String),
+    StashDrop(String),
+    Restore(String),
+}
+
+fn preview_git(store: &Store, op: &GitOp) -> anyhow::Result<String> {
+    Ok(match op {
+        GitOp::Create(n) | GitOp::Switch(n) => {
+            let files = crate::branches::change(store, n, matches!(op, GitOp::Create(_)), true)?;
+            format!(
+                "{op:?}\nSource/index: {}\nHOME unchanged.{}",
+                files.join(", "),
+                if *n != crate::branches::default_name(store) {
+                    " Non-default branch."
+                } else {
+                    ""
+                }
+            )
+        }
+        GitOp::Delete(n, f) => crate::branches::plan_delete(store, n, *f)?.render(),
+        GitOp::StashDrop(id) => crate::stashes::plan_drop(store, Some(id))?.render(),
+        GitOp::StashPush | GitOp::StashPop(_) => {
+            let s = if let GitOp::StashPop(id) = op {
+                crate::stashes::pop(store, Some(id), true)?
+            } else {
+                crate::stashes::push(store, true)?
+            };
+            format!(
+                "{op:?}\nHOME: {}\nSource index: {}\nSnapshot before overwrite; untracked HOME excluded.",
+                s.paths.join(", "),
+                s.index_paths.join(", ")
+            )
+        }
+        GitOp::Restore(hash) => {
+            let cs = crate::restores::plan(store, hash, None, true)?;
+            format!(
+                "Review restore from {hash}\n{}\nHOME and HEAD unchanged until review/apply.",
+                cs.iter()
+                    .map(|c| format!(
+                        "~/{}{}",
+                        c.path,
+                        if c.conflict { " (Conflict)" } else { "" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+    })
 }
 
 /// Typed-in secret text; never printed by `Debug`.
@@ -282,6 +339,12 @@ pub const TABS: [&str; 4] = ["Local", "Staged", "Incoming", "Conflicts"];
 /// A modal dialog over the main screen.
 #[derive(Debug)]
 pub enum Dialog {
+    GitCreate(String),
+    GitConfirm {
+        op: GitOp,
+        preview: String,
+        guard: String,
+    },
     /// The one review listing every selected item; Enter or `y` applies.
     Review(Vec<Item>),
     /// Per-item outcome of an apply, partial results included.
@@ -307,6 +370,10 @@ pub enum Load<T> {
 }
 
 pub struct App {
+    pub git_tab: usize,
+    pub git_selected: usize,
+    pub branches: Vec<crate::branches::Branch>,
+    pub stashes: Vec<crate::stashes::Stash>,
     pub commits: Vec<crate::history::Commit>,
     pub commit_selected: usize,
     commit_limit: usize,
@@ -356,6 +423,10 @@ impl App {
     pub fn new(store: Arc<Store>, rules: HideRules, tx: Sender<Event>) -> Self {
         let root = store.dirs.home.clone();
         Self {
+            git_tab: 0,
+            git_selected: 0,
+            branches: Vec::new(),
+            stashes: Vec::new(),
             commits: Vec::new(),
             commit_selected: 0,
             commit_limit: 50,
@@ -560,6 +631,19 @@ impl App {
             return;
         }
         match done.payload {
+            Payload::GitMeta(result) => match result {
+                Ok((branches, stashes)) => {
+                    self.branches = branches;
+                    self.stashes = stashes;
+                }
+                Err(e) => self.message = Some(e),
+            },
+            Payload::GitPreview { op, preview } => match preview {
+                Ok((preview, guard)) => {
+                    self.dialog = Some(Dialog::GitConfirm { op, preview, guard })
+                }
+                Err(e) => self.message = Some(e),
+            },
             Payload::Commits(r) => match r {
                 Ok(commits) => {
                     self.commits = commits;
@@ -793,6 +877,24 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmPush),
             },
+            Some(Dialog::GitCreate(mut name)) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.git_preview(GitOp::Create(name)),
+                KeyCode::Backspace => {
+                    name.pop();
+                    self.dialog = Some(Dialog::GitCreate(name));
+                }
+                KeyCode::Char(c) => {
+                    name.push(c);
+                    self.dialog = Some(Dialog::GitCreate(name));
+                }
+                _ => self.dialog = Some(Dialog::GitCreate(name)),
+            },
+            Some(Dialog::GitConfirm { op, preview, guard }) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Git(op, guard)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::GitConfirm { op, preview, guard }),
+            },
             Some(Dialog::ConfirmRevert(hash)) => match key.code {
                 KeyCode::Char('y') => self.request_action(ActionReq::Revert(hash)),
                 KeyCode::Esc | KeyCode::Char('n') => {}
@@ -1016,7 +1118,11 @@ impl App {
             }
             KeyCode::Enter if tab == 3 => {
                 if let Some(c) = selected {
-                    self.open_conflict(c.path);
+                    if c.kind == "restore" {
+                        self.message = Some("Historical restore collides or is stale: clear with `dw restore --clear PATH`, preserve edits and re-plan".into());
+                    } else {
+                        self.open_conflict(c.path);
+                    }
                 }
             }
             KeyCode::Enter => self.request_diff(),
@@ -1153,6 +1259,18 @@ impl App {
     }
 
     fn refresh_commits(&mut self) {
+        let meta_store = Arc::clone(&self.store);
+        self.jobs.spawn("git-meta", move |_| {
+            Payload::GitMeta(
+                (|| -> anyhow::Result<_> {
+                    Ok((
+                        crate::branches::list(&meta_store)?,
+                        crate::stashes::list(&meta_store)?,
+                    ))
+                })()
+                .map_err(|e| format!("{e:#}")),
+            )
+        });
         let store = Arc::clone(&self.store);
         let count = self.commit_limit;
         self.jobs.spawn("commits", move |_| {
@@ -1163,6 +1281,9 @@ impl App {
     }
 
     fn commit_diff(&mut self) {
+        if self.git_tab != 0 {
+            return;
+        }
         let Some(c) = self.commits.get(self.commit_selected) else {
             return;
         };
@@ -1180,6 +1301,65 @@ impl App {
     }
 
     fn git_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                self.git_tab =
+                    (self.git_tab + if key.code == KeyCode::Char(']') { 1 } else { 2 }) % 3;
+                self.git_selected = 0;
+                self.commit_diff();
+                return;
+            }
+            KeyCode::Char('R') if self.git_tab == 0 => {
+                if let Some(c) = self.commits.get(self.commit_selected) {
+                    self.git_preview(GitOp::Restore(c.hash.clone()));
+                }
+                return;
+            }
+            _ => {}
+        }
+        if self.git_tab != 0 {
+            let n = if self.git_tab == 1 {
+                self.branches.len()
+            } else {
+                self.stashes.len()
+            };
+            let branch = self.branches.get(self.git_selected).map(|b| b.name.clone());
+            let stash = self.stashes.get(self.git_selected).map(|s| s.id.clone());
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.git_selected = (self.git_selected + 1).min(n.saturating_sub(1))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.git_selected = self.git_selected.saturating_sub(1)
+                }
+                KeyCode::Char('n') if self.git_tab == 1 => {
+                    self.dialog = Some(Dialog::GitCreate(String::new()))
+                }
+                KeyCode::Enter if self.git_tab == 1 => {
+                    if let Some(b) = branch {
+                        self.git_preview(GitOp::Switch(b));
+                    }
+                }
+                KeyCode::Char('d' | 'D') if self.git_tab == 1 => {
+                    if let Some(b) = branch {
+                        self.git_preview(GitOp::Delete(b, key.code == KeyCode::Char('D')));
+                    }
+                }
+                KeyCode::Char('s') if self.git_tab == 2 => self.git_preview(GitOp::StashPush),
+                KeyCode::Enter if self.git_tab == 2 => {
+                    if let Some(s) = stash {
+                        self.git_preview(GitOp::StashPop(s));
+                    }
+                }
+                KeyCode::Char('d') if self.git_tab == 2 => {
+                    if let Some(s) = stash {
+                        self.git_preview(GitOp::StashDrop(s));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
                 self.commit_selected =
@@ -1209,6 +1389,22 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
             _ => {}
         }
+    }
+
+    fn git_preview(&mut self, op: GitOp) {
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn("git-preview", move |_| {
+            let preview = (|| -> anyhow::Result<_> {
+                let guard = crate::git_state::preview_guard(&store)?;
+                let text = preview_git(&store, &op)?;
+                if crate::git_state::preview_guard(&store)? != guard {
+                    anyhow::bail!("state changed during preview; try again");
+                }
+                Ok((text, guard))
+            })()
+            .map_err(|e| format!("{e:#}"));
+            Payload::GitPreview { op, preview }
+        });
     }
 
     /// The editor returned: its merge file becomes the result awaiting y/n.
@@ -1629,6 +1825,12 @@ fn render_diff(
     cancel: &crate::exec::CancelToken,
 ) -> anyhow::Result<ratatui::text::Text<'static>> {
     use ansi_to_tui::IntoText;
+    if c.kind == "restore" {
+        let plain = crate::restores::preview(store, &c.path)?;
+        return Ok(changes::through_delta(store, &plain, Some(cancel))
+            .unwrap_or(plain)
+            .into_text()?);
+    }
     if c.state == State::Incoming {
         return Ok(format!(
             "~/{} has an incoming change.\n\nSpace or Enter applies it to HOME (a snapshot is taken first); a applies all.",
@@ -1668,6 +1870,49 @@ fn render_diff(
 /// Run one queued mutation on a worker thread.
 fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
     match req {
+        ActionReq::Git(op, guard) => {
+            if crate::git_state::preview_guard(store)? != guard {
+                return Err(crate::error::DwError::new(
+                    crate::error::Kind::Stale,
+                    "state changed since preview; review again",
+                )
+                .into());
+            }
+            match &op {
+                GitOp::Create(n) | GitOp::Switch(n) => {
+                    crate::branches::change(store, n, matches!(op, GitOp::Create(_)), false)?;
+                }
+                GitOp::StashPush => {
+                    crate::stashes::push(store, false)?;
+                }
+                GitOp::StashPop(id) => {
+                    crate::stashes::pop(store, Some(id), false)?;
+                }
+                GitOp::Restore(hash) => {
+                    crate::restores::plan(store, hash, None, false)?;
+                }
+                GitOp::Delete(..) | GitOp::StashDrop(_) => {
+                    let item = match &op {
+                        GitOp::Delete(n, f) => crate::branches::plan_delete(store, n, *f)?,
+                        GitOp::StashDrop(id) => crate::stashes::plan_drop(store, Some(id))?,
+                        _ => unreachable!(),
+                    };
+                    if changes::agent(store).is_some() {
+                        let lock = store.lock()?;
+                        let ctx = track::Ctx::load(store)?;
+                        pending::add(store, &lock, vec![item], &track::stale_checker(store, &ctx))?;
+                        return Ok(report("Queued for human approval".into()));
+                    }
+                    let done = track::apply_now(store, &[item])?;
+                    if let Some(bad) = done.iter().find(|r| r.status != track::Outcome::Applied) {
+                        anyhow::bail!("{}", bad.message.as_deref().unwrap_or("operation refused"));
+                    }
+                }
+            }
+            Ok(report(format!(
+                "Completed {op:?}; review Changes for Incoming/Conflicts"
+            )))
+        }
         ActionReq::Revert(hash) => {
             let c = crate::history::revert(store, &hash, changes::agent(store).as_deref())?;
             Ok(report(format!("Reverted in {}; see Incoming", c.short)))

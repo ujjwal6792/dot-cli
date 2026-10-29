@@ -368,6 +368,33 @@ pub enum Command {
         #[arg(long)]
         abort: bool,
     },
+    /// List, create, switch or delete local branches; never writes HOME.
+    Branch {
+        #[command(subcommand)]
+        action: BranchCmd,
+    },
+    /// Stash tracked HOME edits and the independent source index (untracked files excluded).
+    Stash {
+        #[command(subcommand)]
+        action: StashCmd,
+    },
+    /// Review historical rendered files through Incoming; leaves HEAD and HOME unchanged.
+    Restore {
+        /// Commit or revision to restore from.
+        #[arg(long, required_unless_present = "clear", conflicts_with = "clear")]
+        at: Option<String>,
+        /// HOME files or folders to restore.
+        paths: Vec<String>,
+        /// All files received in both historical and current assignments.
+        #[arg(long, conflicts_with = "paths")]
+        all: bool,
+        /// Remove review candidates without writing HOME.
+        #[arg(long)]
+        clear: bool,
+        /// Preview without saving candidates.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List commits (newest first), with the agent that made them.
     Log {
         /// Only commits touching this file (HOME path) or repository path.
@@ -691,6 +718,79 @@ pub enum RemoteCmd {
     },
     /// List the remotes and how their visibility is verified.
     List,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum BranchCmd {
+    /// List local branches and mark the default/current branch.
+    List,
+    /// Create a branch at HEAD without switching.
+    Create {
+        /// New branch name.
+        name: String,
+        /// Preview without creating a branch.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Switch source/index only; refuse overlapping staged edits.
+    Switch {
+        /// Existing local branch name.
+        name: String,
+        /// Preview affected repository paths.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Delete a branch with human approval; agents queue a pending item.
+    Delete {
+        /// Existing local branch name.
+        name: String,
+        /// Explicitly allow deleting an unmerged branch after approval.
+        #[arg(long)]
+        force: bool,
+        /// Confirm as a human (agents cannot approve themselves).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Preview without deleting or queuing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum StashCmd {
+    /// List Dotwarden stashes, with HOME and index paths.
+    List,
+    /// Save tracked HOME and index independently, then clean those paths to HEAD.
+    Push {
+        /// Preview the HOME/index paths; nothing is written.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm overwriting HOME with HEAD after a safety snapshot.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Restore a stash only onto its unchanged base/index/HOME; conflicts retain it.
+    Pop {
+        /// Stash id (newest by default).
+        id: Option<String>,
+        /// Preview without applying or removing the stash.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm after previewing affected paths.
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
+    /// Delete a stash with human approval.
+    Drop {
+        /// Stash id (newest by default).
+        id: Option<String>,
+        /// Preview without deletion.
+        #[arg(long)]
+        dry_run: bool,
+        /// Confirm as a human (agents queue a pending item).
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -1149,6 +1249,15 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
             return cmds::pull_cmd(&store, remote.as_deref(), mode, action, json);
         }
+        Command::Branch { action } => return cmds::branch_cmd(&store, action, json),
+        Command::Stash { action } => return cmds::stash_cmd(&store, action, json),
+        Command::Restore {
+            at,
+            paths,
+            all,
+            clear,
+            dry_run,
+        } => return cmds::restore_at_cmd(&store, at.as_deref(), &paths, all, clear, dry_run, json),
         Command::Log { path, count } => {
             return cmds::log_cmd(&store, path.as_deref(), count, json);
         }

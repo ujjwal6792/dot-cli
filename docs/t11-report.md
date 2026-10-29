@@ -25,4 +25,26 @@
 ## Limits
 - Binary, symlink and delete/modify conflicts use whole-side selection, not text hunks. Remote-tracking refs are the evidence of publication; deleted/unknown remote history cannot be inferred.
 - Historical masking uses known secret values and existing secret detectors; arbitrary legacy plaintext unknown to the vault is not guaranteed detectable.
-- Real terminal editor handoff and interactive delta display were not manually exercised; Linux was not run. No branch/stash/restore-at work (part B), no push.
+- At part A's commit: real terminal editor/delta display and Linux were untested; part B was pending. No push.
+
+## Part B — built
+- CLI `branch list/create/switch/delete`: source/index-only switching, overlap refusal, default-branch warnings, guarded pending approval for agent deletion; current deletion refused and unmerged deletion requires explicit force.
+- CLI `stash list/push/pop/drop`: exact stored index commit under local `refs/dotwarden/stashes/` plus separate tracked HOME payload. Partial staging, references, variants, and staged tracking additions/removals round-trip. Untracked HOME is excluded.
+- Push/pop list HOME/index paths before confirmation and snapshot before overwrite. With a vault, payloads and new safety snapshots are encrypted before disk writes; locked operations refuse. Without one, detected secret-like content refuses capture. Drop uses pending approval for agents.
+- `restore --at REV PATH…|--all` renders an isolated historical source copy using historical data/variants and this machine's identity; both historical/current assignments must receive the file. Candidates contain hashes/fingerprints, never rendered secrets.
+- Candidates appear separately in Incoming/Conflicts and `diff`; HOME/index/HEAD stay unchanged until apply. Apply snapshots HOME, leaves index/HEAD intact, and makes restored content a Local edit. Unrelated forward Incoming survives. Stale/colliding candidates refuse; `restore --clear` removes them.
+- Git `[ ]` tabs: Commits, Branches, Stash. Branches `n` create, Enter switch, `d/D` delete/force; Stash `s` push, Enter pop, `d` drop. Commits `R` previews a historical restore. Mutations use background jobs, path previews, y/n and preview guards; no new event-loop I/O.
+- JSON, dry-run and help added; spec §6/§11 documents scope. Temporary historical copies are clones, not Git worktrees; transient file-backend unlock sessions are cleaned up.
+
+## Part B — verification
+- 14 new behavioral tests: 11 CLI/real-Git tests and 3 TUI tests. Branch index/HOME preservation, approvals, partial/new/removed tracking stash state, conflict retention, references/variants, historical assignments, local/stale collisions, encrypted canaries and UI confirmation are covered.
+- Encryption hand-break: bypassing protected snapshot encryption failed the secret canary; restored. Together with part A this is three targeted hand-breaks.
+- Final full run completed (no timeout): 345 passed, 1 failed, doc tests 0. Failure was read-only status updating Git's index cache via `write-tree`; replaced the guard with a read-only cached-diff fingerprint.
+- Post-fix targeted checks: read-only regression 1/1, git_depth 11/11, new Git TUI actions 3/3 pass. All 346 distinct tests have passing coverage; the already-passing full targets were not repeated.
+- macOS only, isolated HOME/XDG and file sessions throughout. Post-fix `cargo fmt --check` and `cargo clippy --all-targets -- -D warnings` pass.
+
+## Part B — deliberate limits / stop boundary
+- Stash pop requires its original HEAD and a clean source index; it retains the stash rather than attempting a cross-base merge. Custom templates, non-UTF-8 files, symlinks and staged vault identity changes refuse explicitly.
+- Historical restore is limited to regular UTF-8 files received both then and now, with Dotwarden-owned templates. Historical rendering requires unlock if its render scope needs secrets; removed/unassigned targets are not resurrected.
+- No crash-recovery automation for an interrupted multi-file stash; recovery payload/index refs and safety snapshots are retained. Interactive terminal/editor testing and Linux remain unrun.
+- Work stops after T11B. No T10 or other ticket, merge, push, or GitHub changes.

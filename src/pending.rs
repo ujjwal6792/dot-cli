@@ -30,6 +30,13 @@ pub struct TrackFile {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Action {
+    StashDrop {
+        id: String,
+    },
+    BranchDelete {
+        name: String,
+        force: bool,
+    },
     Track {
         /// The tracked path (relative to HOME): a file, symlink or folder.
         path: String,
@@ -190,6 +197,8 @@ pub struct AssignChange {
 impl Action {
     pub fn kind_name(&self) -> &'static str {
         match self {
+            Action::StashDrop { .. } => "stash_drop",
+            Action::BranchDelete { .. } => "branch_delete",
             Action::Track { .. } => "track",
             Action::Untrack { .. } => "untrack",
             Action::Discard { .. } => "discard",
@@ -222,6 +231,8 @@ impl Action {
             || matches!(
                 self,
                 Action::Discard { .. }
+                    | Action::StashDrop { .. }
+                    | Action::BranchDelete { .. }
                     | Action::Resolve { .. }
                     | Action::RemoteAdd { .. }
                     | Action::RemoteRemove { .. }
@@ -233,6 +244,8 @@ impl Action {
     /// Two items with the same key request the same thing.
     pub fn key(&self) -> (&'static str, &str) {
         let what = match self {
+            Action::StashDrop { id } => id,
+            Action::BranchDelete { name, .. } => name,
             Action::Track { path, .. }
             | Action::Untrack { path, .. }
             | Action::Discard { path, .. }

@@ -454,6 +454,24 @@ restore. All machines share one default branch; the UI warns when a machine is o
 another branch. Background fetch runs on TUI start and at a preference interval;
 it never pulls or applies.
 
+Branch create does not switch. Switch changes only source/index; overlapping
+staged edits are refused, and HOME drift is retained. Branch deletion requires
+human approval; current branches cannot be deleted, and unmerged deletion also
+requires explicit `--force`. The current non-default branch is warned about.
+
+Dotwarden stashes are local records, not ordinary Git stashes: they retain the
+exact source index in `refs/dotwarden/stashes/` and tracked HOME contents
+separately, preserving partial staging, references and variants. Untracked HOME
+files are excluded. Push cleans affected HOME/index to HEAD after a snapshot;
+pop requires the same HEAD, clean index and unchanged affected HOME paths.
+Conflicts retain the stash. Payloads and safety snapshots are age-encrypted when
+a vault exists (unlock required); without a vault, detected secret-like content
+is refused. Custom templates, binary/symlink files and staged vault identity
+changes are refused rather than flattened. Staged tracking additions/removals
+are included; previously untracked HOME files remain outside the stash.
+Push/pop preview HOME and index paths and require confirmation; drop uses human
+approval. These records are separate from any stashes made by external Git.
+
 **Public remotes are refused** (ADR 0006). For github.com, gitlab.com,
 codeberg.org and bitbucket.org, an anonymous `git ls-remote` over HTTPS with
 credential helpers and prompts disabled succeeding means public. Checked when a
@@ -631,6 +649,16 @@ from preferences.
   (from snapshot), last unpushed commit. Never a push.
 - Point-in-time restore of one file or all files from any commit (through Incoming
   so it is reviewed).
+  `restore --at REV PATH…|--all` saves only commit IDs and guards locally. It
+  renders historical data/variants for this machine and requires both historical
+  and current assignments to receive each path. HOME and source/index/HEAD are
+  unchanged until apply; `diff` previews the candidate. Local/staged collisions
+  appear as Conflicts; changed guards refuse apply. `restore --clear` removes
+  candidates. Apply snapshots HOME (encrypted with the vault), writes the
+  historical result as a Local edit against current source, and preserves
+  unrelated forward Incoming changes. Regular UTF-8 files and Dotwarden-owned
+  templates are supported; locked secrets require unlock. Stage/commit the
+  result normally to make the restore part of shared history.
 - Archive: git bundle of the repository + registry, encrypted with the vault
   passphrase; `archive import` restores a machine offline.
 
