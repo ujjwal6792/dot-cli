@@ -157,3 +157,61 @@ pub fn stage_plan(store: &Store, rel: &str, id: &str) -> Result<RefStage, String
         remove: None,
     })
 }
+
+/// Plan rewriting the fixed templates (`dw upgrade-templates`).
+pub fn plan_upgrade(store: &Store, ctx: &Ctx, requester: &str) -> Result<Item> {
+    let repo = store.repo();
+    if !crate::templates::needs_upgrade(&repo) {
+        return Err(refuse("the repository templates are up to date".into()));
+    }
+    let files = crate::templates::outdated(&repo)
+        .into_iter()
+        .map(|f| {
+            let action = if repo.join(&f).is_file() {
+                "change"
+            } else {
+                "add"
+            };
+            change(action, "(templates)", &f)
+        })
+        .chain([change("change", "(templates)", "dotwarden.toml")])
+        .collect();
+    let preview = Preview {
+        files,
+        notes: vec![
+            format!(
+                "templates {} → {}; stored files are unchanged and keep rendering the same",
+                crate::templates::recorded(&repo),
+                crate::templates::VERSION
+            ),
+            "other machines upgrade when they pull and apply this change".into(),
+        ],
+        ..Preview::default()
+    };
+    new_item(
+        store,
+        requester,
+        Action::UpgradeTemplates {
+            key: "templates".into(),
+        },
+        "Upgrade the repository templates".into(),
+        preview,
+        ctx,
+    )
+}
+
+pub fn upgrade_templates(store: &Store) -> Result<BTreeSet<String>> {
+    let repo = store.repo();
+    let mut files: BTreeSet<String> = crate::templates::outdated(&repo).into_iter().collect();
+    for (rel, content) in crate::templates::FILES {
+        if files.contains(*rel) {
+            crate::fsutil::write_atomic(&repo.join(rel), content)?;
+        }
+    }
+    let path = repo.join("dotwarden.toml");
+    let mut doc: toml_edit::DocumentMut = fs::read_to_string(&path)?.parse()?;
+    doc["templates"] = toml_edit::value(crate::templates::VERSION);
+    crate::fsutil::write_atomic(&path, doc.to_string())?;
+    files.insert("dotwarden.toml".into());
+    Ok(files)
+}

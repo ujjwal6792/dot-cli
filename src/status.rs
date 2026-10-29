@@ -62,6 +62,8 @@ pub struct Status {
     pub vault: String,
     /// Files that need the vault to render and are skipped while it is locked.
     pub vault_locked_files: Vec<String>,
+    /// The repository's fixed templates are older than this version's.
+    pub templates_outdated: bool,
 }
 
 fn trimmed(store: &Store, args: &[&str], cancel: Option<&CancelToken>) -> Option<String> {
@@ -99,6 +101,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             value_changes: Vec::new(),
             vault: "none".into(),
             vault_locked_files: Vec::new(),
+            templates_outdated: false,
         });
     }
     let machine = store.local_machine_name()?.map(|name| {
@@ -182,6 +185,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         changes,
         variants,
         value_changes,
+        templates_outdated: crate::templates::needs_upgrade(&store.repo()),
         vault: vault_state(store),
         vault_locked_files: crate::values::locked_files(store)
             .unwrap_or_default()
@@ -304,6 +308,9 @@ impl Status {
                     v.clash.as_deref().unwrap_or_default()
                 ));
             }
+        }
+        if self.templates_outdated {
+            s.push_str("Templates:  outdated; run `dw upgrade-templates` (adds secrets/encrypted files support)\n");
         }
         s.push_str(&format!("Vault:      {}\n", self.vault));
         s.push_str(&format!("Repository: {}\n", self.repo_path));

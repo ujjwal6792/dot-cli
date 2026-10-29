@@ -693,3 +693,64 @@ fn add_secret_has_apply_and_a_dry_run_that_changes_nothing() {
             .is_file()
     );
 }
+
+const OLD_VALUE_TEMPLATE: &str = r#"{{- /* Value of a variable for this machine. */ -}}
+{{- $v := dig "dotwarden" "values" .name (dict) .data -}}
+{{- if not $v -}}
+{{- fail (printf "dotwarden: variable %q does not exist" .name) -}}
+{{- end -}}
+{{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- $w := includeTemplate "dotwarden/select" (dict "targets" $targets "entries" (get $v "overrides" | default (list)) "what" (printf "overrides of %s" .name)) -}}
+{{- if $w }}{{ (fromJson $w).value }}{{ else }}{{ get $v "default" }}{{ end -}}
+"#;
+
+#[test]
+fn an_older_repository_is_upgraded_through_a_pending_item_without_changing_stored_files() {
+    let t = env();
+    t.dw_ok(&["init", "--name", "mac"]);
+    write(&t, ".conf", "font = Menlo\n");
+    t.dw_ok(&["track", ".conf", "--apply"]);
+    t.dw_ok(&["values", "set-variable", "FONT", "Menlo", "--apply"]);
+    t.dw_ok(&["values", "wire", ".conf", "FONT", "--apply"]);
+    // Make the repository look like one created by the previous version.
+    let r = repo(&t);
+    fs::write(
+        r.join("home/.chezmoitemplates/dotwarden/value"),
+        OLD_VALUE_TEMPLATE,
+    )
+    .unwrap();
+    fs::remove_file(r.join("home/.chezmoitemplates/dotwarden/file")).unwrap();
+    let toml = fs::read_to_string(r.join("dotwarden.toml"))
+        .unwrap()
+        .replace("templates = 2\n", "");
+    fs::write(r.join("dotwarden.toml"), toml).unwrap();
+    t.git(&r, &["add", "-A"]);
+    t.dw_ok(&["commit", "-m", "old"]);
+    assert!(t.dw_ok(&["status"]).contains("dw upgrade-templates"));
+    assert!(t.dw_ok(&["doctor"]).contains("outdated"));
+    let dry = t.dw_ok(&["upgrade-templates", "--dry-run"]);
+    assert!(
+        dry.contains("dotwarden/value") && dry.contains("dotwarden/file"),
+        "{dry}"
+    );
+    let stored = fs::read_to_string(r.join("home/dot_conf.tmpl")).unwrap();
+    t.dw_ok(&["upgrade-templates", "--apply"]);
+    assert_eq!(
+        fs::read_to_string(r.join("home/dot_conf.tmpl")).unwrap(),
+        stored
+    );
+    assert!(!t.dw_ok(&["status"]).contains("upgrade-templates"));
+    assert_ne!(
+        dw(&t, &["upgrade-templates"]).code,
+        0,
+        "nothing left to upgrade"
+    );
+    // A secret now works in the upgraded repository.
+    init_vault(&t);
+    assert_eq!(add_secret(&t, "S", None, "Upgraded-Secret-1").code, 0);
+    assert!(
+        !t.dw_ok(&["status"]).contains("Local"),
+        "{}",
+        t.dw_ok(&["status"])
+    );
+}

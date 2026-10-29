@@ -202,6 +202,15 @@ pub fn run(store: &Store) -> Report {
                     Ok(_) => {}
                     Err(e) => checks.push(check("variants", false, format!("{e:#}"))),
                 }
+                if crate::templates::needs_upgrade(&store.repo()) {
+                    let mut w = check(
+                        "templates",
+                        true,
+                        "the repository's fixed templates are outdated; run `dw upgrade-templates`",
+                    );
+                    w.warning = true;
+                    checks.push(w);
+                }
                 if config_ok {
                     checks.push(match store.chezmoi(&["managed"]) {
                         Ok(o) => check(

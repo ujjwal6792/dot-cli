@@ -163,6 +163,15 @@ pub enum Command {
         #[command(subcommand)]
         action: VaultCmd,
     },
+    /// Upgrade the repository's fixed templates (added by newer versions) as a pending item.
+    UpgradeTemplates {
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Store a tracked file encrypted in the vault (rendered by a helper on apply).
     Encrypt {
         /// A tracked file.
@@ -836,6 +845,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 VaultCmd::Passwd => vault_cmds::passwd(&store, json),
                 VaultCmd::Recover => vault_cmds::recover(&store, json),
             };
+        }
+        Command::UpgradeTemplates { apply, dry_run } => {
+            return vault_cmds::upgrade_templates(&store, apply, dry_run, json);
         }
         Command::Encrypt {
             path,

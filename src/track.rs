@@ -479,6 +479,16 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         Action::ValueWire { .. } => {
             g.repo.extend(crate::values::guard(store, ctx, action)?);
         }
+        Action::UpgradeTemplates { .. } => {
+            for (rel, _) in crate::templates::FILES {
+                g.repo
+                    .insert(format!("template:{rel}"), repo_fingerprint(&repo, rel));
+            }
+            g.repo.insert(
+                "templates:version".into(),
+                crate::templates::recorded(&repo).to_string(),
+            );
+        }
         Action::Encrypt { path, .. } | Action::SecretMove { path, .. } => {
             g.home
                 .insert(path.clone(), home_fingerprint(&home.join(path)));
@@ -1440,6 +1450,10 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
                 crate::detect::prune(store)?;
             }
             Ok(staged)
+        }
+        Action::UpgradeTemplates { .. } => {
+            let expected = crate::encfile::upgrade_templates(store)?;
+            verify_and_stage(store, &expected, &[])
         }
         Action::Encrypt { .. } => {
             let expected = crate::encfile::exec(store, &item.action)?;

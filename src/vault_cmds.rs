@@ -151,6 +151,18 @@ pub fn add_secret(
     done(json, &format!("secret {name} stored in the vault (staged)"))
 }
 
+pub fn upgrade_templates(
+    store: &Store,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = crate::track::Ctx::load(store)?;
+    let item = crate::encfile::plan_upgrade(store, &ctx, &crate::pending::requester(store))?;
+    crate::cmds::submit(store, vec![item], apply, dry_run, json)
+}
+
 pub fn encrypt(
     store: &Store,
     path: &str,

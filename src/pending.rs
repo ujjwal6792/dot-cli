@@ -137,6 +137,10 @@ pub enum Action {
         path: String,
         name: String,
     },
+    /// Rewrite the repository's fixed templates to this version's.
+    UpgradeTemplates {
+        key: String,
+    },
     /// Store a tracked file encrypted in the vault (`files/<id>.age`).
     Encrypt {
         key: String,
@@ -187,6 +191,7 @@ impl Action {
             Action::ValueUnset { .. } => "value_unset",
             Action::ValueWire { .. } => "value_wire",
             Action::Encrypt { .. } => "encrypt",
+            Action::UpgradeTemplates { .. } => "upgrade_templates",
             Action::SecretMove { .. } => "secret_move",
         }
     }
@@ -221,6 +226,7 @@ impl Action {
             Action::ValueSet { key, .. }
             | Action::ValueUnset { key, .. }
             | Action::ValueWire { key, .. }
+            | Action::UpgradeTemplates { key }
             | Action::Encrypt { key, .. }
             | Action::SecretMove { key, .. } => key,
         };

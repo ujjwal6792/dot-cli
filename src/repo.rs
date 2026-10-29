@@ -48,7 +48,10 @@ pub fn write_layout(root: &Path, branch: &str) -> Result<()> {
     write(
         root,
         "dotwarden.toml",
-        &format!("format = {FORMAT_VERSION}\ndefault_branch = \"{branch}\"\n"),
+        &format!(
+            "format = {FORMAT_VERSION}\ntemplates = {}\ndefault_branch = \"{branch}\"\n",
+            templates::VERSION
+        ),
     )?;
     write(root, "hide", DEFAULT_RULES)?;
     for (rel, content) in templates::FILES {
