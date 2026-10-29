@@ -1538,13 +1538,15 @@ pub fn mask_home(rendered: &str, home: &str, known: &[(String, String)]) -> Stri
                     for l in &new_lines[n] {
                         out.push_str(l);
                     }
-                } else if o.len() == n.len()
-                    && o.clone()
-                        .zip(n.clone())
-                        .all(|(a, b)| line_matches(old_lines[a], new_lines[b]))
-                {
-                    for l in &old_lines[o] {
-                        out.push_str(l);
+                } else if o.len() == n.len() {
+                    for (a, b) in o.zip(n) {
+                        out.push_str(if !old_lines[a].contains("«secret:") {
+                            new_lines[b]
+                        } else if line_matches(old_lines[a], new_lines[b]) {
+                            old_lines[a]
+                        } else {
+                            HIDDEN
+                        });
                     }
                 } else if !n.is_empty() {
                     out.push_str(HIDDEN);

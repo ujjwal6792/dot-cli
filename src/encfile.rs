@@ -93,7 +93,7 @@ pub fn plan(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> Result<
     let action = Action::Encrypt {
         key: hp.rel.clone(),
         path: hp.rel.clone(),
-        id,
+        file_id: id,
         source: entry.source.clone(),
     };
     new_item(
@@ -109,7 +109,10 @@ pub fn plan(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> Result<
 /// Make the repository change of an `Encrypt` item; returns the files changed.
 pub fn exec(store: &Store, action: &Action) -> Result<BTreeSet<String>> {
     let Action::Encrypt {
-        path, id, source, ..
+        path,
+        file_id,
+        source,
+        ..
     } = action
     else {
         unreachable!("not an encrypt action");
@@ -117,11 +120,11 @@ pub fn exec(store: &Store, action: &Action) -> Result<BTreeSet<String>> {
     let repo = store.repo();
     let plain =
         fs::read(store.dirs.home.join(path)).with_context(|| format!("reading ~/{path}"))?;
-    let age = age_file(id);
+    let age = age_file(file_id);
     let new_source = format!("{source}.tmpl");
     for (rel, bytes) in [
         (age.clone(), vault::encrypt(store, &plain)?),
-        (new_source.clone(), render::file_stub(id).into_bytes()),
+        (new_source.clone(), render::file_stub(file_id).into_bytes()),
     ] {
         let p = repo.join(&rel);
         if let Some(d) = p.parent() {

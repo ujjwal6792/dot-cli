@@ -141,7 +141,7 @@ pub enum Action {
     Encrypt {
         key: String,
         path: String,
-        id: String,
+        file_id: String,
         /// The current source file of `path`.
         source: String,
     },

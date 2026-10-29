@@ -1400,7 +1400,9 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
         }
         Action::Encrypt { .. } => {
             let expected = crate::encfile::exec(store, &item.action)?;
-            verify_and_stage(store, &expected, &[])
+            let staged = verify_and_stage(store, &expected, &[])?;
+            crate::detect::prune(store)?;
+            Ok(staged)
         }
         Action::SecretMove { .. } => {
             let expected = crate::detect::exec(store, &item.action)?;

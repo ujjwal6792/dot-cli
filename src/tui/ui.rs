@@ -23,14 +23,6 @@ const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m 
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
-    (
-        "E",
-        "Files: store the selected tracked file encrypted (pending item)",
-    ),
-    (
-        "V, u / L",
-        "Values: u unlock (masked prompt), L lock, s new secret",
-    ),
     ("q / Ctrl-C", "quit"),
     ("1-5", "focus panel Status/Files/Changes/Git/Machines"),
     ("Tab / Shift-Tab", "next / previous panel"),
@@ -70,6 +62,14 @@ const HELP: &[(&str, &str)] = &[
     ("< / >, Home / End", "first / last item"),
     (".", "show or hide items matched by hide rules"),
     ("r", "refresh status and folder"),
+    (
+        "E",
+        "Files: store the selected tracked file encrypted (pending item)",
+    ),
+    (
+        "V, u / L",
+        "Values: u unlock (masked prompt), L lock, s new secret",
+    ),
 ];
 
 fn border(focused: bool) -> Style {
