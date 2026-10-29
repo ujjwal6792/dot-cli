@@ -38,6 +38,7 @@ Hand-broken (both caught, reverted): token check removed (1 failed); masked diff
 3. `values add-secret` has `--apply` (the default, since values cannot wait in pending) and a structured `--dry-run`.
 4. Templates carry `templates = N` in `dotwarden.toml`; `dw upgrade-templates` adds a pending item; status and doctor hint. Content-compared, stored files unchanged.
 5. `values remove NAME [--force]` (force needs human approval), `values unset-secret NAME --target T` (needs unlock), `values wire PATH NAME --literal TEXT` for placeholders; a placeholder renders empty with a stderr warning, needs no unlock; doctor lists referenced placeholders.
+6. Session store: the Keychain is used only through `security` with the login keychain path of this HOME given explicitly (checked first with `show-keychain-info`), payload on `security -i` stdin; every `security`/`secret-tool` call has null or piped stdin and a 5 s kill timeout; any failure falls back to the 0600 file with a one-line notice (Security framework dependency removed).
 
 ## Gaps
 

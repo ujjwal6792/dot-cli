@@ -7,7 +7,7 @@
 //! in [`Prompt::hook`] so that tests can run without a terminal.
 
 use std::io::IsTerminal;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use age::secrecy::{ExposeSecret, SecretString};
@@ -373,81 +373,134 @@ pub mod session {
         }
     }
 
-    /// macOS Keychain through the Security framework (no secret on a command line).
-    #[cfg(target_os = "macos")]
-    struct Keychain;
+    const TOOL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
 
-    #[cfg(target_os = "macos")]
+    /// Run an OS credential tool without ever blocking on it: stdin is `input`
+    /// (or null), the child is killed after [`TOOL_TIMEOUT`], and any failure is
+    /// an error (the caller falls back to the file store). Returns stdout.
+    fn run_tool(mut cmd: Command, input: Option<&str>) -> Result<String> {
+        use std::io::{Read, Write};
+        cmd.stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null());
+        let mut child = cmd.spawn().context("starting the credential tool")?;
+        if let (Some(text), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(text.as_bytes())?;
+        }
+        let start = std::time::Instant::now();
+        let status = loop {
+            if let Some(s) = child.try_wait()? {
+                break s;
+            }
+            if start.elapsed() >= TOOL_TIMEOUT {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(anyhow!("the credential tool timed out"));
+            }
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        };
+        let mut out = String::new();
+        if let Some(mut o) = child.stdout.take() {
+            let _ = o.read_to_string(&mut out);
+        }
+        if status.success() {
+            Ok(out)
+        } else {
+            Err(anyhow!("the credential tool failed"))
+        }
+    }
+
+    fn hex_of(s: &str) -> String {
+        s.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    fn unhex(s: &str) -> Option<String> {
+        let s = s.trim();
+        let bytes: Option<Vec<u8>> = (0..s.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(s.get(i..i + 2)?, 16).ok())
+            .collect();
+        String::from_utf8(bytes?).ok()
+    }
+
+    /// macOS Keychain through the `security` tool, always with an explicit
+    /// keychain file (so it never searches for or creates one, which would
+    /// raise a GUI dialog) and never blocking. The payload travels hex-encoded
+    /// on the stdin of `security -i`, not on a command line.
+    struct Keychain(PathBuf);
+
+    impl Keychain {
+        /// A usable login keychain of this HOME, checked without any prompt.
+        fn open(home: &Path) -> Result<Self> {
+            let path = home.join("Library/Keychains/login.keychain-db");
+            if !path.is_file() {
+                return Err(anyhow!("no login keychain in {}", home.display()));
+            }
+            let mut cmd = Command::new("security");
+            cmd.arg("show-keychain-info").arg(&path);
+            run_tool(cmd, None).context("the login keychain is not usable")?;
+            Ok(Self(path))
+        }
+        fn line(&self, verb: &str, key: &str, tail: &str) -> String {
+            format!(
+                "{verb} -a {key} -s dotwarden-session {tail} \"{}\"\n",
+                self.0.display()
+            )
+        }
+        fn run(&self, line: &str) -> Result<String> {
+            let mut cmd = Command::new("security");
+            cmd.arg("-i");
+            run_tool(cmd, Some(line))
+        }
+    }
+
     impl Backend for Keychain {
         fn put(&self, key: &str, payload: &str) -> Result<()> {
-            security_framework::passwords::set_generic_password(
-                "dotwarden-session",
-                key,
-                payload.as_bytes(),
-            )
-            .map_err(|e| anyhow!("keychain: {e}"))
+            let tail = format!("-U -w {}", hex_of(payload));
+            self.run(&self.line("add-generic-password", key, &tail))
+                .map(|_| ())
         }
         fn get(&self, key: &str) -> Result<Option<String>> {
-            Ok(
-                security_framework::passwords::get_generic_password("dotwarden-session", key)
-                    .ok()
-                    .and_then(|b| String::from_utf8(b).ok()),
-            )
+            Ok(self
+                .run(&self.line("find-generic-password", key, "-w"))
+                .ok()
+                .and_then(|o| unhex(&o)))
         }
         fn delete(&self, key: &str) -> Result<()> {
-            let _ =
-                security_framework::passwords::delete_generic_password("dotwarden-session", key);
+            let _ = self.run(&self.line("delete-generic-password", key, ""));
             Ok(())
         }
     }
 
-    /// Linux Secret Service through `secret-tool` (payload on stdin).
-    #[allow(dead_code)]
+    /// Linux Secret Service through `secret-tool` (payload on stdin, bounded).
     struct SecretService;
 
     impl Backend for SecretService {
         fn put(&self, key: &str, payload: &str) -> Result<()> {
-            use std::io::Write;
-            let mut c = Command::new("secret-tool")
-                .args([
-                    "store",
-                    "--label=dotwarden session",
-                    "service",
-                    "dotwarden",
-                    "key",
-                    key,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .context("secret-tool")?;
-            c.stdin
-                .take()
-                .context("stdin")?
-                .write_all(payload.as_bytes())?;
-            if c.wait()?.success() {
-                Ok(())
-            } else {
-                Err(anyhow!("secret-tool failed"))
-            }
+            let mut cmd = Command::new("secret-tool");
+            cmd.args([
+                "store",
+                "--label=dotwarden session",
+                "service",
+                "dotwarden",
+                "key",
+                key,
+            ]);
+            run_tool(cmd, Some(payload)).map(|_| ())
         }
         fn get(&self, key: &str) -> Result<Option<String>> {
-            let o = Command::new("secret-tool")
-                .args(["lookup", "service", "dotwarden", "key", key])
-                .stderr(Stdio::null())
-                .output()
-                .context("secret-tool")?;
-            Ok(o.status
-                .success()
-                .then(|| String::from_utf8(o.stdout).ok())
-                .flatten())
+            let mut cmd = Command::new("secret-tool");
+            cmd.args(["lookup", "service", "dotwarden", "key", key]);
+            Ok(run_tool(cmd, None).ok().filter(|o| !o.is_empty()))
         }
         fn delete(&self, key: &str) -> Result<()> {
-            let _ = Command::new("secret-tool")
-                .args(["clear", "service", "dotwarden", "key", key])
-                .stderr(Stdio::null())
-                .status();
+            let mut cmd = Command::new("secret-tool");
+            cmd.args(["clear", "service", "dotwarden", "key", key]);
+            let _ = run_tool(cmd, None);
             Ok(())
         }
     }
@@ -455,15 +508,27 @@ pub mod session {
     /// The OS store, falling back to the file when it is unavailable.
     struct Auto {
         primary: Option<Box<dyn Backend>>,
+        /// Why there is no OS store (shown once when a session starts).
+        unavailable: Option<String>,
         file: FileBackend,
+    }
+
+    fn notice(why: &str) {
+        static ONCE: std::sync::Once = std::sync::Once::new();
+        ONCE.call_once(|| {
+            eprintln!("dotwarden: OS credential store unavailable ({why}); using a private 0600 file instead");
+        });
     }
 
     impl Backend for Auto {
         fn put(&self, key: &str, payload: &str) -> Result<()> {
-            if let Some(p) = &self.primary
-                && p.put(key, payload).is_ok()
-            {
-                return Ok(());
+            match (&self.primary, &self.unavailable) {
+                (Some(p), _) => match p.put(key, payload) {
+                    Ok(()) => return Ok(()),
+                    Err(e) => notice(&format!("{e:#}")),
+                },
+                (None, Some(why)) => notice(why),
+                _ => {}
             }
             self.file.put(key, payload)
         }
@@ -489,26 +554,34 @@ pub mod session {
             .env()
             .get(std::ffi::OsStr::new("DOTWARDEN_SESSION_BACKEND"))
             .is_some_and(|v| v == "file");
-        let primary: Option<Box<dyn Backend>> = if forced {
-            None
+        // A tool that failed or hung once is not tried again in this process.
+        static FAILED: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let found: Result<Box<dyn Backend>> = if forced {
+            Err(anyhow!("forced"))
+        } else if let Some(why) = FAILED.get() {
+            Err(anyhow!("{why}"))
+        } else if cfg!(target_os = "macos") {
+            Keychain::open(&store.dirs.home).map(|k| Box::new(k) as Box<dyn Backend>)
         } else {
-            #[cfg(target_os = "macos")]
-            {
-                Some(Box::new(Keychain))
-            }
-            #[cfg(not(target_os = "macos"))]
-            {
-                Command::new("secret-tool")
-                    .arg("--version")
-                    .stdout(Stdio::null())
-                    .stderr(Stdio::null())
-                    .status()
-                    .ok()
-                    .filter(|s| s.success())
-                    .map(|_| Box::new(SecretService) as Box<dyn Backend>)
-            }
+            let mut cmd = Command::new("secret-tool");
+            cmd.arg("--version");
+            run_tool(cmd, None).map(|_| Box::new(SecretService) as Box<dyn Backend>)
         };
-        Auto { primary, file }
+        if let (Err(e), false) = (&found, forced) {
+            let _ = FAILED.set(format!("{e:#}"));
+        }
+        match found {
+            Ok(p) => Auto {
+                primary: Some(p),
+                unavailable: None,
+                file,
+            },
+            Err(e) => Auto {
+                primary: None,
+                unavailable: (!forced).then(|| format!("{e:#}")),
+                file,
+            },
+        }
     }
 
     fn key(store: &Store) -> String {

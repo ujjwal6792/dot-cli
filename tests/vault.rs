@@ -860,3 +860,71 @@ fn an_agent_can_wire_a_placeholder_which_renders_empty_until_a_human_sets_it() {
         "name = demo\nkey = Real-App-Key-Value-77\n"
     );
 }
+
+/// A `security` that hangs forever, first on PATH: proves nothing real is used.
+fn with_hanging_security(t: &mut TestEnv) {
+    let bin = t.root.path().join("fakebin");
+    fs::create_dir_all(&bin).unwrap();
+    let fake = bin.join("security");
+    fs::write(&fake, "#!/bin/sh\nsleep 600\n").unwrap();
+    fs::set_permissions(&fake, fs::Permissions::from_mode(0o755)).unwrap();
+    let path = format!(
+        "{}:{}",
+        bin.display(),
+        t.env[std::ffi::OsStr::new("PATH")].to_string_lossy()
+    );
+    t.set("PATH", path);
+    t.env
+        .remove(std::ffi::OsStr::new("DOTWARDEN_SESSION_BACKEND"));
+}
+
+#[test]
+fn an_unusable_or_hanging_keychain_falls_back_to_the_file_store_without_blocking() {
+    for hang in [false, true] {
+        let mut t = env();
+        with_hanging_security(&mut t);
+        if hang {
+            // A keychain file exists, but `security` never answers.
+            let kc = t.home.join("Library/Keychains");
+            fs::create_dir_all(&kc).unwrap();
+            fs::write(kc.join("login.keychain-db"), "").unwrap();
+        }
+        let started = std::time::Instant::now();
+        t.dw_ok(&["init", "--name", "mac"]);
+        let r = run(
+            &t,
+            &[("DOTWARDEN_TEST_NEW_PASSPHRASE", PASS)],
+            false,
+            &["vault", "init"],
+        );
+        assert_eq!(r.code, 0, "{}", r.all());
+        assert!(
+            r.err.contains("OS credential store unavailable"),
+            "{}",
+            r.err
+        );
+        ok(&t, &[], &["vault", "lock"]);
+        let r = run(
+            &t,
+            &[("DOTWARDEN_TEST_PASSPHRASE", PASS)],
+            false,
+            &["vault", "unlock"],
+        );
+        assert_eq!(r.code, 0, "{}", r.all());
+        assert!(r.err.contains("OS credential store unavailable"));
+        assert!(ok(&t, &[], &["vault", "status"]).contains("unlocked"));
+        let rt = t.env[std::ffi::OsStr::new("XDG_RUNTIME_DIR")].clone();
+        assert!(
+            fs::read_dir(PathBuf::from(rt).join("dotwarden"))
+                .unwrap()
+                .count()
+                == 1,
+            "file session"
+        );
+        assert!(
+            started.elapsed().as_secs() < 60,
+            "no hang: {:?}",
+            started.elapsed()
+        );
+    }
+}
