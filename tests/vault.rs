@@ -754,3 +754,109 @@ fn an_older_repository_is_upgraded_through_a_pending_item_without_changing_store
         t.dw_ok(&["status"])
     );
 }
+
+#[test]
+fn values_can_be_removed_safely_and_secret_overrides_unset() {
+    let (a, b) = wired_pair();
+    // Referenced: refused; --force is a request only a human may approve.
+    let r = dw(&a, &["values", "remove", "API"]);
+    assert_eq!(r.code, 1, "{}", r.all());
+    assert!(r.err.contains("still referenced") && r.err.contains("--force"));
+    let forced = run(
+        &a,
+        &[],
+        true,
+        &["values", "remove", "API", "--force", "--apply"],
+    );
+    assert_eq!(forced.code, 3, "agent: {}", forced.all());
+    assert!(
+        repo(&a)
+            .join("home/.dotwarden/vault/secrets/API.age")
+            .is_file()
+    );
+    a.dw_ok(&["pending", "drop", "1"]);
+
+    // Unsetting the srv override changes what srv receives.
+    let r = dw(
+        &a,
+        &["values", "unset-secret", "API", "--target", "machine:nope"],
+    );
+    assert_eq!(r.code, 1);
+    a.dw_ok(&["values", "unset-secret", "API", "--target", "machine:srv"]);
+    assert!(!read_meta(&a, "API").contains("machine:srv"));
+    a.dw_ok(&["commit", "-m", "unset"]);
+    sync(&a, &b);
+    unlock(&b);
+    b.dw_ok(&["apply", "--all"]);
+    assert_eq!(read(&b, ".conf"), format!("key = {DEFAULT_V}\nname = x\n"));
+
+    // Unreferenced values (secret and variable) can be removed.
+    assert_eq!(add_secret(&a, "TMP", None, "Tmp-Secret-Value-1").code, 0);
+    a.dw_ok(&["values", "set-variable", "VAR", "v", "--apply"]);
+    a.dw_ok(&["values", "remove", "TMP", "--apply"]);
+    a.dw_ok(&["values", "remove", "VAR", "--apply"]);
+    assert!(
+        !repo(&a)
+            .join("home/.dotwarden/vault/secrets/TMP.age")
+            .exists()
+    );
+    assert!(!a.dw_ok(&["values", "list"]).contains("TMP"));
+}
+
+#[test]
+fn an_agent_can_wire_a_placeholder_which_renders_empty_until_a_human_sets_it() {
+    let t = env();
+    t.dw_ok(&["init", "--name", "mac"]);
+    init_vault(&t);
+    t.dw_ok(&["commit", "-m", "vault"]);
+    write(&t, ".app", "name = demo\nkey = REPLACE_ME\n");
+    t.dw_ok(&["track", ".app", "--apply"]);
+    let agent = |args: &[&str]| run(&t, &[], true, args);
+    assert_eq!(
+        agent(&["values", "add-secret", "APP_KEY", "--placeholder"]).code,
+        0
+    );
+    // Without a stand-in the placeholder cannot be wired; a value-like stand-in is refused.
+    assert_eq!(
+        agent(&["values", "wire", ".app", "APP_KEY", "--apply"]).code,
+        1
+    );
+    let bad = agent(&[
+        "values",
+        "wire",
+        ".app",
+        "APP_KEY",
+        "--literal",
+        "sk-abcdefghijklmnopqrstuvwxyz0123",
+        "--apply",
+    ]);
+    assert_eq!(bad.code, 1, "{}", bad.all());
+    let ok_ = agent(&[
+        "values",
+        "wire",
+        ".app",
+        "APP_KEY",
+        "--literal",
+        "REPLACE_ME",
+        "--apply",
+    ]);
+    assert_eq!(ok_.code, 0, "{}", ok_.all());
+    t.dw_ok(&["commit", "-m", "wire"]);
+    // Locked or not it renders empty (a warning names the secret only).
+    ok(&t, &[], &["vault", "lock"]);
+    t.dw_ok(&["apply", "--all"]);
+    assert_eq!(read(&t, ".app"), "name = demo\nkey = \n");
+    assert!(t.dw_ok(&["doctor"]).contains("APP_KEY"));
+    // The human sets the value; the same reference now renders it.
+    assert_eq!(
+        add_secret(&t, "APP_KEY", None, "Real-App-Key-Value-77").code,
+        0
+    );
+    t.dw_ok(&["commit", "-m", "key"]);
+    unlock(&t);
+    t.dw_ok(&["apply", "--all"]);
+    assert_eq!(
+        read(&t, ".app"),
+        "name = demo\nkey = Real-App-Key-Value-77\n"
+    );
+}

@@ -238,7 +238,10 @@ impl Resolver {
 
     /// The value this machine receives. A secret needs the unlock session.
     pub fn value(&self, name: &str) -> Result<String> {
-        if self.is_secret(name) {
+        if let Some(m) = self.secrets.get(name) {
+            if m.placeholder {
+                return Ok(String::new());
+            }
             let id = self.identity.as_ref().ok_or_else(crate::vault::locked)?;
             return crate::secrets::value_for(&self.store, id, name, &self.targets);
         }
@@ -1006,6 +1009,65 @@ pub fn plan_unset(
     new_item(store, requester, action, summary, preview, ctx)
 }
 
+/// Plan removing a variable or secret. While files reference it this is
+/// refused, unless `force` (which only a human may approve).
+pub fn plan_remove(
+    store: &Store,
+    ctx: &Ctx,
+    name: &str,
+    force: bool,
+    requester: &str,
+) -> Result<Pending> {
+    let repo = store.repo();
+    let vars = read_all(&repo)?;
+    let secrets = crate::secrets::read_meta(&repo);
+    let secret = secrets.contains_key(name);
+    if !secret && !vars.contains_key(name) {
+        return Err(refuse(format!("{name} does not exist")));
+    }
+    let used = usage(&repo, &ctx.tracked)?.remove(name).unwrap_or_default();
+    if !used.is_empty() && !force {
+        return Err(refuse(format!(
+            "{name} is still referenced by {}; the references would no longer render \
+             (--force removes it anyway and needs a human's approval)",
+            used.iter().map(|f| tilde(f)).collect::<Vec<_>>().join(", ")
+        )));
+    }
+    let kind = if secret { "secret" } else { "variable" };
+    let mut files = vec![change("remove", name, &file_of(name))];
+    if secret && repo.join(crate::secrets::file_of(name)).is_file() {
+        files.push(change("remove", name, &crate::secrets::file_of(name)));
+    }
+    let mut notes = Vec::new();
+    if !used.is_empty() {
+        notes.push(format!(
+            "warning: {} file(s) reference {name} and will fail to render: {}",
+            used.len(),
+            used.iter().map(|f| tilde(f)).collect::<Vec<_>>().join(", ")
+        ));
+    }
+    let preview = Preview {
+        files,
+        data: vec![format!("remove {kind} {name}")],
+        notes,
+        ..Preview::default()
+    };
+    let action = Action::ValueRemove {
+        key: format!("remove:{name}"),
+        name: name.into(),
+        force,
+        secret,
+    };
+    new_item(
+        store,
+        requester,
+        action,
+        format!("Remove {kind} {name}"),
+        preview,
+        ctx,
+    )
+}
+
 /// The repository changes of wiring one variable into one file.
 struct Wiring {
     writes: Vec<(String, String)>,
@@ -1147,7 +1209,48 @@ pub fn plan_wire(
     name: &str,
     requester: &str,
 ) -> Result<Pending> {
-    let w = wiring(store, ctx, &hp.rel, name, None)?;
+    plan_wire_literal(store, ctx, hp, name, None, requester)
+}
+
+/// Wire `name`; for a placeholder secret `literal` is the stand-in text in the
+/// file that the reference replaces (it must not look like a secret).
+pub fn plan_wire_literal(
+    store: &Store,
+    ctx: &Ctx,
+    hp: &HomePath,
+    name: &str,
+    literal: Option<&str>,
+    requester: &str,
+) -> Result<Pending> {
+    let placeholder = crate::secrets::read_meta(&store.repo())
+        .get(name)
+        .is_some_and(|m| m.placeholder);
+    let literal = match (literal, placeholder) {
+        (Some(l), true) => {
+            if l.is_empty()
+                || l.chars().count() > 64
+                || !crate::detect::scan_text(l).is_empty()
+                || !crate::detect::scan_text(&format!("token = {l}")).is_empty()
+            {
+                return Err(refuse(
+                    "the stand-in text must be a short placeholder, not a value".into(),
+                ));
+            }
+            Some(l)
+        }
+        (Some(_), false) => {
+            return Err(refuse(format!(
+                "--literal is only for placeholder secrets; {name} has a value"
+            )));
+        }
+        (None, true) => {
+            return Err(refuse(format!(
+                "{name} is a placeholder with no value; pass --literal TEXT, the stand-in text in the file that the reference replaces"
+            )));
+        }
+        (None, false) => None,
+    };
+    let w = wiring(store, ctx, &hp.rel, name, literal)?;
     let mut files = Vec::new();
     for r in &w.removes {
         files.push(change("remove", &hp.rel, r));
@@ -1189,6 +1292,7 @@ pub fn plan_wire(
         key: format!("{}@{name}", hp.rel),
         path: hp.rel.clone(),
         name: name.into(),
+        literal: literal.map(str::to_string),
     };
     new_item(
         store,
@@ -1205,7 +1309,9 @@ pub fn guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<BTreeMap<Strin
     let repo = store.repo();
     let mut g = BTreeMap::new();
     let (name, path) = match action {
-        Action::ValueSet { name, .. } | Action::ValueUnset { name, .. } => (name, None),
+        Action::ValueSet { name, .. }
+        | Action::ValueUnset { name, .. }
+        | Action::ValueRemove { name, .. } => (name, None),
         Action::ValueWire { name, path, .. } => (name, Some(path)),
         _ => return Ok(g),
     };
@@ -1280,7 +1386,24 @@ pub fn exec(store: &Store, action: &Action) -> Result<BTreeSet<String>> {
             }
             Ok(BTreeSet::from([file_of(name)]))
         }
-        Action::ValueWire { path, name, .. } => wire_in_repo(store, path, name, None),
+        Action::ValueWire {
+            path,
+            name,
+            literal,
+            ..
+        } => wire_in_repo(store, path, name, literal.as_deref()),
+        Action::ValueRemove { name, secret, .. } => {
+            let mut files = BTreeSet::from([file_of(name)]);
+            if *secret {
+                let age = crate::secrets::file_of(name);
+                if repo.join(&age).is_file() {
+                    fs::remove_file(repo.join(&age))?;
+                    files.insert(age);
+                }
+            }
+            remove_var(&repo, name)?;
+            Ok(files)
+        }
         _ => unreachable!("not a value action"),
     }
 }
@@ -1614,7 +1737,10 @@ pub fn vault_files(repo: &Path, tracked: &Tracked) -> Result<BTreeSet<String>> {
     let vars = Variants::read(repo)?;
     let mut out = BTreeSet::new();
     for (path, names) in references(repo, tracked, &vars) {
-        if names.iter().any(|n| secrets.contains_key(n)) {
+        if names
+            .iter()
+            .any(|n| secrets.get(n).is_some_and(|m| !m.placeholder))
+        {
             out.insert(path);
         }
     }

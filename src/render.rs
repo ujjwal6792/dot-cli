@@ -144,6 +144,14 @@ fn verify_token(store: &Store) -> Result<()> {
 /// `dw __secret NAME TARGETS_JSON`: the value `NAME` has for those targets.
 pub fn helper_secret(store: &Store, name: &str, targets_json: &str) -> Result<String> {
     verify_token(store)?;
+    // A placeholder has no value yet: it renders empty, with a warning (name only).
+    if crate::secrets::read_meta(&store.repo())
+        .get(name)
+        .is_some_and(|m| m.placeholder)
+    {
+        eprintln!("dotwarden: secret {name} is a placeholder with no value yet");
+        return Ok(String::new());
+    }
     let id = vault::session::require(store)?;
     let targets: Vec<String> = serde_json::from_str(targets_json)?;
     crate::secrets::value_for(store, &id, name, &targets)

@@ -151,6 +151,36 @@ pub fn add_secret(
     done(json, &format!("secret {name} stored in the vault (staged)"))
 }
 
+pub fn unset_secret(
+    store: &Store,
+    name: &str,
+    target: &str,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    if dry_run {
+        let meta = crate::secrets::read_meta(&store.repo());
+        if !meta
+            .get(name)
+            .is_some_and(|m| m.targets.iter().any(|t| t == target))
+        {
+            return Err(crate::track::refuse(format!(
+                "secret {name} has no override for {target}"
+            )));
+        }
+        return done(
+            json,
+            &format!("dry run: would remove the override of {name} for {target}"),
+        );
+    }
+    crate::secrets::unset_target(store, name, target)?;
+    done(
+        json,
+        &format!("override of {name} for {target} removed (staged)"),
+    )
+}
+
 pub fn upgrade_templates(
     store: &Store,
     apply: bool,

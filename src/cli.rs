@@ -486,12 +486,44 @@ pub enum ValuesCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove a variable or secret (refused while files reference it, unless --force).
+    Remove {
+        /// The variable's or secret's name.
+        name: String,
+        /// Remove although files reference it (they stop rendering); needs a human's approval.
+        #[arg(long)]
+        force: bool,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove one per-target override of a secret (needs an unlock).
+    UnsetSecret {
+        /// The secret's name.
+        name: String,
+        /// The override's target.
+        #[arg(long, value_name = "TARGET")]
+        target: String,
+        /// Apply immediately (the default: this edits the encrypted secret).
+        #[arg(long)]
+        apply: bool,
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Replace this machine's value of a variable in a tracked file by references.
     Wire {
         /// A tracked file containing the variable's value.
         path: String,
         /// The variable to reference.
         name: String,
+        /// For a placeholder secret: the stand-in text in the file that the reference
+        /// replaces (rendered empty, with a warning, until a human sets the value).
+        #[arg(long, value_name = "TEXT")]
+        literal: Option<String>,
         /// Apply immediately instead of leaving the item in the pending list.
         #[arg(long)]
         apply: bool,
@@ -900,9 +932,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ValuesCmd::Wire {
                     path,
                     name,
+                    literal,
                     apply,
                     dry_run,
-                } => cmds::values_wire(&store, &path, &name, apply, dry_run, json),
+                } => cmds::values_wire(
+                    &store,
+                    &path,
+                    &name,
+                    literal.as_deref(),
+                    apply,
+                    dry_run,
+                    json,
+                ),
+                ValuesCmd::Remove {
+                    name,
+                    force,
+                    apply,
+                    dry_run,
+                } => cmds::values_remove(&store, &name, force, apply, dry_run, json),
+                ValuesCmd::UnsetSecret {
+                    name,
+                    target,
+                    apply: _,
+                    dry_run,
+                } => vault_cmds::unset_secret(&store, &name, &target, dry_run, json),
             };
         }
         Command::Machine { action } => {

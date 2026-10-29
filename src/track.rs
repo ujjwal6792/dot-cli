@@ -476,6 +476,9 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         Action::ValueSet { .. } | Action::ValueUnset { .. } => {
             g.repo.extend(crate::values::guard(store, ctx, action)?);
         }
+        Action::ValueRemove { .. } => {
+            g.repo.extend(crate::values::guard(store, ctx, action)?);
+        }
         Action::ValueWire { .. } => {
             g.repo.extend(crate::values::guard(store, ctx, action)?);
         }
@@ -1442,7 +1445,10 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             let expected = crate::variants::exec(store, &item.action)?;
             verify_and_stage(store, &expected, &[DATA_FILE])
         }
-        Action::ValueSet { .. } | Action::ValueUnset { .. } | Action::ValueWire { .. } => {
+        Action::ValueSet { .. }
+        | Action::ValueUnset { .. }
+        | Action::ValueWire { .. }
+        | Action::ValueRemove { .. } => {
             let expected = crate::values::exec(store, &item.action)?;
             let staged = verify_and_stage(store, &expected, &[])?;
             if matches!(item.action, Action::ValueWire { .. }) {

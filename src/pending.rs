@@ -136,6 +136,17 @@ pub enum Action {
         key: String,
         path: String,
         name: String,
+        /// For a placeholder secret: the stand-in text the reference replaces.
+        #[serde(default)]
+        literal: Option<String>,
+    },
+    /// Remove a variable or secret entirely. `force` removes it although files
+    /// still reference it (they stop rendering); only a human may approve that.
+    ValueRemove {
+        key: String,
+        name: String,
+        force: bool,
+        secret: bool,
     },
     /// Rewrite the repository's fixed templates to this version's.
     UpgradeTemplates {
@@ -190,6 +201,7 @@ impl Action {
             Action::ValueSet { .. } => "value_set",
             Action::ValueUnset { .. } => "value_unset",
             Action::ValueWire { .. } => "value_wire",
+            Action::ValueRemove { .. } => "value_remove",
             Action::Encrypt { .. } => "encrypt",
             Action::UpgradeTemplates { .. } => "upgrade_templates",
             Action::SecretMove { .. } => "secret_move",
@@ -199,14 +211,15 @@ impl Action {
     /// Whether only a human may apply this item (spec §8): agents cannot approve
     /// their own requests: discard, push and remote changes.
     pub fn needs_approval(&self) -> bool {
-        matches!(
-            self,
-            Action::Discard { .. }
-                | Action::RemoteAdd { .. }
-                | Action::RemoteRemove { .. }
-                | Action::Push { .. }
-                | Action::MachineRetire { .. }
-        )
+        matches!(self, Action::ValueRemove { force: true, .. })
+            || matches!(
+                self,
+                Action::Discard { .. }
+                    | Action::RemoteAdd { .. }
+                    | Action::RemoteRemove { .. }
+                    | Action::Push { .. }
+                    | Action::MachineRetire { .. }
+            )
     }
 
     /// Two items with the same key request the same thing.
@@ -226,6 +239,7 @@ impl Action {
             Action::ValueSet { key, .. }
             | Action::ValueUnset { key, .. }
             | Action::ValueWire { key, .. }
+            | Action::ValueRemove { key, .. }
             | Action::UpgradeTemplates { key }
             | Action::Encrypt { key, .. }
             | Action::SecretMove { key, .. } => key,

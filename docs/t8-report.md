@@ -31,6 +31,14 @@ Protects the repository, outputs, logs and pending/state files from values. Not 
 `tests/vault.rs` (8, real chezmoi/git, two machines): lifecycle/passwd/recover; refusal from args/env/pipe/agent; agent sees no value in 7 commands × json/human, helper refuses without token; two machines with a `machine:srv` override, locked skip/exit 4; edited secret masked → staged into vault; encrypted SSH key (0600, no plaintext in files/git objects); detection → pending → no plaintext in git; canary over ~18 commands (json, human, agent, locked) plus every file under state/, runtime dir, repo tree and git objects. `tests/tui_vault.rs` (2): masked prompt and reveal/lock; `E`.
 Hand-broken (both caught, reverted): token check removed (1 failed); masked diff disabled (2 failed).
 
+## Review fixes
+
+1. Detected secrets are never written: `track`/`stage` inspect HOME first. No vault: refused (exit 1; `--allow-plaintext`, humans only). Vault: the file is stored sanitized at once (chezmoi adds a masked copy in a throwaway destination; `secret_move` items remain only for already stored files), so no blob exists to prune. Deviation: the move is applied directly, not proposed.
+2. `values wire` always compared the real value; the message now says "hidden" and that a HOME-only value needs `dw stage` first (it was the cause of the review's failure).
+3. `values add-secret` has `--apply` (the default, since values cannot wait in pending) and a structured `--dry-run`.
+4. Templates carry `templates = N` in `dotwarden.toml`; `dw upgrade-templates` adds a pending item; status and doctor hint. Content-compared, stored files unchanged.
+5. `values remove NAME [--force]` (force needs human approval), `values unset-secret NAME --target T` (needs unlock), `values wire PATH NAME --literal TEXT` for placeholders; a placeholder renders empty with a stderr warning, needs no unlock; doctor lists referenced placeholders.
+
 ## Gaps
 
 - No `values unset` for secrets, no secret removal; wiring a placeholder is not possible.

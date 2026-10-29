@@ -1034,10 +1034,31 @@ pub fn values_unset(
     submit(store, vec![item], apply, dry_run, json)
 }
 
+pub fn values_remove(
+    store: &Store,
+    name: &str,
+    force: bool,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::values::plan_remove(store, &ctx, name, force, &pending::requester(store))?;
+    if apply && !dry_run && item.action.needs_approval() {
+        let again = item.clone();
+        return gated(store, item, false, false, json, || {
+            submit(store, vec![again], true, false, json)
+        });
+    }
+    submit(store, vec![item], apply, dry_run, json)
+}
+
 pub fn values_wire(
     store: &Store,
     path: &str,
     name: &str,
+    literal: Option<&str>,
     apply: bool,
     dry_run: bool,
     json: bool,
@@ -1045,7 +1066,14 @@ pub fn values_wire(
     require_initialised(store)?;
     let hp = track::resolve_home_path(store, path, &cwd()?)?;
     let ctx = Ctx::load(store)?;
-    let item = crate::values::plan_wire(store, &ctx, &hp, name, &pending::requester(store))?;
+    let item = crate::values::plan_wire_literal(
+        store,
+        &ctx,
+        &hp,
+        name,
+        literal,
+        &pending::requester(store),
+    )?;
     submit(store, vec![item], apply, dry_run, json)
 }
 

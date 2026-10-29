@@ -208,6 +208,40 @@ pub fn prepare(
     ])
 }
 
+/// Remove one override of a secret (needs an unlock).
+pub fn unset_target(store: &Store, name: &str, target: &str) -> Result<()> {
+    vault::recipient(store)?;
+    let meta = read_meta(&store.repo());
+    let m = meta
+        .get(name)
+        .ok_or_else(|| refuse(format!("secret {name} does not exist")))?;
+    if m.placeholder || !m.targets.iter().any(|t| t == target) {
+        return Err(refuse(format!(
+            "secret {name} has no override for {target}"
+        )));
+    }
+    let id = vault::session::require(store)?;
+    let mut doc = load_doc(store, &id, name)?;
+    doc.overrides.retain(|o| o.target != target);
+    let meta = Meta {
+        name: name.into(),
+        targets: doc.overrides.iter().map(|o| o.target.clone()).collect(),
+        placeholder: false,
+    };
+    let (meta_path, meta_bytes) = meta_file(&meta)?;
+    vault::write_staged(
+        store,
+        &[
+            (
+                file_of(name),
+                vault::encrypt(store, &serde_json::to_vec(&doc)?)?,
+            ),
+            (meta_path, meta_bytes),
+        ],
+        &[],
+    )
+}
+
 /// Set the default or one override. A new secret needs only the recipient;
 /// changing an existing one decrypts it first, so it needs an unlock.
 pub fn set(store: &Store, name: &str, target: Option<&str>, value: &str) -> Result<()> {
