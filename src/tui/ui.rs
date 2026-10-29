@@ -182,12 +182,100 @@ fn draw_values(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
+    use crate::conflicts::Pick;
+    let Some(c) = &app.conflict else { return };
+    let title = format!(
+        " Conflict ~/{} · j/k hunk · l local · i incoming · b both · e editor · w write · Esc cancel ",
+        c.path
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let Load::Ready(data) = &c.data else {
+        let text = match &c.data {
+            Load::Failed(e) => e.clone(),
+            _ => "loading…".to_string(),
+        };
+        return f.render_widget(Paragraph::new(text).block(block), area);
+    };
+    let confirm_h = if c.confirm.is_some() { 3 } else { 0 };
+    let list_h = (data.shown.len() as u16 + 2).clamp(3, 8);
+    let [list, panes, confirm] = Layout::vertical([
+        Constraint::Length(list_h),
+        Constraint::Min(3),
+        Constraint::Length(confirm_h),
+    ])
+    .areas(area);
+    let mut lines = Vec::new();
+    if data.shown.is_empty() {
+        lines.push(Line::from(
+            "No overlapping hunks: the merge is clean (w writes it).",
+        ));
+    }
+    for (i, h) in data.shown.iter().enumerate() {
+        let pick = match c.picks.get(i).copied().flatten() {
+            Some(Pick::Local) => "local",
+            Some(Pick::Incoming) => "incoming",
+            Some(Pick::Both) => "both",
+            None => "undecided",
+        };
+        let at = if h.line > 0 {
+            format!("base line {}", h.line)
+        } else {
+            "no base".to_string()
+        };
+        let style = if i == c.cursor {
+            Style::default().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::default()
+        };
+        lines.push(Line::styled(
+            format!("hunk {}/{}  {at}  → {pick}", i + 1, data.shown.len()),
+            style,
+        ));
+    }
+    f.render_widget(Paragraph::new(lines).block(block), list);
+    let hunk = data.shown.get(c.cursor);
+    let cols = Layout::horizontal([Constraint::Ratio(1, 3); 3]).split(panes);
+    let picked = c.picks.get(c.cursor).copied().flatten();
+    let mark = |p: Pick, name: &str| match picked {
+        Some(x) if x == p || x == Pick::Both => format!(" ✓ {name} "),
+        _ => format!(" {name} "),
+    };
+    let parts = [
+        (" base ".to_string(), hunk.map(|h| h.base.as_str())),
+        (mark(Pick::Local, "local"), hunk.map(|h| h.local.as_str())),
+        (
+            mark(Pick::Incoming, "incoming"),
+            hunk.map(|h| h.incoming.as_str()),
+        ),
+    ];
+    for (i, (name, text)) in parts.into_iter().enumerate() {
+        f.render_widget(
+            Paragraph::new(text.unwrap_or_default().to_string())
+                .block(Block::default().borders(Borders::ALL).title(name)),
+            cols[i],
+        );
+    }
+    if c.confirm.is_some() {
+        f.render_widget(
+            Paragraph::new(format!(
+                "Write the result to ~/{} and stage it? y / n (a snapshot is taken first)",
+                c.path
+            ))
+            .block(Block::default().borders(Borders::ALL)),
+            confirm,
+        );
+    }
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.size = (area.width, area.height);
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-    if app.values.is_some() {
+    if app.conflict.is_some() {
+        draw_conflict(f, app, body);
+    } else if app.values.is_some() {
         draw_values(f, app, body);
     } else if is_single_panel(area) {
         draw_panel(f, app, app.focus, body, true);

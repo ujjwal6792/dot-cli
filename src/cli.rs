@@ -304,6 +304,27 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Resolve a conflict: a file changed in HOME and by an incoming commit.
+    ///
+    /// `--take local` stages the HOME version; `--take incoming` writes the
+    /// incoming version over HOME (a snapshot is taken first); `--merge` merges
+    /// both line by line and, when edits overlap, opens $EDITOR on a private
+    /// merge file (exit 5 without a terminal). Conflict markers never reach the
+    /// live file. The result is staged. From an agent (DOTWARDEN_AGENT) taking
+    /// the incoming version or merging goes to the pending list (exit 3).
+    Resolve {
+        /// The conflicting file.
+        path: String,
+        /// Keep one whole side.
+        #[arg(long, value_parser = ["local", "incoming"])]
+        take: Option<String>,
+        /// Merge both sides automatically.
+        #[arg(long, conflicts_with = "take")]
+        merge: bool,
+        /// Show what would happen without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List or restore snapshots of HOME files taken before they were overwritten.
     Snapshot {
         #[command(subcommand)]
@@ -1053,6 +1074,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
             yes,
             dry_run,
         } => return cmds::discard_cmd(&store, &paths, yes, dry_run, json),
+        Command::Resolve {
+            path,
+            take,
+            merge,
+            dry_run,
+        } => return cmds::resolve_cmd(&store, &path, take.as_deref(), merge, dry_run, json),
         Command::Remote { action } => {
             return match action {
                 RemoteCmd::Add {

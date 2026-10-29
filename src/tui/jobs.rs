@@ -32,6 +32,7 @@ pub const KEY_FETCH: &str = "fetch";
 pub const KEY_REGISTRY: &str = "registry";
 pub const KEY_MACHINE: &str = "machine";
 pub const KEY_VALUES: &str = "values";
+pub const KEY_CONFLICT: &str = "conflict";
 
 /// The Values screen's data, read off the event loop.
 #[derive(Debug, Default)]
@@ -39,6 +40,22 @@ pub struct ValuesView {
     pub rows: Vec<crate::values::Row>,
     /// Decrypted secrets; empty while the vault is locked.
     pub reveal: std::collections::BTreeMap<String, crate::values::Reveal>,
+}
+
+/// One conflicting hunk as the Conflicts screen shows it: secret values hidden.
+#[derive(Debug, Clone)]
+pub struct ShownHunk {
+    pub line: usize,
+    pub base: String,
+    pub local: String,
+    pub incoming: String,
+}
+
+/// A loaded conflict: the merge to resolve and its masked display.
+#[derive(Debug)]
+pub struct ConflictData {
+    pub loaded: crate::conflicts::Loaded,
+    pub shown: Vec<ShownHunk>,
 }
 
 /// The machine registry and the assignments, as the TUI shows them.
@@ -80,6 +97,10 @@ pub enum Payload {
     Fetch(Result<Option<String>, String>),
     Registry(Result<Box<RegistryView>, String>),
     Values(Result<Box<ValuesView>, String>),
+    Conflict {
+        path: String,
+        data: Result<Box<ConflictData>, String>,
+    },
     /// What a registry machine would receive.
     MachinePreview {
         name: String,

@@ -4,6 +4,7 @@ pub mod assign;
 pub mod changes;
 pub mod cli;
 pub mod cmds;
+pub mod conflicts;
 pub mod detect;
 pub mod doctor;
 pub mod encfile;

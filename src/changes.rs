@@ -60,20 +60,20 @@ pub struct Change {
     pub kind: &'static str,
 }
 
-struct Target {
-    link: bool,
+pub(crate) struct Target {
+    pub link: bool,
     /// File contents, or the link target for symlinks.
-    text: String,
-    perm: u64,
+    pub text: String,
+    pub perm: u64,
 }
 
 impl Target {
-    fn sha(&self) -> String {
+    pub(crate) fn sha(&self) -> String {
         sha256(self.text.as_bytes())
     }
 }
 
-fn sha256(bytes: &[u8]) -> String {
+pub(crate) fn sha256(bytes: &[u8]) -> String {
     Sha256::digest(bytes)
         .iter()
         .map(|b| format!("{b:02x}"))
@@ -81,7 +81,7 @@ fn sha256(bytes: &[u8]) -> String {
 }
 
 /// Files and symlinks that apply to this machine, with their rendered content.
-fn targets(store: &Store) -> Result<BTreeMap<String, Target>> {
+pub(crate) fn targets(store: &Store) -> Result<BTreeMap<String, Target>> {
     let mut args: Vec<String> = ["dump", "--format", "json", "--include=files,symlinks"]
         .map(String::from)
         .into();
@@ -112,7 +112,7 @@ fn targets(store: &Store) -> Result<BTreeMap<String, Target>> {
 }
 
 /// Last-written records: absolute path to (type, content hash).
-fn last_written(store: &Store) -> Result<BTreeMap<String, (String, String)>> {
+pub(crate) fn last_written(store: &Store) -> Result<BTreeMap<String, (String, String)>> {
     let out = store.chezmoi(&["state", "dump", "--format", "json"])?;
     let v: Value = serde_json::from_str(&out.stdout).context("reading chezmoi state")?;
     Ok(v["entryState"]
@@ -179,7 +179,7 @@ pub struct Scan {
     pub clashes: BTreeMap<String, String>,
     /// Files that need the vault while it is locked (not classified).
     pub locked: std::collections::BTreeSet<String>,
-    targets: BTreeMap<String, Target>,
+    pub(crate) targets: BTreeMap<String, Target>,
 }
 
 /// Classify every change on this machine.
@@ -343,7 +343,22 @@ pub struct Done {
 /// can be staged). Explicitly named changes that cannot be staged are refused;
 /// with `None`, or inside a named folder, they are skipped and reported.
 pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Done> {
-    let lock = if dry_run { None } else { Some(store.lock()?) };
+    stage_with(store, sel, dry_run, None)
+}
+
+/// [`stage`] for a caller that already holds the mutation lock (`held`).
+pub(crate) fn stage_with(
+    store: &Store,
+    sel: Option<&[String]>,
+    dry_run: bool,
+    held: Option<&crate::lock::Lock>,
+) -> Result<Done> {
+    let own = if dry_run || held.is_some() {
+        None
+    } else {
+        Some(store.lock()?)
+    };
+    let lock = held.or(own.as_ref());
     let ctx = Ctx::load(store)?;
     let scan = scan(store, &ctx)?;
     let mut files = Vec::new();
@@ -608,7 +623,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                     rel: rel.clone(),
                 };
                 let item = track::plan_untrack(store, &Ctx::load(store)?, &hp, "human")?;
-                let lock = lock.as_ref().expect("held outside dry runs");
+                let lock = lock.expect("held outside dry runs");
                 let done = track::apply_items(store, lock, &[item])?;
                 if let Some(r) = done.iter().find(|r| r.status != track::Outcome::Applied) {
                     bail!(
@@ -632,13 +647,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .chain(ref_files.iter().map(|p| p.rel.clone()))
             .chain(new_sanitized.iter().map(|(r, _)| r.clone()))
             .collect();
-        if let Some(l) = lock.as_ref() {
+        if let Some(l) = lock {
             // Detection only proposes; it never fails a stage that succeeded.
             notes.extend(crate::values::propose_wires(store, l, &staged).unwrap_or_default());
         }
         // chezmoi's records of untracked files go once the mutation lock is free.
-        drop(lock);
-        track::cleanup_state(store, &results);
+        drop(own);
+        if held.is_none() {
+            track::cleanup_state(store, &results);
+        }
     }
     Ok(Done {
         paths: files
@@ -875,7 +892,7 @@ pub fn plan_discard(store: &Store, rel: &str, requester: &str) -> Result<Item> {
                 c.path
             )),
             (State::Incoming | State::Conflict, _) if exact => problems.push(format!(
-                "~/{} has an incoming change; resolving it is not supported yet",
+                "~/{} has an incoming change; use `dw apply` or `dw resolve`",
                 c.path
             )),
             _ => {}
@@ -981,7 +998,7 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
                 Kind::Conflict,
                 format!(
                     "~/{p} changed here and in the repository; applying would lose a side. \
-                     Resolving conflicts arrives later"
+                     resolve it with `dw resolve`"
                 ),
             )
             .into());

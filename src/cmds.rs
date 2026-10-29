@@ -574,6 +574,106 @@ pub fn discard_cmd(
     Ok(results_exit(&results))
 }
 
+pub fn resolve_cmd(
+    store: &Store,
+    path: &str,
+    take: Option<&str>,
+    merge: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    use crate::conflicts::{self, How};
+    use std::io::IsTerminal;
+    require_initialised(store)?;
+    if take.is_none() && !merge {
+        return Err(changes_refuse(
+            "choose --take local, --take incoming or --merge",
+        ));
+    }
+    let agent = changes::agent(store);
+    let requester = agent.clone().unwrap_or_else(|| "human".into());
+    let rel = track::resolve_home_path(store, path, &cwd()?)?.rel;
+    let how = match take {
+        Some("local") => How::Local,
+        Some(_) => How::Incoming,
+        None => How::Merge,
+    };
+    if how != How::Local && agent.is_some() {
+        let item = conflicts::plan_resolve(store, &rel, merge, &requester)?;
+        if dry_run {
+            return submit(store, vec![item], false, true, json);
+        }
+        submit(store, vec![item], false, false, json)?;
+        if !json {
+            println!(
+                "Resolving with the incoming side needs a human: approve it with `dw pending apply`."
+            );
+        }
+        return Ok(ExitCode::from(Kind::NeedsApproval.code()));
+    }
+    if dry_run {
+        let l = (how == How::Merge)
+            .then(|| conflicts::load(store, &rel))
+            .transpose()?;
+        let note = match (&how, &l) {
+            (How::Merge, Some(l)) => match l.clean() {
+                Some(_) => "the merge is clean".to_string(),
+                None => l.describe(),
+            },
+            (How::Local, _) => "HOME is staged as it is".to_string(),
+            _ => "the incoming version is written to HOME after a snapshot".to_string(),
+        };
+        if json {
+            print_json(&json!({"dry_run": true, "path": track::tilde(&rel), "note": note}))?;
+        } else {
+            println!(
+                "Dry run: nothing was changed. {}: {note}",
+                track::tilde(&rel)
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let how = if how == How::Merge {
+        let l = conflicts::load(store, &rel)?;
+        match l.clean() {
+            Some(t) => How::Text(t),
+            None if !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal() => {
+                How::Text(conflicts::edit(store, &l)?)
+            }
+            None => {
+                return Err(DwError::new(
+                    Kind::Conflict,
+                    format!(
+                        "{}: {}; resolve it in the TUI, with $EDITOR in a terminal, or with --take",
+                        track::tilde(&rel),
+                        l.describe()
+                    ),
+                )
+                .into());
+            }
+        }
+    } else {
+        how
+    };
+    let r = conflicts::resolve(store, &rel, how, &requester)?;
+    if json {
+        print_json(&r)?;
+    } else {
+        println!(
+            "Resolved {} with the {} version; staged.",
+            r.path, r.resolution
+        );
+        if let Some(s) = &r.snapshot {
+            println!("what was there before is in snapshot {s}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn changes_refuse(msg: &str) -> anyhow::Error {
+    track::refuse(msg.to_string())
+}
+
 /// The one place that decides who may apply approval-required items (discard,
 /// later push and the like): never an agent, and without a terminal only with
 /// `--yes`. A human on a terminal without `--yes` confirms the list.
