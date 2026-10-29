@@ -61,6 +61,12 @@ pub enum Action {
         /// Files with local changes that are overwritten.
         files: Vec<String>,
     },
+    /// Resolve a conflict by writing the incoming version (or the automatic
+    /// merge) over the HOME file, after a snapshot, and stage it.
+    Resolve {
+        path: String,
+        merge: bool,
+    },
     HideAdd {
         pattern: String,
     },
@@ -187,6 +193,7 @@ impl Action {
             Action::Track { .. } => "track",
             Action::Untrack { .. } => "untrack",
             Action::Discard { .. } => "discard",
+            Action::Resolve { .. } => "resolve",
             Action::HideAdd { .. } => "hide_add",
             Action::HideRemove { .. } => "hide_remove",
             Action::RemoteAdd { .. } => "remote_add",
@@ -215,6 +222,7 @@ impl Action {
             || matches!(
                 self,
                 Action::Discard { .. }
+                    | Action::Resolve { .. }
                     | Action::RemoteAdd { .. }
                     | Action::RemoteRemove { .. }
                     | Action::Push { .. }
@@ -227,7 +235,8 @@ impl Action {
         let what = match self {
             Action::Track { path, .. }
             | Action::Untrack { path, .. }
-            | Action::Discard { path, .. } => path,
+            | Action::Discard { path, .. }
+            | Action::Resolve { path, .. } => path,
             Action::HideAdd { pattern } | Action::HideRemove { pattern } => pattern,
             Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => name,
             Action::Push { remotes } => remotes.first().map_or("", String::as_str),

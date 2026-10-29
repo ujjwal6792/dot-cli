@@ -22,6 +22,17 @@ pub enum Event {
 
 const TICK: Duration = Duration::from_secs(2);
 
+static PAUSED: AtomicBool = AtomicBool::new(false);
+
+/// Stop (or resume) reading terminal input, so a child process such as the
+/// editor owns the keyboard. Returns after the reader has had time to notice.
+pub fn pause_input(paused: bool) {
+    PAUSED.store(paused, Ordering::SeqCst);
+    if paused {
+        thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Read terminal input on its own thread so the event loop only ever waits on
 /// the channel. Stops when `stop` is set (within ~100 ms).
 pub fn spawn_input(tx: Sender<Event>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
@@ -33,6 +44,10 @@ pub fn spawn_input(tx: Sender<Event>, stop: Arc<AtomicBool>) -> JoinHandle<()> {
                 if tx.send(Event::Tick).is_err() {
                     break;
                 }
+            }
+            if PAUSED.load(Ordering::SeqCst) {
+                thread::sleep(Duration::from_millis(50));
+                continue;
             }
             match event::poll(Duration::from_millis(100)) {
                 Ok(true) => match event::read() {

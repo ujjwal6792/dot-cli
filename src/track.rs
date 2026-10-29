@@ -465,6 +465,10 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 g.home.insert(f.clone(), home_fingerprint(&home.join(f)));
             }
         }
+        Action::Resolve { path, .. } => {
+            g.home
+                .insert(path.clone(), home_fingerprint(&home.join(path)));
+        }
         Action::VariantAdd { path, .. } => {
             g.home
                 .insert(path.clone(), home_fingerprint(&home.join(path)));
@@ -1422,6 +1426,7 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
         }
         Action::Discard { .. }
+        | Action::Resolve { .. }
         | Action::RemoteAdd { .. }
         | Action::RemoteRemove { .. }
         | Action::Push { .. } => {
@@ -1541,6 +1546,20 @@ pub fn apply_items(store: &Store, lock: &Lock, items: &[Item]) -> Result<Vec<Ite
                     let note = match snap {
                         Some(id) => format!("snapshot {id} taken first"),
                         None => "nothing to snapshot (file was deleted)".to_string(),
+                    };
+                    (Vec::new(), Some(note))
+                })
+            }
+            Action::Resolve { path, merge } => {
+                let how = if *merge {
+                    crate::conflicts::How::Merge
+                } else {
+                    crate::conflicts::How::Incoming
+                };
+                crate::conflicts::resolve_locked(store, lock, path, how, &item.requester).map(|r| {
+                    let note = match r.snapshot {
+                        Some(id) => format!("snapshot {id} taken first; staged"),
+                        None => "staged".to_string(),
                     };
                     (Vec::new(), Some(note))
                 })

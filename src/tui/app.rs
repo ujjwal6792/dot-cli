@@ -10,12 +10,13 @@ use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyM
 use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
-    ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING, KEY_MACHINE,
-    KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STATUS, KEY_TRACKED, KEY_VALUES, Payload,
-    RegistryView, ValuesView,
+    ActionReport, Done, Jobs, KEY_ACTION, KEY_CONFLICT, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING,
+    KEY_MACHINE, KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STATUS, KEY_TRACKED, KEY_VALUES,
+    Payload, RegistryView, ShownHunk, ValuesView,
 };
 use crate::assign::{self, Side, TargetRow, Tri};
 use crate::changes::{self, Change, CommitOpts, State};
+use crate::conflicts::Pick;
 use crate::hide::HideRules;
 use crate::pending::{self, Item, List};
 use crate::source::{self, Tracked};
@@ -127,6 +128,8 @@ pub enum ActionReq {
     },
     Unlock(Secret),
     Lock,
+    /// Write this finished text over the conflicting file (HOME-relative) and stage it.
+    Resolve(String, Secret),
 }
 
 /// Typed-in secret text; never printed by `Debug`.
@@ -187,6 +190,25 @@ pub struct ValuesScreen {
     pub reveal: std::collections::BTreeMap<String, crate::values::Reveal>,
     pub selected: usize,
     pub input: Option<ValueInput>,
+}
+
+/// The Conflicts screen (Enter on the Conflicts tab): hunks of one file.
+#[derive(Debug)]
+pub struct ConflictScreen {
+    pub path: String,
+    pub data: Load<Box<super::jobs::ConflictData>>,
+    /// The conflicting hunk in view.
+    pub cursor: usize,
+    /// The choice per conflicting hunk.
+    pub picks: Vec<Option<Pick>>,
+    /// The finished text waiting for the y/n before it is written. Never shown.
+    pub confirm: Option<Secret>,
+}
+
+/// The editor waiting to be run with the terminal handed over (see `tui::run_loop`).
+pub struct Handoff {
+    pub command: std::process::Command,
+    pub session: crate::conflicts::EditSession,
 }
 
 /// The assignment editor: one checkbox row per target, with the state over
@@ -309,6 +331,9 @@ pub struct App {
     pub machines_selected: usize,
     /// The Values screen, open while `Some`.
     pub values: Option<ValuesScreen>,
+    /// The Conflicts screen, open while `Some`.
+    pub conflict: Option<ConflictScreen>,
+    handoff: Option<Handoff>,
     /// The preview of the machine last opened with Enter in the Machines panel.
     pub machine_preview: Option<(String, Load<String>)>,
     /// Change marker of the `hide` file last loaded (`None` until the first load).
@@ -344,6 +369,8 @@ impl App {
             diff: Load::Ready(ratatui::text::Text::default()),
             registry: None,
             values: None,
+            conflict: None,
+            handoff: None,
             machines_selected: 0,
             machine_preview: None,
             hide_stamp: None,
@@ -571,6 +598,20 @@ impl App {
                 }
                 Err(e) => self.message = Some(e),
             },
+            Payload::Conflict { path, data } => {
+                if let Some(c) = self.conflict.as_mut().filter(|c| c.path == path) {
+                    match data {
+                        Ok(d) => {
+                            c.picks = vec![None; d.shown.len()];
+                            c.data = Load::Ready(d);
+                        }
+                        Err(e) => {
+                            self.conflict = None;
+                            self.message = Some(e);
+                        }
+                    }
+                }
+            }
             Payload::Registry(r) => {
                 if let Ok(v) = r {
                     self.registry = Some(Arc::new(*v));
@@ -937,6 +978,11 @@ impl App {
                     self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path])));
                 }
             }
+            KeyCode::Enter if tab == 3 => {
+                if let Some(c) = selected {
+                    self.open_conflict(c.path);
+                }
+            }
             KeyCode::Enter => self.request_diff(),
             KeyCode::Char(' ') => match (tab, selected) {
                 (0, Some(c)) => self.request_action(ActionReq::Stage(Some(vec![c.path]))),
@@ -1009,6 +1055,12 @@ impl App {
                 _ => self.dialog_key(key),
             };
         }
+        if self.conflict.is_some() {
+            return match key.code {
+                KeyCode::Char('c') if ctrl => self.quit = true,
+                _ => self.conflict_key(key),
+            };
+        }
         if self.values.is_some() {
             return match key.code {
                 KeyCode::Char('c') if ctrl => self.quit = true,
@@ -1052,6 +1104,116 @@ impl App {
                 KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
                 _ => {}
             },
+        }
+    }
+
+    pub fn take_handoff(&mut self) -> Option<Handoff> {
+        self.handoff.take()
+    }
+
+    /// The editor returned: its merge file becomes the result awaiting y/n.
+    pub fn finish_handoff(
+        &mut self,
+        session: crate::conflicts::EditSession,
+        status: Result<std::process::ExitStatus, String>,
+    ) {
+        let Some(c) = &mut self.conflict else { return };
+        match status {
+            Err(e) => self.message = Some(format!("could not start the editor: {e}")),
+            Ok(s) if !s.success() => {
+                self.message = Some(format!("the editor exited with {s}; nothing was written"))
+            }
+            Ok(_) => match session.read_result() {
+                Ok(text) => c.confirm = Some(Secret(text)),
+                Err(e) => self.message = Some(format!("{e:#}")),
+            },
+        }
+    }
+
+    fn open_conflict(&mut self, path: String) {
+        self.conflict = Some(ConflictScreen {
+            path: path.clone(),
+            data: Load::Loading,
+            cursor: 0,
+            picks: Vec::new(),
+            confirm: None,
+        });
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_CONFLICT, move |_| {
+            let data = crate::conflicts::load(&store, &path)
+                .map(|loaded| {
+                    let shown = crate::conflicts::hunks(&loaded.chunks)
+                        .into_iter()
+                        .map(|h| ShownHunk {
+                            line: h.line,
+                            base: crate::conflicts::masked(&store, &h.base.concat()),
+                            local: crate::conflicts::masked(&store, &h.local.concat()),
+                            incoming: crate::conflicts::masked(&store, &h.incoming.concat()),
+                        })
+                        .collect();
+                    Box::new(super::jobs::ConflictData { loaded, shown })
+                })
+                .map_err(|e| format!("{e:#}"));
+            Payload::Conflict { path, data }
+        });
+    }
+
+    fn conflict_key(&mut self, key: KeyEvent) {
+        let Some(c) = &mut self.conflict else { return };
+        if let Some(text) = c.confirm.take() {
+            match key.code {
+                KeyCode::Char('y') | KeyCode::Enter => {
+                    let path = c.path.clone();
+                    self.conflict = None;
+                    return self.request_action(ActionReq::Resolve(path, text));
+                }
+                KeyCode::Char('n') | KeyCode::Esc => {}
+                _ => c.confirm = Some(text),
+            }
+            return;
+        }
+        let Load::Ready(data) = &c.data else {
+            if key.code == KeyCode::Esc {
+                self.conflict = None;
+            }
+            return;
+        };
+        let n = data.shown.len();
+        match key.code {
+            KeyCode::Esc => self.conflict = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                c.cursor = (c.cursor + 1).min(n.saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => c.cursor = c.cursor.saturating_sub(1),
+            KeyCode::Char(ch @ ('l' | 'i' | 'b')) if n > 0 => {
+                c.picks[c.cursor] = Some(match ch {
+                    'l' => Pick::Local,
+                    'i' => Pick::Incoming,
+                    _ => Pick::Both,
+                });
+                if let Some(next) = (0..n)
+                    .map(|k| (c.cursor + 1 + k) % n)
+                    .find(|k| c.picks[*k].is_none())
+                {
+                    c.cursor = next;
+                }
+            }
+            KeyCode::Char('e') => {
+                match crate::conflicts::EditSession::new(&self.store, &data.loaded, &c.picks) {
+                    Ok(session) => {
+                        let command = session.command(&self.store);
+                        self.handoff = Some(Handoff { command, session });
+                    }
+                    Err(e) => self.message = Some(format!("{e:#}")),
+                }
+            }
+            KeyCode::Char('w') | KeyCode::Enter => {
+                match crate::conflicts::result(&data.loaded.chunks, &c.picks) {
+                    Some(text) => c.confirm = Some(Secret(text)),
+                    None => self.message = Some("choose l / i / b for every hunk first".into()),
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1343,7 +1505,7 @@ fn done_message(verb: &str, d: &changes::Done) -> String {
 }
 
 const CONFLICT_BLOCKED: &str =
-    "conflicts are not applied: they changed here and in the repository (resolving arrives later)";
+    "conflicts are not applied: they changed here and in the repository; Enter resolves them";
 
 /// How often the background fetch repeats (the preference comes later).
 const FETCH_EVERY: std::time::Duration = std::time::Duration::from_secs(300);
@@ -1374,7 +1536,7 @@ fn render_diff(
     }
     if c.state == State::Conflict {
         return Ok(format!(
-            "~/{} changed here and in the repository.\n\nIt is not applied; resolving conflicts arrives later.",
+            "~/{} changed here and in the repository.\n\nIt is not applied. Enter picks local / incoming per hunk (or `dw resolve`).",
             c.path
         )
         .into());
@@ -1515,6 +1677,15 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 .snapshot
                 .map_or(String::new(), |id| format!(", snapshot {id}"));
             Ok(report(format!("Applied {} file(s){snap}", a.applied.len())))
+        }
+        ActionReq::Resolve(path, text) => {
+            let r = crate::conflicts::resolve(
+                store,
+                &path,
+                crate::conflicts::How::Text(text.0),
+                "human",
+            )?;
+            Ok(report(format!("Resolved {}; staged", r.path)))
         }
         ActionReq::Fetch => {
             let f = crate::remote::fetch(store, true, None)?;

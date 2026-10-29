@@ -4,7 +4,8 @@
   verifies Linux on real machines after development. Linux-specific code must
   still compile and have unit tests that run on macOS.
 - Never run dotwarden or tests against the real HOME; use isolated temporary
-  HOME and XDG directories.
+  HOME and XDG directories, and set `DOTWARDEN_SESSION_BACKEND=file` so the
+  OS keychain is never touched.
 - Keep `cargo fmt --check`, `cargo clippy --all-targets -- -D warnings` and
   `cargo test` green.
 - Follow `docs/spec.md`, `GLOSSARY.md` terms and `docs/adr/`. Report any

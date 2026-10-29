@@ -41,7 +41,27 @@ pub fn run_loop<B: Backend>(
             let Ok(ev) = rx.try_recv() else { break };
             app.handle_event(ev);
         }
+        if let Some(h) = app.take_handoff() {
+            hand_off(terminal, app, h)?;
+        }
     }
+}
+
+/// Give the terminal to the editor and take it back afterwards.
+fn hand_off<B: Backend>(
+    terminal: &mut Terminal<B>,
+    app: &mut App,
+    mut h: app::Handoff,
+) -> Result<()> {
+    event::pause_input(true);
+    ratatui::restore();
+    let status = h.command.status();
+    crossterm::terminal::enable_raw_mode()?;
+    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    terminal.clear().map_err(|e| anyhow!("{e}"))?;
+    event::pause_input(false);
+    app.finish_handoff(h.session, status.map_err(|e| e.to_string()));
+    Ok(())
 }
 
 pub fn run(store: Store) -> Result<()> {
