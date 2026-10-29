@@ -24,6 +24,15 @@ pub fn require_initialised(store: &Store) -> Result<()> {
     Ok(())
 }
 
+/// `--allow-plaintext`: humans only.
+pub fn allow_plaintext(store: &Store, flag: bool) -> Result<()> {
+    if flag && changes::agent(store).is_some() {
+        return Err(DwError::usage("--allow-plaintext is for humans; agents cannot use it").into());
+    }
+    crate::detect::set_allow_plaintext(flag);
+    Ok(())
+}
+
 fn cwd() -> Result<PathBuf> {
     Ok(std::env::current_dir()?)
 }
@@ -36,7 +45,7 @@ struct Listed<'a> {
     stale: Option<String>,
 }
 
-fn print_json(v: &impl Serialize) -> Result<()> {
+pub(crate) fn print_json(v: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
@@ -74,7 +83,7 @@ fn results_exit(results: &[ItemResult]) -> ExitCode {
 }
 
 /// Add planned items to the pending list, show them, or apply them at once.
-fn submit(
+pub(crate) fn submit(
     store: &Store,
     items: Vec<Item>,
     apply: bool,
@@ -828,10 +837,13 @@ pub fn apply_cmd(
         for f in &a.failed {
             println!("FAILED  ~/{f}");
         }
+        for f in &a.vault_locked {
+            println!("skipped ~/{f}: vault locked (run `dw vault unlock`, then apply again)");
+        }
         if let Some(id) = &a.snapshot {
             println!("snapshot {id} taken first");
         }
-        if a.applied.is_empty() && a.failed.is_empty() {
+        if a.applied.is_empty() && a.failed.is_empty() && a.vault_locked.is_empty() {
             println!("Nothing incoming to apply.");
         }
         if let Some(e) = &a.error {
@@ -1022,10 +1034,31 @@ pub fn values_unset(
     submit(store, vec![item], apply, dry_run, json)
 }
 
+pub fn values_remove(
+    store: &Store,
+    name: &str,
+    force: bool,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let ctx = Ctx::load(store)?;
+    let item = crate::values::plan_remove(store, &ctx, name, force, &pending::requester(store))?;
+    if apply && !dry_run && item.action.needs_approval() {
+        let again = item.clone();
+        return gated(store, item, false, false, json, || {
+            submit(store, vec![again], true, false, json)
+        });
+    }
+    submit(store, vec![item], apply, dry_run, json)
+}
+
 pub fn values_wire(
     store: &Store,
     path: &str,
     name: &str,
+    literal: Option<&str>,
     apply: bool,
     dry_run: bool,
     json: bool,
@@ -1033,7 +1066,14 @@ pub fn values_wire(
     require_initialised(store)?;
     let hp = track::resolve_home_path(store, path, &cwd()?)?;
     let ctx = Ctx::load(store)?;
-    let item = crate::values::plan_wire(store, &ctx, &hp, name, &pending::requester(store))?;
+    let item = crate::values::plan_wire_literal(
+        store,
+        &ctx,
+        &hp,
+        name,
+        literal,
+        &pending::requester(store),
+    )?;
     submit(store, vec![item], apply, dry_run, json)
 }
 

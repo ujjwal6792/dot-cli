@@ -8,5 +8,10 @@
 {{- fail (printf "dotwarden: variable %q does not exist" .name) -}}
 {{- end -}}
 {{- $targets := includeTemplate "dotwarden/targets" .data | fromJson -}}
+{{- if eq (get $v "kind") "secret" -}}
+{{- /* Secrets: the dotwarden helper prints the value (needs the per-run token and an unlock session). DOTWARDEN_MASK renders a marker instead. */ -}}
+{{- if env "DOTWARDEN_MASK" }}«secret:{{ .name }}»{{ else }}{{ output (env "DOTWARDEN_HELPER") "__secret" .name (toJson $targets) }}{{ end -}}
+{{- else -}}
 {{- $w := includeTemplate "dotwarden/select" (dict "targets" $targets "entries" (get $v "overrides" | default (list)) "what" (printf "overrides of %s" .name)) -}}
 {{- if $w }}{{ (fromJson $w).value }}{{ else }}{{ get $v "default" }}{{ end -}}
+{{- end -}}

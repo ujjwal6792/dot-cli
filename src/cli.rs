@@ -13,7 +13,7 @@ use crate::machine;
 use crate::repo::{self, DEFAULT_BRANCH};
 use crate::store::Store;
 use crate::track::Plan;
-use crate::{cmds, doctor, status, tui};
+use crate::{cmds, doctor, status, tui, vault_cmds};
 
 /// Dotfiles, secrets and variables in sync across your machines.
 ///
@@ -73,6 +73,10 @@ pub enum Command {
         /// Files, symlinks or folders to track.
         #[arg(required = true, num_args = 1..)]
         paths: Vec<String>,
+        /// Store files holding detected secrets as they are (humans only; the
+        /// default refuses, or moves the secret to the vault).
+        #[arg(long)]
+        allow_plaintext: bool,
         /// Apply immediately instead of leaving the items in the pending list.
         #[arg(long)]
         apply: bool,
@@ -148,6 +152,51 @@ pub enum Command {
         #[command(subcommand)]
         action: ValuesCmd,
     },
+    /// The vault: an age identity that protects secrets and encrypted files.
+    ///
+    /// `init` creates the identity, wrapped by a passphrase and by a one-time
+    /// recovery code. Passphrases are read only from an interactive terminal
+    /// (never from arguments, the environment or a pipe), and only by a human.
+    /// `unlock` keeps the identity in the OS keychain (or a 0600 runtime file)
+    /// for a limited time (default 15 minutes); `lock` ends it.
+    Vault {
+        #[command(subcommand)]
+        action: VaultCmd,
+    },
+    /// Upgrade the repository's fixed templates (added by newer versions) as a pending item.
+    UpgradeTemplates {
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Store a tracked file encrypted in the vault (rendered by a helper on apply).
+    Encrypt {
+        /// A tracked file.
+        path: String,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Internal: print a secret for chezmoi (needs dotwarden's per-run token).
+    #[command(name = "__secret", hide = true)]
+    HelperSecret {
+        /// The secret's name.
+        name: String,
+        /// This machine's targets as a JSON list.
+        targets: String,
+    },
+    /// Internal: print an encrypted file for chezmoi (needs dotwarden's per-run token).
+    #[command(name = "__file", hide = true)]
+    HelperFile {
+        /// The encrypted file's id.
+        id: String,
+    },
     /// List, register, rename, retire or preview machines of the registry.
     Machine {
         #[command(subcommand)]
@@ -190,6 +239,10 @@ pub enum Command {
         /// Stage every change that can be staged.
         #[arg(long, conflicts_with = "paths")]
         all: bool,
+        /// Store files holding detected secrets as they are (humans only; the
+        /// default refuses, or moves the secret to the vault).
+        #[arg(long)]
+        allow_plaintext: bool,
         /// Show what would be staged without changing anything.
         #[arg(long)]
         dry_run: bool,
@@ -357,7 +410,44 @@ pub enum VariantCmd {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum VaultCmd {
+    /// Create the vault (identity, recipient, passphrase and recovery code).
+    Init,
+    /// Unlock with the passphrase (terminal only).
+    Unlock,
+    /// End the unlock session.
+    Lock,
+    /// Show whether the vault exists and is unlocked.
+    Status,
+    /// Change the passphrase (rewrites identity.age only).
+    Passwd,
+    /// Set a new passphrase using the recovery code.
+    Recover,
+}
+
+#[derive(Debug, Subcommand)]
 pub enum ValuesCmd {
+    /// Set a secret's value (read from the terminal, never from arguments).
+    ///
+    /// A new secret needs only the vault's public recipient; changing an existing
+    /// one needs an unlock. `--placeholder` adds the name only (agents may do
+    /// this); a human sets the value later.
+    AddSecret {
+        /// Letters, digits, `_` and `-`.
+        name: String,
+        /// Set the override for this target instead of the default.
+        #[arg(long, value_name = "TARGET")]
+        target: Option<String>,
+        /// Add the name only; no value.
+        #[arg(long)]
+        placeholder: bool,
+        /// Apply immediately (the default: a value can never wait in the pending list).
+        #[arg(long)]
+        apply: bool,
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// List variables: default, overrides, the value this machine receives, files using them.
     List,
     /// Show one variable in full.
@@ -396,12 +486,44 @@ pub enum ValuesCmd {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Remove a variable or secret (refused while files reference it, unless --force).
+    Remove {
+        /// The variable's or secret's name.
+        name: String,
+        /// Remove although files reference it (they stop rendering); needs a human's approval.
+        #[arg(long)]
+        force: bool,
+        /// Apply immediately instead of leaving the item in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show exactly what would change without adding or applying anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove one per-target override of a secret (needs an unlock).
+    UnsetSecret {
+        /// The secret's name.
+        name: String,
+        /// The override's target.
+        #[arg(long, value_name = "TARGET")]
+        target: String,
+        /// Apply immediately (the default: this edits the encrypted secret).
+        #[arg(long)]
+        apply: bool,
+        /// Show what would change without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Replace this machine's value of a variable in a tracked file by references.
     Wire {
         /// A tracked file containing the variable's value.
         path: String,
         /// The variable to reference.
         name: String,
+        /// For a placeholder secret: the stand-in text in the file that the reference
+        /// replaces (rendered empty, with a warning, until a human sets the value).
+        #[arg(long, value_name = "TEXT")]
+        literal: Option<String>,
         /// Apply immediately instead of leaving the item in the pending list.
         #[arg(long)]
         apply: bool,
@@ -623,13 +745,15 @@ pub fn main(bin_name: &'static str) -> ExitCode {
         Err(e) => e.exit(),
     };
     let json = cli.json;
-    match run(cli) {
+    let code = match run(cli) {
         Ok(code) => code,
         Err(e) => {
             let (kind, message) = error::classify(&e);
             report(kind, &message, json)
         }
-    }
+    };
+    crate::render::forget();
+    code
 }
 
 /// Rust ignores SIGPIPE, so printing into a closed pipe (`dw status | head`)
@@ -698,9 +822,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
         }
         Command::Track {
             paths,
+            allow_plaintext,
             apply,
             dry_run,
-        } => return cmds::track_cmd(&store, Plan::Track, &paths, apply, dry_run, json),
+        } => {
+            cmds::allow_plaintext(&store, allow_plaintext)?;
+            return cmds::track_cmd(&store, Plan::Track, &paths, apply, dry_run, json);
+        }
         Command::Untrack {
             paths,
             apply,
@@ -740,8 +868,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 VariantCmd::List { path } => cmds::variant_list(&store, path.as_deref(), json),
             };
         }
+        Command::Vault { action } => {
+            return match action {
+                VaultCmd::Init => vault_cmds::init(&store, json),
+                VaultCmd::Unlock => vault_cmds::unlock(&store, json),
+                VaultCmd::Lock => vault_cmds::lock(&store, json),
+                VaultCmd::Status => vault_cmds::status(&store, json),
+                VaultCmd::Passwd => vault_cmds::passwd(&store, json),
+                VaultCmd::Recover => vault_cmds::recover(&store, json),
+            };
+        }
+        Command::UpgradeTemplates { apply, dry_run } => {
+            return vault_cmds::upgrade_templates(&store, apply, dry_run, json);
+        }
+        Command::Encrypt {
+            path,
+            apply,
+            dry_run,
+        } => return vault_cmds::encrypt(&store, &path, apply, dry_run, json),
+        Command::HelperSecret { name, targets } => {
+            return vault_cmds::helper_secret(&store, &name, &targets);
+        }
+        Command::HelperFile { id } => return vault_cmds::helper_file(&store, &id),
         Command::Values { action } => {
             return match action {
+                ValuesCmd::AddSecret {
+                    name,
+                    target,
+                    placeholder,
+                    apply: _,
+                    dry_run,
+                } => vault_cmds::add_secret(
+                    &store,
+                    &name,
+                    target.as_deref(),
+                    placeholder,
+                    dry_run,
+                    json,
+                ),
                 ValuesCmd::List => cmds::values_list(&store, json),
                 ValuesCmd::Show { name } => cmds::values_show(&store, &name, json),
                 ValuesCmd::SetVariable {
@@ -768,9 +932,30 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 ValuesCmd::Wire {
                     path,
                     name,
+                    literal,
                     apply,
                     dry_run,
-                } => cmds::values_wire(&store, &path, &name, apply, dry_run, json),
+                } => cmds::values_wire(
+                    &store,
+                    &path,
+                    &name,
+                    literal.as_deref(),
+                    apply,
+                    dry_run,
+                    json,
+                ),
+                ValuesCmd::Remove {
+                    name,
+                    force,
+                    apply,
+                    dry_run,
+                } => cmds::values_remove(&store, &name, force, apply, dry_run, json),
+                ValuesCmd::UnsetSecret {
+                    name,
+                    target,
+                    apply: _,
+                    dry_run,
+                } => vault_cmds::unset_secret(&store, &name, &target, dry_run, json),
             };
         }
         Command::Machine { action } => {
@@ -844,8 +1029,12 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Stage {
             paths,
             all,
+            allow_plaintext,
             dry_run,
-        } => return cmds::stage_cmd(&store, true, &paths, all, dry_run, json),
+        } => {
+            cmds::allow_plaintext(&store, allow_plaintext)?;
+            return cmds::stage_cmd(&store, true, &paths, all, dry_run, json);
+        }
         Command::Unstage {
             paths,
             all,

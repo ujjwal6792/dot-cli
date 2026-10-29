@@ -177,6 +177,8 @@ pub struct Scan {
     pub changes: Vec<Change>,
     /// Files whose variants clash on this machine (path, reason): not classified.
     pub clashes: BTreeMap<String, String>,
+    /// Files that need the vault while it is locked (not classified).
+    pub locked: std::collections::BTreeSet<String>,
     targets: BTreeMap<String, Target>,
 }
 
@@ -188,6 +190,7 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
     let columns = status_columns(store)?;
     let last = last_written(store)?;
     let clashes = crate::variants::clashes(store)?;
+    let locked = crate::values::locked_files(store)?;
     let vars = crate::variants::Variants::read(&repo)?;
     let mut changes = Vec::new();
 
@@ -196,7 +199,11 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
         match repo_target(&repo, &vars, &path) {
             Some(target) => {
                 let present = fs::symlink_metadata(repo.join(&path)).is_ok();
-                if present && !targets.contains_key(&target) && !clashes.contains_key(&target) {
+                if present
+                    && !targets.contains_key(&target)
+                    && !clashes.contains_key(&target)
+                    && !locked.contains(&target)
+                {
                     continue; // assigned to other machines
                 }
                 let kind = match letter {
@@ -266,6 +273,7 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
     Ok(Scan {
         changes,
         clashes,
+        locked,
         targets,
     })
 }
@@ -342,6 +350,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     let mut deleted = Vec::new();
     let mut skipped = Vec::new();
     let mut refusals = Vec::new();
+    let mut notes_secret: Vec<String> = Vec::new();
     let vars = crate::variants::Variants::read(&store.repo())?;
     let mine = crate::variants::this_targets(store)?;
     let resolver = crate::values::Resolver::load(store)?;
@@ -352,6 +361,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     for s in sel.unwrap_or_default() {
         if let Some(why) = scan.clashes.get(s) {
             return Err(refuse(format!("~/{s}: {why}")));
+        }
+        if scan.locked.iter().any(|l| covers(s, l)) {
+            return Err(DwError::new(
+                Kind::VaultLocked,
+                format!(
+                    "~/{s} needs the vault, which is locked; run `dw vault unlock` in a terminal"
+                ),
+            )
+            .into());
         }
     }
     let matched_any = |p: &str| {
@@ -441,6 +459,56 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             }),
         }
     }
+    // Files that gained secrets are never staged as they are.
+    let mut new_sanitized: Vec<(String, crate::detect::Sanitized)> = Vec::new();
+    {
+        let found = crate::detect::found_in(store, &files);
+        if !found.is_empty() && !crate::vault::exists(store) {
+            let msg = crate::detect::no_vault_message(&found);
+            if found
+                .iter()
+                .any(|f| sel.is_some_and(|s| s.contains(&f.rel)))
+            {
+                refusals.push((Kind::Error, msg));
+            } else {
+                for f in &found {
+                    skipped.push(Skipped {
+                        path: track::tilde(&f.rel),
+                        reason: "holds a secret; run `dw vault init` first (it would be moved to the vault)".into(),
+                    });
+                }
+            }
+            files.retain(|f| !found.iter().any(|x| &x.rel == f));
+        } else if !found.is_empty() && !dry_run {
+            let mut taken = crate::detect::taken(store);
+            for f in &found {
+                let san = crate::detect::sanitize(store, f, &mut taken)?;
+                match ctx.tracked.files.get(&f.rel) {
+                    Some(e) if !e.source.ends_with(".tmpl") && !e.symlink => {
+                        ref_files.push(crate::values::RefStage {
+                            rel: f.rel.clone(),
+                            dest: format!("{}.tmpl", e.source),
+                            bytes: san.bytes,
+                            changes: Vec::new(),
+                            unchanged: false,
+                            extra: san.extra,
+                            remove: Some(e.source.clone()),
+                        });
+                    }
+                    _ => new_sanitized.push((f.rel.clone(), san)),
+                }
+            }
+            files.retain(|f| !found.iter().any(|x| &x.rel == f));
+        } else if !found.is_empty() {
+            for f in &found {
+                notes_secret.push(format!(
+                    "~/{} holds a secret: staging stores it in the vault",
+                    f.rel
+                ));
+            }
+            files.retain(|f| !found.iter().any(|x| &x.rel == f));
+        }
+    }
     if let Some((kind, _)) = refusals.first() {
         let msg = refusals
             .iter()
@@ -449,24 +517,34 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .join("; ");
         return Err(DwError::new(*kind, msg).into());
     }
-    let mut notes: Vec<String> = Vec::new();
+    let mut notes: Vec<String> = notes_secret;
     let mut new_values: BTreeMap<&str, &str> = BTreeMap::new();
     for ch in ref_files.iter().flat_map(|p| &p.changes) {
         if let Some(other) = new_values.insert(&ch.name, &ch.new)
             && other != ch.new
         {
-            return Err(refuse(format!(
-                "variable {} would get two values ({other:?} and {:?}); stage one file at a time",
-                ch.name, ch.new
-            )));
+            return Err(refuse(if resolver.is_secret(&ch.name) {
+                format!(
+                    "secret {} would get two values; stage one file at a time",
+                    ch.name
+                )
+            } else {
+                format!(
+                    "variable {} would get two values ({other:?} and {:?}); stage one file at a time",
+                    ch.name, ch.new
+                )
+            }));
         }
         let line = crate::values::describe(&resolver, ch);
         if !notes.contains(&line) {
             notes.push(line);
         }
     }
-    let nothing =
-        files.is_empty() && deleted.is_empty() && variant_files.is_empty() && ref_files.is_empty();
+    let nothing = files.is_empty()
+        && deleted.is_empty()
+        && variant_files.is_empty()
+        && ref_files.is_empty()
+        && new_sanitized.is_empty();
     if nothing && skipped.is_empty() {
         bail!("nothing to stage");
     }
@@ -488,8 +566,16 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 fs::write(&to, bytes).with_context(|| format!("writing {}", to.display()))?;
             }
             for p in &ref_files {
+                crate::detect::write_extra(store, &p.extra)?;
                 let to = store.repo().join(&p.dest);
                 fs::write(&to, &p.bytes).with_context(|| format!("writing {}", to.display()))?;
+                if let Some(old) = &p.remove {
+                    fs::remove_file(store.repo().join(old))?;
+                }
+            }
+            for (rel, san) in &new_sanitized {
+                crate::detect::write_extra(store, &san.extra)?;
+                crate::detect::add_sanitized(store, rel, &san.bytes)?;
             }
             let all: Vec<_> = ref_files.iter().flat_map(|p| p.changes.clone()).collect();
             crate::values::apply_changes(store, &all)?;
@@ -498,9 +584,17 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
                 let rels: BTreeSet<&str> = variant_files
                     .iter()
                     .map(|(r, _)| r.as_str())
-                    .chain(ref_files.iter().map(|p| p.rel.as_str()))
+                    .chain(
+                        ref_files
+                            .iter()
+                            .filter(|p| p.extra.is_empty())
+                            .map(|p| p.rel.as_str()),
+                    )
                     .collect();
                 restore_last_written(store, &rels)?;
+                for p in ref_files.iter().filter(|p| !p.extra.is_empty()) {
+                    crate::detect::set_last_written(store, &p.rel)?;
+                }
             }
             let changed: Vec<String> = track::unstaged(store)?.into_iter().collect();
             track::stage(store, &changed)?;
@@ -536,6 +630,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .cloned()
             .chain(variant_files.iter().map(|(r, _)| r.clone()))
             .chain(ref_files.iter().map(|p| p.rel.clone()))
+            .chain(new_sanitized.iter().map(|(r, _)| r.clone()))
             .collect();
         if let Some(l) = lock.as_ref() {
             // Detection only proposes; it never fails a stage that succeeded.
@@ -550,6 +645,7 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
             .iter()
             .chain(variant_files.iter().map(|(rel, _)| rel))
             .chain(ref_files.iter().map(|p| &p.rel))
+            .chain(new_sanitized.iter().map(|(r, _)| r))
             .map(|f| track::tilde(f))
             .chain(
                 deleted
@@ -837,6 +933,8 @@ pub struct Applied {
     pub conflicts: Vec<String>,
     /// Files chezmoi could not write (the others were written regardless).
     pub failed: Vec<String>,
+    /// Files that need the vault, skipped because it is locked.
+    pub vault_locked: Vec<String>,
     pub snapshot: Option<String>,
     pub error: Option<String>,
 }
@@ -862,7 +960,22 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
     };
     let files = pick(State::Incoming);
     let conflicts = pick(State::Conflict);
+    let vault_locked: Vec<String> = found
+        .locked
+        .iter()
+        .filter(|l| selected(paths, l))
+        .cloned()
+        .collect();
     for p in paths.unwrap_or_default() {
+        if vault_locked.iter().any(|l| covers(p, l)) {
+            return Err(DwError::new(
+                Kind::VaultLocked,
+                format!(
+                    "~/{p} needs the vault, which is locked; run `dw vault unlock` in a terminal"
+                ),
+            )
+            .into());
+        }
         if conflicts.contains(p) {
             return Err(DwError::new(
                 Kind::Conflict,
@@ -882,6 +995,7 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
         applied: files.clone(),
         conflicts,
         failed: Vec::new(),
+        vault_locked,
         snapshot: None,
         error: None,
     };
@@ -1031,6 +1145,7 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
     if opts.amend {
         ensure_amendable(store)?;
     }
+    crate::detect::commit_guard(store)?;
     if opts.messages.iter().any(|m| m.trim().is_empty()) {
         return Err(DwError::usage("the commit message is empty").into());
     }
@@ -1160,6 +1275,8 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
     let staged = staged_paths(store)?;
     let vars = crate::variants::Variants::read(&repo)?;
     let vchanges = crate::values::value_changes(store, &ctx, &scan.changes)?;
+    let resolver = crate::values::Resolver::load(store)?;
+    let known = crate::detect::known_pairs(store);
     let mut out = Vec::new();
     for c in &scan.changes {
         let wanted = if c.kind == "repo" {
@@ -1172,9 +1289,15 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
         }
         let diff = match c.state {
             State::Local | State::New => {
-                let old = scan.targets.get(&c.path).map(|t| t.text.as_str());
+                let old = scan.targets.get(&c.path).map(|t| t.text.clone());
                 let new = home_text(&store.dirs.home.join(&c.path));
-                unified(&c.path, old, new.as_deref())
+                let (old, new) = match new.as_deref().and_then(|h| {
+                    crate::values::masked_diff(store, &ctx, &resolver, &vars, &c.path, h)
+                }) {
+                    Some((o, n)) => (Some(o), Some(n)),
+                    None => (old, new),
+                };
+                unified(&c.path, old.as_deref(), new.as_deref())
             }
             State::Staged if c.kind == "repo" => {
                 git_literal(
@@ -1234,16 +1357,23 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
             .iter()
             .filter(|v| v.path == c.path)
             .map(|v| {
-                format!(
-                    "# variable {} changed: {} → {} (staging updates {})\n",
-                    v.name, v.from, v.to, v.updates
-                )
+                if v.secret {
+                    format!(
+                        "# secret {} changed (staging updates {} in the vault)\n",
+                        v.name, v.updates
+                    )
+                } else {
+                    format!(
+                        "# variable {} changed: {} → {} (staging updates {})\n",
+                        v.name, v.from, v.to, v.updates
+                    )
+                }
             })
             .collect();
         out.push(FileDiff {
             path: tilde(c),
             state: c.state,
-            diff: notes + &diff,
+            diff: notes + &crate::detect::redact(&diff, &known),
         });
     }
     Ok(out)

@@ -1,0 +1,2 @@
+{{- /* An encrypted whole file. Call with (dict "id" "<ID>"). The dotwarden helper prints the decrypted content (per-run token and unlock session required). */ -}}
+{{- if env "DOTWARDEN_MASK" }}«encrypted file»{{ else }}{{ output (env "DOTWARDEN_HELPER") "__file" .id }}{{ end -}}

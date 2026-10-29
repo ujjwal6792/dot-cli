@@ -202,6 +202,35 @@ pub fn run(store: &Store) -> Report {
                     Ok(_) => {}
                     Err(e) => checks.push(check("variants", false, format!("{e:#}"))),
                 }
+                if let Ok(tracked) = crate::source::load(&store.repo()) {
+                    let used = crate::values::usage(&store.repo(), &tracked).unwrap_or_default();
+                    let empty: Vec<String> = crate::secrets::read_meta(&store.repo())
+                        .values()
+                        .filter(|m| m.placeholder && used.contains_key(&m.name))
+                        .map(|m| m.name.clone())
+                        .collect();
+                    if !empty.is_empty() {
+                        let mut w = check(
+                            "placeholders",
+                            true,
+                            format!(
+                                "referenced but without a value (rendered empty): {}; set them with `dw values add-secret`",
+                                empty.join(", ")
+                            ),
+                        );
+                        w.warning = true;
+                        checks.push(w);
+                    }
+                }
+                if crate::templates::needs_upgrade(&store.repo()) {
+                    let mut w = check(
+                        "templates",
+                        true,
+                        "the repository's fixed templates are outdated; run `dw upgrade-templates`",
+                    );
+                    w.warning = true;
+                    checks.push(w);
+                }
                 if config_ok {
                     checks.push(match store.chezmoi(&["managed"]) {
                         Ok(o) => check(

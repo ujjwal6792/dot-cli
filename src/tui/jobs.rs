@@ -31,6 +31,15 @@ pub const KEY_ACTION: &str = "action";
 pub const KEY_FETCH: &str = "fetch";
 pub const KEY_REGISTRY: &str = "registry";
 pub const KEY_MACHINE: &str = "machine";
+pub const KEY_VALUES: &str = "values";
+
+/// The Values screen's data, read off the event loop.
+#[derive(Debug, Default)]
+pub struct ValuesView {
+    pub rows: Vec<crate::values::Row>,
+    /// Decrypted secrets; empty while the vault is locked.
+    pub reveal: std::collections::BTreeMap<String, crate::values::Reveal>,
+}
 
 /// The machine registry and the assignments, as the TUI shows them.
 #[derive(Debug, Default, Clone)]
@@ -70,6 +79,7 @@ pub enum Payload {
     /// A background fetch: `None` when there was nothing to fetch from.
     Fetch(Result<Option<String>, String>),
     Registry(Result<Box<RegistryView>, String>),
+    Values(Result<Box<ValuesView>, String>),
     /// What a registry machine would receive.
     MachinePreview {
         name: String,

@@ -77,15 +77,22 @@ impl Store {
     /// same git isolation as [`Store::git_command`] for the git chezmoi runs
     /// itself. Callers append the subcommand and its arguments.
     pub fn chezmoi_command(&self) -> Command {
-        self.chezmoi_command_with(
+        let mut cmd = self.chezmoi_command_with(
             &self.dirs.chezmoi_config(),
             &self.dirs.chezmoi_state(),
             &self.dirs.chezmoi_cache(),
-        )
+        );
+        // Real renders may call the secret helper; masked ones (below) never do.
+        cmd.env_remove(crate::render::MASK_ENV);
+        for (k, v) in crate::render::chezmoi_env(self) {
+            cmd.env(k, v);
+        }
+        cmd
     }
 
     /// Like [`Store::chezmoi_command`] with another config, state and cache
-    /// (preview as another machine uses throwaway ones).
+    /// (preview as another machine uses throwaway ones). Renders with this
+    /// command never contain secret values (masked).
     pub fn chezmoi_command_with(&self, config: &Path, state: &Path, cache: &Path) -> Command {
         let mut cmd = Command::new(self.tools.chezmoi());
         cmd.env_clear();
@@ -96,6 +103,7 @@ impl Store {
             }
         }
         self.apply_git_env(&mut cmd);
+        cmd.env(crate::render::MASK_ENV, "1");
         let mut path = vec![self.tools.git_root().join("bin")];
         if let Some(existing) = self.env.get(OsStr::new("PATH")) {
             path.extend(std::env::split_paths(existing));

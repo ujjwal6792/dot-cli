@@ -476,8 +476,26 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         Action::ValueSet { .. } | Action::ValueUnset { .. } => {
             g.repo.extend(crate::values::guard(store, ctx, action)?);
         }
+        Action::ValueRemove { .. } => {
+            g.repo.extend(crate::values::guard(store, ctx, action)?);
+        }
         Action::ValueWire { .. } => {
             g.repo.extend(crate::values::guard(store, ctx, action)?);
+        }
+        Action::UpgradeTemplates { .. } => {
+            for (rel, _) in crate::templates::FILES {
+                g.repo
+                    .insert(format!("template:{rel}"), repo_fingerprint(&repo, rel));
+            }
+            g.repo.insert(
+                "templates:version".into(),
+                crate::templates::recorded(&repo).to_string(),
+            );
+        }
+        Action::Encrypt { path, .. } | Action::SecretMove { path, .. } => {
+            g.home
+                .insert(path.clone(), home_fingerprint(&home.join(path)));
+            g.repo.extend(crate::detect::guard(store, ctx, action));
         }
         Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
             g.repo
@@ -737,6 +755,17 @@ pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> R
             hp.rel
         )));
     };
+    let rels: Vec<String> = files
+        .iter()
+        .filter(|f| !f.symlink)
+        .map(|f| f.path.clone())
+        .collect();
+    for f in crate::detect::inspect(store, &rels)? {
+        notes.push(format!(
+            "~/{} holds a secret (hidden): applying stores it in the vault and the file keeps a reference",
+            f.rel
+        ));
+    }
     let changes = preview_add(store, &files)?;
     let want: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let got: BTreeSet<&str> = changes.iter().map(|c| c.target.as_str()).collect();
@@ -1308,17 +1337,44 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
                     bail!("~/{} is hidden by a hide rule", f.path);
                 }
             }
-            for chunk in files.chunks(CHUNK) {
+            // Files holding secrets are never added as they are: they are stored
+            // sanitized (secret in the vault, reference in the file).
+            let rels: Vec<String> = files
+                .iter()
+                .filter(|f| !f.symlink)
+                .map(|f| f.path.clone())
+                .collect();
+            let found = crate::detect::inspect(store, &rels)?;
+            let plain: Vec<&crate::pending::TrackFile> = files
+                .iter()
+                .filter(|f| !found.iter().any(|x| x.rel == f.path))
+                .collect();
+            for chunk in plain.chunks(CHUNK) {
                 let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
                 args.extend(chunk.iter().map(|f| home.join(&f.path).into()));
                 store.chezmoi_locked(&args)?;
+            }
+            let mut expected = expected_sources(item);
+            let mut extra_files: Vec<String> = Vec::new();
+            let mut taken = crate::detect::taken(store);
+            for f in &found {
+                let san = crate::detect::sanitize(store, f, &mut taken)?;
+                crate::detect::write_extra(store, &san.extra)?;
+                extra_files.extend(san.extra.iter().map(|(r, _)| r.clone()));
+                crate::detect::add_sanitized(store, &f.rel, &san.bytes)?;
+                for c in item.preview.files.iter().filter(|c| c.target == f.rel) {
+                    expected.remove(&c.source);
+                    expected.insert(format!("{}.tmpl", c.source));
+                }
             }
             if *record_folder {
                 let mut folders = source::read_folders(&repo)?;
                 folders.insert(path.clone());
                 source::write_folders(&repo, &folders)?;
             }
-            verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
+            let mut optional: Vec<&str> = vec![DATA_FILE];
+            optional.extend(extra_files.iter().map(String::as_str));
+            verify_and_stage(store, &expected, &optional)
         }
         Action::Untrack {
             files,
@@ -1389,9 +1445,33 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             let expected = crate::variants::exec(store, &item.action)?;
             verify_and_stage(store, &expected, &[DATA_FILE])
         }
-        Action::ValueSet { .. } | Action::ValueUnset { .. } | Action::ValueWire { .. } => {
+        Action::ValueSet { .. }
+        | Action::ValueUnset { .. }
+        | Action::ValueWire { .. }
+        | Action::ValueRemove { .. } => {
             let expected = crate::values::exec(store, &item.action)?;
+            let staged = verify_and_stage(store, &expected, &[])?;
+            if matches!(item.action, Action::ValueWire { .. }) {
+                // A value moved behind a reference must not linger as a loose blob.
+                crate::detect::prune(store)?;
+            }
+            Ok(staged)
+        }
+        Action::UpgradeTemplates { .. } => {
+            let expected = crate::encfile::upgrade_templates(store)?;
             verify_and_stage(store, &expected, &[])
+        }
+        Action::Encrypt { .. } => {
+            let expected = crate::encfile::exec(store, &item.action)?;
+            let staged = verify_and_stage(store, &expected, &[])?;
+            crate::detect::prune(store)?;
+            Ok(staged)
+        }
+        Action::SecretMove { .. } => {
+            let expected = crate::detect::exec(store, &item.action)?;
+            let staged = verify_and_stage(store, &expected, &[])?;
+            crate::detect::prune(store)?;
+            Ok(staged)
         }
         Action::Assign { .. }
         | Action::MachineAdd { .. }
