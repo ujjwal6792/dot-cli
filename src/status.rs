@@ -143,23 +143,37 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         .map(str::to_string)
         .collect();
     let pending = crate::pending::load(store)?.items.len();
-    let tracked = crate::source::load(&store.repo())?;
+    let merging = crate::remote::merge_in_progress(store);
+    let tracked = if merging {
+        Default::default()
+    } else {
+        crate::source::load(&store.repo())?
+    };
     let rules = crate::hide::HideRules::for_store(store)?;
-    let new_files = crate::track::new_files(&store.dirs.home, &tracked, &rules, cancel)?;
+    let new_files = if merging {
+        Vec::new()
+    } else {
+        crate::track::new_files(&store.dirs.home, &tracked, &rules, cancel)?
+    };
     // chezmoi needs the generated config (and so a registered machine) to render targets.
-    let changes = if machine.as_ref().is_some_and(|m| m.registered.is_some())
-        && store.dirs.chezmoi_config().exists()
+    let changes = if merging
+        || (machine.as_ref().is_some_and(|m| m.registered.is_some())
+            && store.dirs.chezmoi_config().exists())
     {
         crate::changes::classify(store)?
     } else {
         Vec::new()
     };
-    let value_changes = if changes.is_empty() {
+    let value_changes = if merging || changes.is_empty() {
         Vec::new()
     } else {
         crate::values::value_changes(store, &crate::track::Ctx::load(store)?, &changes)?
     };
-    let variants = match crate::variants::this_targets(store)? {
+    let variants = match if merging {
+        None
+    } else {
+        crate::variants::this_targets(store)?
+    } {
         Some(mine) => {
             crate::variants::summaries(&crate::variants::Variants::read(&store.repo())?, &mine)
         }
@@ -263,7 +277,7 @@ impl Status {
             }
             s.push_str(&format!("{title}: {}\n", list.len()));
             for c in list.iter().take(20) {
-                let shown = if c.kind == "repo" {
+                let shown = if c.kind == "repo" || c.kind == "merge" {
                     format!("repo:{}", c.path)
                 } else {
                     format!("~/{}", c.path)

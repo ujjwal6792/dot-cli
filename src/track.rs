@@ -1248,6 +1248,12 @@ pub(crate) fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
 }
 
 pub(crate) fn ensure_repo_clean(store: &Store) -> Result<()> {
+    if crate::remote::merge_in_progress(store) {
+        return Err(refuse(
+            "a merge from `dw pull --merge` is in progress: resolve its conflicts with `dw resolve`,              then `dw pull --continue` (or `dw pull --abort`)"
+                .to_string(),
+        ));
+    }
     let dirty = unstaged(store)?;
     if dirty.is_empty() {
         return Ok(());

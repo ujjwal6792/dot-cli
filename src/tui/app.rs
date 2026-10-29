@@ -107,6 +107,10 @@ pub enum ActionReq {
     ApplyIncoming(Option<Vec<String>>),
     Fetch,
     Pull,
+    MergePull,
+    ContinuePull,
+    AbortPull,
+    Revert(String),
     Push,
     /// Add one pending assignment item for these HOME-relative paths.
     Assign(Vec<String>, Vec<crate::machines::Edit>),
@@ -195,6 +199,7 @@ pub struct ValuesScreen {
 /// The Conflicts screen (Enter on the Conflicts tab): hunks of one file.
 #[derive(Debug)]
 pub struct ConflictScreen {
+    pub stored: bool,
     pub path: String,
     pub data: Load<Box<super::jobs::ConflictData>>,
     /// The conflicting hunk in view.
@@ -289,6 +294,7 @@ pub enum Dialog {
     ConfirmApply(Option<Vec<String>>),
     /// `P`: y/n before pushing.
     ConfirmPush,
+    ConfirmRevert(String),
     /// `m`: the assignment editor.
     Assign(AssignEditor),
 }
@@ -301,6 +307,9 @@ pub enum Load<T> {
 }
 
 pub struct App {
+    pub commits: Vec<crate::history::Commit>,
+    pub commit_selected: usize,
+    commit_limit: usize,
     pub store: Arc<Store>,
     rules: Arc<HideRules>,
     jobs: Jobs,
@@ -347,6 +356,9 @@ impl App {
     pub fn new(store: Arc<Store>, rules: HideRules, tx: Sender<Event>) -> Self {
         let root = store.dirs.home.clone();
         Self {
+            commits: Vec::new(),
+            commit_selected: 0,
+            commit_limit: 50,
             store,
             rules: Arc::new(rules),
             jobs: Jobs::new(tx),
@@ -396,6 +408,7 @@ impl App {
         self.refresh_hide();
         self.reload_listing(None);
         self.background_fetch();
+        self.refresh_commits();
     }
 
     /// Fetch every remote without blocking; it never pulls or applies.
@@ -547,6 +560,18 @@ impl App {
             return;
         }
         match done.payload {
+            Payload::Commits(r) => match r {
+                Ok(commits) => {
+                    self.commits = commits;
+                    self.commit_selected = self
+                        .commit_selected
+                        .min(self.commits.len().saturating_sub(1));
+                    if self.focus == Panel::Git {
+                        self.commit_diff();
+                    }
+                }
+                Err(e) => self.message = Some(e),
+            },
             Payload::Status(r) => {
                 self.status = match r {
                     Ok(s) => Load::Ready(*s),
@@ -643,6 +668,11 @@ impl App {
                 self.action_running = false;
                 match r {
                     Ok(report) => {
+                        if report.merge_conflicts {
+                            self.focus = Panel::Changes;
+                            self.changes_tab = 3;
+                            self.changes_selected = 0;
+                        }
                         self.message = Some(report.message);
                         if let Some(text) = report.amend_message {
                             self.dialog = Some(Dialog::Commit(CommitBox { text, amend: true }));
@@ -654,6 +684,7 @@ impl App {
                     Err(e) => self.message = Some(e),
                 }
                 self.reload_values();
+                self.refresh_commits();
                 self.refresh_tracking();
                 self.refresh_hide();
                 self.refresh_status();
@@ -761,6 +792,11 @@ impl App {
                 KeyCode::Char('y') => self.request_action(ActionReq::Push),
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmPush),
+            },
+            Some(Dialog::ConfirmRevert(hash)) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Revert(hash)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::ConfirmRevert(hash)),
             },
             Some(Dialog::Assign(mut e)) if e.variant => {
                 let last = e.rows.len().saturating_sub(1);
@@ -1041,6 +1077,9 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         let before = self.focus;
         self.handle_key_inner(key);
+        if self.focus == Panel::Git && before != Panel::Git {
+            self.commit_diff();
+        }
         if self.focus == Panel::Changes && before != Panel::Changes {
             self.request_diff();
         }
@@ -1076,7 +1115,8 @@ impl App {
             KeyCode::Tab => return self.focus = self.focus.shifted(1),
             KeyCode::BackTab => return self.focus = self.focus.shifted(-1),
             KeyCode::Char(c @ '1'..='5') => {
-                return self.focus = Panel::ALL[c as usize - '1' as usize];
+                self.focus = Panel::ALL[c as usize - '1' as usize];
+                return;
             }
             KeyCode::Char('0') => return self.focus = Panel::Pending,
             KeyCode::Char('V') => {
@@ -1086,7 +1126,7 @@ impl App {
             KeyCode::Char('f') => return self.request_action(ActionReq::Fetch),
             KeyCode::Char('p') => return self.request_action(ActionReq::Pull),
             KeyCode::Char('P') => return self.dialog = Some(Dialog::ConfirmPush),
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if self.focus != Panel::Git => {
                 self.refresh_tracking();
                 self.refresh_hide();
                 self.refresh_status();
@@ -1099,6 +1139,7 @@ impl App {
             Panel::Pending => self.pending_key(key),
             Panel::Changes => self.changes_key(key),
             Panel::Machines => self.machines_key(key),
+            Panel::Git => self.git_key(key),
             _ => match key.code {
                 KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
                 KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
@@ -1109,6 +1150,65 @@ impl App {
 
     pub fn take_handoff(&mut self) -> Option<Handoff> {
         self.handoff.take()
+    }
+
+    fn refresh_commits(&mut self) {
+        let store = Arc::clone(&self.store);
+        let count = self.commit_limit;
+        self.jobs.spawn("commits", move |_| {
+            Payload::Commits(
+                crate::history::log(&store, None, 0, count).map_err(|e| format!("{e:#}")),
+            )
+        });
+    }
+
+    fn commit_diff(&mut self) {
+        let Some(c) = self.commits.get(self.commit_selected) else {
+            return;
+        };
+        let hash = c.hash.clone();
+        let store = Arc::clone(&self.store);
+        self.diff = Load::Loading;
+        self.jobs.spawn(KEY_DIFF, move |cancel| {
+            use ansi_to_tui::IntoText;
+            let result = crate::history::diff(&store, &hash, None).and_then(|plain| {
+                let shown = changes::through_delta(&store, &plain, Some(cancel)).unwrap_or(plain);
+                Ok(shown.into_text()?)
+            });
+            Payload::Diff(result.map_err(|e| format!("{e:#}")))
+        });
+    }
+
+    fn git_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.commit_selected =
+                    (self.commit_selected + 1).min(self.commits.len().saturating_sub(1));
+                if self.commit_selected + 1 == self.commits.len()
+                    && self.commits.len() == self.commit_limit
+                {
+                    self.commit_limit += 50;
+                    self.refresh_commits();
+                }
+                self.commit_diff();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.commit_selected = self.commit_selected.saturating_sub(1);
+                self.commit_diff();
+            }
+            KeyCode::Enter => self.commit_diff(),
+            KeyCode::Char('r') => {
+                if let Some(c) = self.commits.get(self.commit_selected) {
+                    self.dialog = Some(Dialog::ConfirmRevert(c.hash.clone()));
+                }
+            }
+            KeyCode::Char('M') => self.request_action(ActionReq::MergePull),
+            KeyCode::Char('C') => self.request_action(ActionReq::ContinuePull),
+            KeyCode::Char('X') => self.request_action(ActionReq::AbortPull),
+            KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            _ => {}
+        }
     }
 
     /// The editor returned: its merge file becomes the result awaiting y/n.
@@ -1132,6 +1232,7 @@ impl App {
 
     fn open_conflict(&mut self, path: String) {
         self.conflict = Some(ConflictScreen {
+            stored: self.selected_change().is_some_and(|c| c.kind == "merge"),
             path: path.clone(),
             data: Load::Loading,
             cursor: 0,
@@ -1484,6 +1585,7 @@ impl App {
 
 fn report(message: String) -> ActionReport {
     ActionReport {
+        merge_conflicts: false,
         message,
         results: None,
         amend_message: None,
@@ -1566,6 +1668,28 @@ fn render_diff(
 /// Run one queued mutation on a worker thread.
 fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
     match req {
+        ActionReq::Revert(hash) => {
+            let c = crate::history::revert(store, &hash, changes::agent(store).as_deref())?;
+            Ok(report(format!("Reverted in {}; see Incoming", c.short)))
+        }
+        ActionReq::MergePull => {
+            let p = crate::remote::pull(store, None, crate::remote::PullMode::Merge)?;
+            let mut r = report(if p.conflicts.is_empty() {
+                "Pulled; see Incoming".into()
+            } else {
+                "Merge conflicts: resolve in Changes → Conflicts, then Git C (continue), or X (abort)".into()
+            });
+            r.merge_conflicts = !p.conflicts.is_empty();
+            Ok(r)
+        }
+        ActionReq::ContinuePull => {
+            crate::remote::pull_continue(store)?;
+            Ok(report("Merge committed; see Incoming".into()))
+        }
+        ActionReq::AbortPull => {
+            crate::remote::pull_abort(store)?;
+            Ok(report("Merge aborted".into()))
+        }
         ActionReq::Toggle(paths) => {
             let requester = "human";
             let mut messages = Vec::new();
@@ -1587,6 +1711,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 (n, m) => format!("{n} pending changes updated, {m} refused: {}", refused[0]),
             };
             Ok(ActionReport {
+                merge_conflicts: false,
                 message,
                 results: None,
                 amend_message: None,
@@ -1596,6 +1721,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let hp = track::resolve_home_path(store, &path.to_string_lossy(), &store.dirs.home)?;
             let t = track::toggle_hide(store, &hp, is_dir, "human")?;
             Ok(ActionReport {
+                merge_conflicts: false,
                 message: t.message,
                 results: None,
                 amend_message: None,
@@ -1605,6 +1731,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let lock = store.lock()?;
             let gone = pending::drop_items(store, &lock, &[id])?;
             Ok(ActionReport {
+                merge_conflicts: false,
                 message: format!("Dropped {}: {}", gone[0].label(), gone[0].summary),
                 results: None,
                 amend_message: None,
@@ -1697,7 +1824,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             }))
         }
         ActionReq::Pull => {
-            let p = crate::remote::pull(store, None)?;
+            let p = crate::remote::pull(store, None, crate::remote::PullMode::Rebase)?;
             Ok(report(if p.commits == 0 {
                 format!("Up to date with {}", p.remote)
             } else {
@@ -1794,6 +1921,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 .filter(|r| r.status == track::Outcome::Applied)
                 .count();
             Ok(ActionReport {
+                merge_conflicts: false,
                 message: format!("Applied {applied} of {} item(s)", results.len()),
                 results: Some(results),
                 amend_message: None,

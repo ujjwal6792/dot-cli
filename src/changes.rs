@@ -184,6 +184,23 @@ pub struct Scan {
 
 /// Classify every change on this machine.
 pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
+    if crate::remote::merge_in_progress(store) {
+        // A merge from `dw pull --merge` is waiting: the stored files that
+        // conflict are the only changes until it is finished.
+        return Ok(Scan {
+            changes: crate::remote::unmerged(store)?
+                .into_iter()
+                .map(|path| Change {
+                    path,
+                    state: State::Conflict,
+                    kind: "merge",
+                })
+                .collect(),
+            clashes: BTreeMap::new(),
+            locked: Default::default(),
+            targets: BTreeMap::new(),
+        });
+    }
     let home = &store.dirs.home;
     let repo = store.repo();
     let targets = targets(store)?;
@@ -280,13 +297,27 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
 
 /// The tracked path a repository file stands for: a source file, or a variant
 /// file of a tracked path.
-fn repo_target(repo: &Path, vars: &crate::variants::Variants, path: &str) -> Option<String> {
+pub(crate) fn repo_target(
+    repo: &Path,
+    vars: &crate::variants::Variants,
+    path: &str,
+) -> Option<String> {
     decode_source_path(repo, path)
         .map(|(t, _)| t)
         .or_else(|| vars.target_of(path))
 }
 
 pub fn classify(store: &Store) -> Result<Vec<Change>> {
+    if crate::remote::merge_in_progress(store) {
+        return Ok(crate::remote::unmerged(store)?
+            .into_iter()
+            .map(|path| Change {
+                path,
+                state: State::Conflict,
+                kind: "merge",
+            })
+            .collect());
+    }
     Ok(scan(store, &Ctx::load(store)?)?.changes)
 }
 
@@ -302,7 +333,7 @@ fn selected(sel: Option<&[String]>, path: &str) -> bool {
 }
 
 fn tilde(c: &Change) -> String {
-    if c.kind == "repo" {
+    if c.kind == "repo" || c.kind == "merge" {
         format!("repo:{}", c.path)
     } else {
         track::tilde(&c.path)

@@ -408,7 +408,7 @@ fn a_file_changed_on_both_machines_is_a_conflict_that_apply_refuses() {
 }
 
 #[test]
-fn pull_refuses_diverged_history_and_leaves_it_alone() {
+fn pull_rebases_diverged_non_overlapping_commits_and_pushes() {
     let (a, remote) = machine_a();
     let b = machine_b(&remote);
     write(&b, ".b", "b side\n");
@@ -418,18 +418,132 @@ fn pull_refuses_diverged_history_and_leaves_it_alone() {
     let head = b.git(&repo(&b), &["rev-parse", "HEAD"]);
 
     let r = dw(&b, &["pull"]);
-    assert_eq!(r.code, 1, "{}{}", r.out, r.err);
-    assert!(
-        r.err.contains("diverged") && r.err.contains("lazygit"),
-        "{}",
-        r.err
-    );
-    assert_eq!(b.git(&repo(&b), &["rev-parse", "HEAD"]), head);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert_ne!(b.git(&repo(&b), &["rev-parse", "HEAD"]), head);
+    assert_eq!(read(&b, ".a"), "one\n");
     let s = b.dw_json(&["status"]);
     assert_eq!(
         (s["repo"]["ahead"].as_u64(), s["repo"]["behind"].as_u64()),
-        (Some(1), Some(1))
+        (Some(1), Some(0))
     );
+    b.dw_ok(&["push", "--yes"]);
+}
+
+fn diverged_overlap() -> (TestEnv, TestEnv, PathBuf) {
+    let (a, remote) = machine_a();
+    let b = machine_b(&remote);
+    write(&b, ".a", "beta\n");
+    b.dw_ok(&["stage", ".a"]);
+    b.dw_ok(&["commit", "-m", "beta edit"]);
+    edit_commit_push(&a, ".a", "alpha\n");
+    (a, b, remote)
+}
+
+#[test]
+fn overlapping_rebase_aborts_restoring_head_index_worktree_and_home() {
+    let (_a, b, _remote) = diverged_overlap();
+    let head = b.git(&repo(&b), &["rev-parse", "HEAD"]);
+    let tree = b.git(&repo(&b), &["write-tree"]);
+    write(&b, ".a", "uncommitted HOME edit\n");
+    let before = fs::read(repo(&b).join("home/dot_a")).unwrap();
+    let r = dw(&b, &["pull"]);
+    assert_eq!(r.code, 5, "{}{}", r.out, r.err);
+    assert!(r.err.contains("home/dot_a"));
+    assert_eq!(b.git(&repo(&b), &["rev-parse", "HEAD"]), head);
+    assert_eq!(b.git(&repo(&b), &["write-tree"]), tree);
+    assert_eq!(fs::read(repo(&b).join("home/dot_a")).unwrap(), before);
+    assert!(b.git(&repo(&b), &["status", "--porcelain"]).is_empty());
+    assert_eq!(read(&b, ".a"), "uncommitted HOME edit\n");
+    assert!(!repo(&b).join(".git/rebase-merge").exists());
+}
+
+#[test]
+fn merge_conflicts_resolve_continue_and_push_without_touching_home() {
+    let (_a, b, _remote) = diverged_overlap();
+    let r = dw(&b, &["pull", "--merge"]);
+    assert_eq!(r.code, 5, "{}{}", r.out, r.err);
+    assert_eq!(states(&b, "conflict"), ["home/dot_a"]);
+    assert_eq!(dw(&b, &["pull", "--continue"]).code, 5);
+    b.dw_ok(&["resolve", ".a", "--take", "incoming"]);
+    assert_eq!(read(&b, ".a"), "beta\n");
+    b.dw_ok(&["pull", "--continue"]);
+    assert_eq!(
+        b.git(&repo(&b), &["rev-list", "--parents", "-n1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
+    assert_eq!(read(&b, ".a"), "beta\n");
+    b.dw_ok(&["push", "--yes"]);
+}
+
+#[test]
+fn abort_restores_even_after_resolving_a_merge_file() {
+    let (_a, b, _remote) = diverged_overlap();
+    let head = b.git(&repo(&b), &["rev-parse", "HEAD"]);
+    let tree = b.git(&repo(&b), &["write-tree"]);
+    assert_eq!(dw(&b, &["pull", "--merge"]).code, 5);
+    b.dw_ok(&["resolve", "home/dot_a", "--take", "incoming"]);
+    b.dw_ok(&["pull", "--abort"]);
+    assert_eq!(b.git(&repo(&b), &["rev-parse", "HEAD"]), head);
+    assert_eq!(b.git(&repo(&b), &["write-tree"]), tree);
+    assert_eq!(
+        fs::read_to_string(repo(&b).join("home/dot_a")).unwrap(),
+        "beta\n"
+    );
+    assert_eq!(read(&b, ".a"), "beta\n");
+}
+
+#[test]
+fn commits_pushed_to_another_remote_are_not_rewritten() {
+    let (_a, b, _remote) = diverged_overlap();
+    let backup = bare(&b, "backup.git");
+    b.dw_ok(&["remote", "add", "backup", backup.to_str().unwrap(), "--yes"]);
+    b.dw_ok(&["push", "backup", "--yes"]);
+    let head = b.git(&repo(&b), &["rev-parse", "HEAD"]);
+    let r = dw(&b, &["pull", "origin"]);
+    assert_eq!(r.code, 1);
+    assert!(r.err.contains("not rewritten"), "{}", r.err);
+    assert_eq!(b.git(&repo(&b), &["rev-parse", "HEAD"]), head);
+}
+
+#[test]
+fn conflicting_registry_data_remains_visible_and_resolvable() {
+    let (a, remote) = machine_a();
+    let b = machine_b(&remote);
+    a.dw_ok(&["pull"]);
+    let path = "home/.chezmoidata/dotwarden.toml";
+    for (t, comment) in [(&a, "alpha"), (&b, "beta")] {
+        let original = fs::read_to_string(repo(t).join(path)).unwrap();
+        fs::write(repo(t).join(path), format!("# {comment}\n{original}")).unwrap();
+        t.git(&repo(t), &["add", path]);
+        t.git(&repo(t), &["commit", "-m", comment]);
+    }
+    a.dw_ok(&["push", "--yes"]);
+    assert_eq!(dw(&b, &["pull", "--merge"]).code, 5);
+    assert_eq!(states(&b, "conflict"), [path]);
+    b.dw_ok(&["resolve", path, "--take", "local"]);
+    b.dw_ok(&["pull", "--continue"]);
+    b.dw_ok(&["push", "--yes"]);
+}
+
+#[test]
+fn clean_merge_has_two_parents_and_incoming_files() {
+    let (a, remote) = machine_a();
+    let b = machine_b(&remote);
+    write(&b, ".b", "beta\n");
+    b.dw_ok(&["stage", ".b"]);
+    b.dw_ok(&["commit", "-m", "beta"]);
+    edit_commit_push(&a, ".a", "alpha\n");
+    b.dw_ok(&["pull", "--merge"]);
+    assert_eq!(
+        b.git(&repo(&b), &["rev-list", "--parents", "-n1", "HEAD"])
+            .split_whitespace()
+            .count(),
+        3
+    );
+    assert!(incoming(&b).contains(&".a".into()));
+    b.dw_ok(&["push", "--yes"]);
 }
 
 #[test]

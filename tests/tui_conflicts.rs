@@ -188,6 +188,40 @@ fn pair() -> (TestEnv, TestEnv) {
 }
 
 #[test]
+fn repository_merge_hunks_write_only_stored_form_and_continue() {
+    let (a, b) = pair();
+    write(&b, ".a", "l1\nL2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+    b.dw_ok(&["stage", ".a"]);
+    b.dw_ok(&["commit", "-m", "beta"]);
+    write(&a, ".a", "l1\nI2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\n");
+    a.dw_ok(&["stage", ".a"]);
+    a.dw_ok(&["commit", "-m", "alpha"]);
+    a.dw_ok(&["push", "--yes"]);
+    let mut tui = open(b);
+    tui.press('4');
+    tui.press('M');
+    assert_eq!(tui.app.focus, dotwarden::tui::app::Panel::Changes);
+    assert_eq!(tui.app.changes_tab, 3);
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(tui.app.conflict.as_ref().unwrap().stored);
+    assert!(tui.screen().contains("I2"));
+    tui.press('i');
+    tui.press('w');
+    assert!(tui.screen().contains("HOME stays unchanged"));
+    tui.press('y');
+    assert!(read(&tui.t, ".a").contains("L2"));
+    assert!(
+        fs::read_to_string(tui.t.dirs().repo().join("home/dot_a"))
+            .unwrap()
+            .contains("I2")
+    );
+    tui.press('4');
+    tui.press('C');
+    assert!(!tui.t.dirs().repo().join(".git/MERGE_HEAD").exists());
+    tui.t.dw_ok(&["push", "--yes"]);
+}
+
+#[test]
 fn hunks_are_picked_with_l_and_i_while_other_changes_merge_automatically() {
     let (a, b) = pair();
     write(&b, ".a", "l1\nL2\nl3\nl4\nL5\nl6\nl7\nl8\nL9\nl10\n");

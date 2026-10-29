@@ -122,6 +122,49 @@ impl Tui {
 }
 
 #[test]
+fn commits_cursor_diff_paging_and_revert_confirmation() {
+    let t = edited();
+    t.dw_ok(&["stage", ".a"]);
+    t.dw_ok(&["commit", "-m", "second"]);
+    // Real history beyond the initial page. Empty commits keep this inexpensive.
+    for i in 0..51 {
+        t.git(
+            &t.dirs().repo(),
+            &["commit", "--allow-empty", "-m", &format!("padding {i}")],
+        );
+    }
+    let mut tui = open(t);
+    tui.press('4');
+    assert_eq!(tui.app.commits.len(), 50);
+    for _ in 0..51 {
+        tui.press('j');
+    }
+    assert!(tui.app.commits.len() > 50);
+    assert_eq!(tui.app.commits[tui.app.commit_selected].subject, "second");
+    let screen = tui.screen();
+    assert!(screen.contains("two"), "{screen}");
+    tui.press('r');
+    assert!(matches!(tui.app.dialog, Some(Dialog::ConfirmRevert(_))));
+    let before = tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]);
+    tui.press('n');
+    assert_eq!(
+        tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]),
+        before
+    );
+    tui.press('r');
+    tui.press('y');
+    assert_ne!(
+        tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]),
+        before
+    );
+    assert_eq!(
+        fs::read_to_string(tui.t.dirs().repo().join("home/dot_a")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+}
+
+#[test]
 fn space_stages_on_the_local_tab_and_unstages_on_the_staged_tab() {
     let mut tui = open(edited());
     assert_eq!(tui.app.focus, Panel::Changes);

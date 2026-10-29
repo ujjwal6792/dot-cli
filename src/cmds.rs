@@ -592,6 +592,22 @@ pub fn resolve_cmd(
     }
     let agent = changes::agent(store);
     let requester = agent.clone().unwrap_or_else(|| "human".into());
+    let merge_path = match conflicts::find_merge_path(store, path)? {
+        Some(p) => Some(p),
+        None if remote::merge_in_progress(store) => {
+            let home = track::resolve_home_path(store, path, &cwd()?)?.rel;
+            conflicts::find_merge_path(store, &home)?
+        }
+        None => None,
+    };
+    if remote::merge_in_progress(store) && merge_path.is_none() {
+        return Err(changes_refuse(
+            "that file is not conflicting in the merge in progress (see `dw status`)",
+        ));
+    }
+    if let Some(rel) = merge_path {
+        return resolve_merge_cmd(store, &rel, take, merge, dry_run, json);
+    }
     let rel = track::resolve_home_path(store, path, &cwd()?)?.rel;
     let how = match take {
         Some("local") => How::Local,
@@ -665,6 +681,76 @@ pub fn resolve_cmd(
         );
         if let Some(s) = &r.snapshot {
             println!("what was there before is in snapshot {s}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// `dw resolve` on a stored file conflicting in a merge from `dw pull --merge`.
+fn resolve_merge_cmd(
+    store: &Store,
+    rel: &str,
+    take: Option<&str>,
+    merge: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    use crate::conflicts::{self, How};
+    use std::io::IsTerminal;
+    if dry_run {
+        let note = if merge {
+            let l = conflicts::load(store, rel)?;
+            l.clean()
+                .map_or_else(|| l.describe(), |_| "the merge is clean".into())
+        } else {
+            "the chosen side is staged".into()
+        };
+        if json {
+            print_json(&json!({"dry_run": true, "path": rel, "note": note}))?;
+        } else {
+            println!("Dry run: nothing was changed. {rel}: {note}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    let how = match take {
+        Some("local") => How::Local,
+        Some(_) => How::Incoming,
+        None => {
+            let l = conflicts::load(store, rel)?;
+            match l.clean() {
+                Some(t) => How::Text(t),
+                None if !json
+                    && std::io::stdin().is_terminal()
+                    && std::io::stdout().is_terminal() =>
+                {
+                    How::Text(conflicts::edit(store, &l)?)
+                }
+                None => {
+                    return Err(DwError::new(
+                        Kind::Conflict,
+                        format!(
+                            "{rel}: {}; resolve it in the TUI, with $EDITOR in a terminal, or with --take",
+                            l.describe()
+                        ),
+                    )
+                    .into());
+                }
+            }
+        }
+    };
+    let r = conflicts::resolve(store, rel, how, "human")?;
+    let left = remote::unmerged(store)?;
+    if json {
+        print_json(&json!({"resolved": r, "remaining": left}))?;
+    } else {
+        println!(
+            "Resolved {} with the {} version; staged.",
+            r.path, r.resolution
+        );
+        if left.is_empty() {
+            println!("All conflicts resolved: run `dw pull --continue`.");
+        } else {
+            println!("Still conflicting: {}", left.join(", "));
         }
     }
     Ok(ExitCode::SUCCESS)
@@ -888,9 +974,27 @@ pub fn fetch_cmd(store: &Store, all: bool, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn pull_cmd(store: &Store, from: Option<&str>, json: bool) -> Result<ExitCode> {
+pub fn pull_cmd(
+    store: &Store,
+    from: Option<&str>,
+    mode: remote::PullMode,
+    action: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
     require_initialised(store)?;
-    let p = remote::pull(store, from)?;
+    let p = match action {
+        Some("continue") => remote::pull_continue(store)?,
+        Some(_) => {
+            remote::pull_abort(store)?;
+            if json {
+                print_json(&json!({"aborted": true}))?;
+            } else {
+                println!("Merge aborted; the repository is as it was before the pull.");
+            }
+            return Ok(ExitCode::SUCCESS);
+        }
+        None => remote::pull(store, from, mode)?,
+    };
     let incoming = match changes::classify(store) {
         Ok(c) => c
             .iter()
@@ -902,14 +1006,84 @@ pub fn pull_cmd(store: &Store, from: Option<&str>, json: bool) -> Result<ExitCod
             0
         }
     };
+    let conflicted = p.how == "conflicts";
     if json {
         print_json(&json!({"pulled": p, "incoming": incoming}))?;
-    } else if p.commits == 0 {
+    } else if conflicted {
+        println!(
+            "Merge stopped: {} stored file(s) conflict: {}\nResolve each with `dw resolve PATH --take local|incoming | --merge`, then `dw pull --continue` (or `dw pull --abort`).",
+            p.conflicts.len(),
+            p.conflicts.join(", ")
+        );
+    } else if p.how == "up-to-date" {
         println!("Already up to date with {}.", p.remote);
     } else {
+        let verb = match p.how {
+            "fast-forward" => "Fast-forwarded",
+            "rebased" => "Rebased your commits onto",
+            _ => "Merged",
+        };
         println!(
-            "Fast-forwarded {} commit(s) from {} ({} file(s) changed). {incoming} incoming; apply with `dw apply`.",
+            "{verb} {} commit(s) from {} ({} file(s) changed). {incoming} incoming; apply with `dw apply`.",
             p.commits, p.remote, p.files
+        );
+    }
+    Ok(if conflicted {
+        ExitCode::from(Kind::Conflict.code())
+    } else {
+        ExitCode::SUCCESS
+    })
+}
+
+pub fn log_cmd(store: &Store, path: Option<&str>, count: usize, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let commits = crate::history::log(store, path, 0, count)?;
+    if json {
+        print_json(&commits)?;
+    } else {
+        for c in commits {
+            println!(
+                "{} {} — {}{}",
+                c.short,
+                c.subject,
+                c.author,
+                c.agent.map_or(String::new(), |a| format!(" [Agent: {a}]"))
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn show_cmd(store: &Store, commit: &str, path: Option<&str>, json: bool) -> Result<ExitCode> {
+    use std::io::IsTerminal;
+    require_initialised(store)?;
+    let c = crate::history::commit_info(store, commit)?;
+    let diff = crate::history::diff(store, &c.hash, path)?;
+    if json {
+        print_json(&json!({"commit": c, "diff": diff}))?;
+    } else {
+        print!("{}", crate::history::header(&c));
+        if std::io::stdout().is_terminal() {
+            print!(
+                "{}",
+                changes::through_delta(store, &diff, None).unwrap_or(diff)
+            );
+        } else {
+            print!("{diff}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn revert_cmd(store: &Store, commit: &str, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let c = crate::history::revert(store, commit, changes::agent(store).as_deref())?;
+    if json {
+        print_json(&c)?;
+    } else {
+        println!(
+            "Reverted in {}. Changed files are Incoming; use `dw apply`.",
+            c.short
         );
     }
     Ok(ExitCode::SUCCESS)

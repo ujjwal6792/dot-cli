@@ -605,15 +605,65 @@ pub fn fetch(store: &Store, all: bool, cancel: Option<&CancelToken>) -> Result<F
 
 // ---- pull ----------------------------------------------------------------
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PullMode {
+    /// Fast-forward, else replay the unpushed local commits on the remote's.
+    Rebase,
+    /// Fast-forward, else create a merge commit.
+    Merge,
+}
+
 #[derive(Debug, Serialize)]
 pub struct Pulled {
     pub remote: String,
     pub commits: u32,
     pub files: usize,
+    /// `up-to-date`, `fast-forward`, `rebased`, `merged` or `conflicts`
+    /// (a merge is in progress).
+    pub how: &'static str,
+    /// Stored files (repository paths) a merge in progress left conflicting.
+    pub conflicts: Vec<String>,
 }
 
-/// Fast-forward the branch to the remote's. Diverged history is refused.
-pub fn pull(store: &Store, remote: Option<&str>) -> Result<Pulled> {
+fn git_dir_has(store: &Store, name: &str) -> bool {
+    store.repo().join(".git").join(name).exists()
+}
+
+/// Whether `dw pull --merge` left a merge waiting for conflict resolution.
+pub fn merge_in_progress(store: &Store) -> bool {
+    git_dir_has(store, "MERGE_HEAD")
+}
+
+/// Stored files with unresolved merge conflicts (repository paths).
+pub fn unmerged(store: &Store) -> Result<Vec<String>> {
+    let out = store.git(&["diff", "--name-only", "--diff-filter=U"])?;
+    Ok(out.stdout.lines().map(str::to_string).collect())
+}
+
+fn conflict_error(files: &[String], what: &str) -> anyhow::Error {
+    DwError::new(
+        Kind::Conflict,
+        format!(
+            "{what} conflicts in {} stored file(s): {}. Nothing was changed. \
+             Run `dw pull --merge` and resolve them with `dw resolve` (or take one side), \
+             then `dw pull --continue`",
+            files.len(),
+            files.join(", ")
+        ),
+    )
+    .into()
+}
+
+/// Fetch, then bring the branch up to the remote's. Diverged history is
+/// replayed (default) or merged; a rebase that conflicts is aborted, leaving the
+/// repository exactly as it was. HOME is never touched.
+pub fn pull(store: &Store, remote: Option<&str>, mode: PullMode) -> Result<Pulled> {
+    let _lock = store.lock()?;
+    if merge_in_progress(store) {
+        bail!(
+            "a merge is in progress: resolve the conflicts, then `dw pull --continue` (or `--abort`)"
+        );
+    }
     let remote = match remote {
         Some(r) => r.to_string(),
         None => default_remote(store)?,
@@ -633,56 +683,134 @@ pub fn pull(store: &Store, remote: Option<&str>) -> Result<Pulled> {
     {
         bail!("{remote} has no branch {branch}; nothing to pull");
     }
-    let _lock = store.lock()?;
     crate::track::ensure_repo_clean(store)?;
     let (ahead, behind) = counts(store, &reference)?;
+    let done = |how, commits, files, conflicts| {
+        Ok(Pulled {
+            remote: remote.clone(),
+            commits,
+            files,
+            how,
+            conflicts,
+        })
+    };
     if behind == 0 {
-        return Ok(Pulled {
-            remote,
-            commits: 0,
-            files: 0,
-        });
+        return done("up-to-date", 0, 0, Vec::new());
     }
     let base = text(store, &["merge-base", "HEAD", &reference]).unwrap_or_default();
-    if ahead > 0 {
-        let only_data = store
-            .git(&["diff", "--name-only", &format!("{reference}...HEAD")])?
-            .stdout
-            .lines()
-            .all(|p| p.starts_with("home/.chezmoidata/"));
-        if !only_data || !rebase_onto(store, &reference) {
-            return Err(DwError::new(
-                Kind::Error,
-                format!(
-                    "diverged: this machine has {ahead} commit(s) {reference} lacks and {reference} has {behind} this machine lacks; \
-                     merge/rebase arrives later — use `G` lazygit"
-                ),
-            )
-            .into());
-        }
-    } else {
+    let how = if ahead == 0 {
         store.git(&["merge", "--ff-only", "--quiet", &reference])?;
-    }
+        "fast-forward"
+    } else {
+        if store.git(&["diff", "--cached", "--quiet"]).is_err() {
+            bail!(
+                "history has diverged and staged changes are waiting: commit or unstage them first"
+            );
+        }
+        match mode {
+            PullMode::Rebase => {
+                rebase_unpushed(store, &reference, ahead)?;
+                "rebased"
+            }
+            PullMode::Merge => {
+                let mut cmd = store.git_command(&store.repo());
+                cmd.args(["merge", "--no-ff", "--no-edit", "--quiet", &reference]);
+                let out = exec::run(cmd, None)?;
+                if !out.success() {
+                    if !merge_in_progress(store) {
+                        bail!("git merge failed: {}", out.stderr.trim());
+                    }
+                    return done("conflicts", behind, 0, unmerged(store)?);
+                }
+                "merged"
+            }
+        }
+    };
     let files = store
         .git(&["diff", "--name-only", &format!("{base}..HEAD")])?
         .stdout
         .lines()
         .count();
+    done(how, behind, files, Vec::new())
+}
+
+/// Replay the local commits on `reference`. Commits that exist on any remote
+/// are never rewritten, and neither are merge commits. A conflict aborts the
+/// rebase so the repository is exactly as before.
+fn rebase_unpushed(store: &Store, reference: &str, ahead: u32) -> Result<()> {
+    let local_only: u32 = text(
+        store,
+        &["rev-list", "--count", "HEAD", "--not", "--remotes"],
+    )
+    .and_then(|n| n.parse().ok())
+    .unwrap_or(0);
+    let merges = text(
+        store,
+        &[
+            "rev-list",
+            "--count",
+            "--merges",
+            &format!("{reference}..HEAD"),
+        ],
+    )
+    .and_then(|n| n.parse::<u32>().ok())
+    .unwrap_or(0);
+    if local_only < ahead || merges > 0 {
+        bail!(
+            "diverged: some local commits are already on a remote or are merges, so they are not rewritten; \
+             use `dw pull --merge`"
+        );
+    }
+    if store.git(&["rebase", "--quiet", reference]).is_ok() {
+        return Ok(());
+    }
+    let files = unmerged(store).unwrap_or_default();
+    if git_dir_has(store, "rebase-merge") || git_dir_has(store, "rebase-apply") {
+        store
+            .git(&["rebase", "--abort"])
+            .context("restoring the repository after rebase failure")?;
+    }
+    if files.is_empty() {
+        bail!("rebasing onto {reference} failed; nothing was changed");
+    }
+    Err(conflict_error(
+        &files,
+        "rebasing your commits onto the remote's",
+    ))
+}
+
+/// `dw pull --continue`: commit the resolved merge.
+pub fn pull_continue(store: &Store) -> Result<Pulled> {
+    let _lock = store.lock()?;
+    if !merge_in_progress(store) {
+        bail!("no merge is in progress");
+    }
+    let left = unmerged(store)?;
+    if !left.is_empty() {
+        return Err(DwError::new(
+            Kind::Conflict,
+            format!("still conflicting: {}", left.join(", ")),
+        )
+        .into());
+    }
+    store.git(&["commit", "--quiet", "--no-edit"])?;
     Ok(Pulled {
-        remote,
-        commits: behind,
-        files,
+        remote: default_remote(store)?,
+        commits: 0,
+        files: 0,
+        how: "merged",
+        conflicts: Vec::new(),
     })
 }
 
-/// Replay the local commits on `reference`; on any conflict abort so the
-/// repository is exactly as before. Only used for commits that touch metadata.
-fn rebase_onto(store: &Store, reference: &str) -> bool {
-    if store.git(&["rebase", "--quiet", reference]).is_ok() {
-        return true;
+/// `dw pull --abort`: drop the merge, restoring the repository as before the pull.
+pub fn pull_abort(store: &Store) -> Result<()> {
+    let _lock = store.lock()?;
+    if !merge_in_progress(store) {
+        bail!("no merge is in progress");
     }
-    let _ = store.git(&["rebase", "--abort"]);
-    false
+    store.git(&["merge", "--abort"])?;
+    Ok(())
 }
 
 // ---- push ----------------------------------------------------------------

@@ -12,6 +12,7 @@ pub mod error;
 pub mod exec;
 pub mod fsutil;
 pub mod hide;
+pub mod history;
 pub mod lock;
 pub mod machine;
 pub mod machines;

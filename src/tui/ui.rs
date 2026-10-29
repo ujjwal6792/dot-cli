@@ -19,7 +19,7 @@ pub fn is_single_panel(area: Rect) -> bool {
     area.width < NARROW_WIDTH || area.height < SHORT_HEIGHT
 }
 
-const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · V values · v range · r refresh";
+const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · V values · r refresh / Git revert";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
@@ -46,7 +46,7 @@ const HELP: &[(&str, &str)] = &[
         "c A d (Changes)",
         "commit, amend (Ctrl+J: new line), discard; Enter diff",
     ),
-    ("f p P", "fetch, pull (fast-forward), push (y/n)"),
+    ("f p P", "fetch, pull (rebase if diverged), push (y/n)"),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
     ("Enter (Pending)", "review and apply all checked items"),
@@ -61,7 +61,8 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("< / >, Home / End", "first / last item"),
     (".", "show or hide items matched by hide rules"),
-    ("r", "refresh status and folder"),
+    ("r", "Git: revert (y/n); elsewhere: refresh"),
+    ("Git M C X", "merge pull, continue merge, abort merge"),
     (
         "E",
         "Files: store the selected tracked file encrypted (pending item)",
@@ -186,7 +187,8 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     use crate::conflicts::Pick;
     let Some(c) = &app.conflict else { return };
     let title = format!(
-        " Conflict ~/{} · j/k hunk · l local · i incoming · b both · e editor · w write · Esc cancel ",
+        " Conflict {}{} · j/k hunk · l local · i incoming · b both · e editor · w write · Esc cancel ",
+        if c.stored { "repo:" } else { "~/" },
         c.path
     );
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -259,8 +261,14 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     if c.confirm.is_some() {
         f.render_widget(
             Paragraph::new(format!(
-                "Write the result to ~/{} and stage it? y / n (a snapshot is taken first)",
-                c.path
+                "Write the result to {}{} and stage it? y / n ({})",
+                if c.stored { "repo:" } else { "~/" },
+                c.path,
+                if c.stored {
+                    "HOME stays unchanged"
+                } else {
+                    "a snapshot is taken first"
+                }
             ))
             .block(Block::default().borders(Borders::ALL)),
             confirm,
@@ -343,17 +351,30 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
         Panel::Changes => draw_changes(f, app, block, area, expanded),
         Panel::Machines => draw_machines(f, app, block, area, expanded),
         Panel::Git => {
-            let text = "Commits · Branches · Remotes · Stash\n(arrives with git support)";
-            let shown = if expanded {
-                text
-            } else {
-                text.lines().next().unwrap_or("")
-            };
-            f.render_widget(
-                Paragraph::new(shown)
-                    .style(Style::default().fg(Color::DarkGray))
-                    .block(block),
+            let items: Vec<ListItem> = app
+                .commits
+                .iter()
+                .map(|c| {
+                    ListItem::new(format!(
+                        "{} {} {} — {}{}",
+                        if c.merge { "◆" } else { "●" },
+                        c.short,
+                        c.subject,
+                        c.author,
+                        c.agent
+                            .as_ref()
+                            .map_or(String::new(), |a| format!(" [Agent: {a}]"))
+                    ))
+                })
+                .collect();
+            let mut state = ListState::default().with_selected(Some(app.commit_selected));
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(block.title(" 4 Git · Commits · r revert "))
+                    .highlight_style(Style::default().fg(Color::Yellow))
+                    .highlight_symbol("› "),
                 area,
+                &mut state,
             );
         }
     }
@@ -685,16 +706,23 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border(false))
         .title(title);
-    if app.focus == Panel::Changes {
+    if app.focus == Panel::Changes || app.focus == Panel::Git {
         let body = match &app.diff {
             Load::Loading => ratatui::text::Text::from("loading…"),
             Load::Failed(e) => ratatui::text::Text::from(e.clone()),
             Load::Ready(t) if t.lines.is_empty() => ratatui::text::Text::from("No change selected"),
             Load::Ready(t) => t.clone(),
         };
-        let title = app
-            .selected_change()
-            .map_or(" Diff ".to_string(), |c| format!(" {} ", c.path));
+        let title = if app.focus == Panel::Git {
+            app.commits
+                .get(app.commit_selected)
+                .map_or(" Commit ".into(), |c| {
+                    format!(" {} {} ", c.short, c.subject)
+                })
+        } else {
+            app.selected_change()
+                .map_or(" Diff ".to_string(), |c| format!(" {} ", c.path))
+        };
         return f.render_widget(Paragraph::new(body).block(block.title(title)), area);
     }
     let text: String = match app.focus {
@@ -879,6 +907,13 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                     "y applies · n / Esc cancels",
                     Style::default().fg(Color::Yellow),
                 ),
+            ],
+        ),
+        Dialog::ConfirmRevert(hash) => (
+            " Revert commit ",
+            vec![
+                Line::from(format!("Create a revert commit for {hash}?")),
+                Line::from("y confirm · n cancel (HOME stays unchanged)"),
             ],
         ),
         Dialog::ConfirmPush => (

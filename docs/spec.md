@@ -445,8 +445,9 @@ Actions:
 
 ## 6. Git
 
-Covered in CLI and TUI: fetch, pull (fast-forward by default; merge or rebase on
-explicit choice with conflict resolution in dotwarden), push (to one or all
+Covered in CLI and TUI: fetch, pull (fast-forward when possible; otherwise rebase
+only unpushed commits, aborting on conflict; explicit `--merge` keeps conflicts
+for stored-form resolution and `--continue`/`--abort`), push (to one or all
 remotes), branches (list/create/switch/delete), remotes (add/remove/list), log with
 per-commit diff and file history, revert a commit, stash/pop, point-in-time
 restore. All machines share one default branch; the UI warns when a machine is on
