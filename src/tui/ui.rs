@@ -23,6 +23,14 @@ const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m 
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
+    (
+        "E",
+        "Files: store the selected tracked file encrypted (pending item)",
+    ),
+    (
+        "V, u / L",
+        "Values: u unlock (masked prompt), L lock, s new secret",
+    ),
     ("q / Ctrl-C", "quit"),
     ("1-5", "focus panel Status/Files/Changes/Git/Machines"),
     ("Tab / Shift-Tab", "next / previous panel"),
@@ -116,12 +124,17 @@ fn draw_values(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::from("No values yet. n creates a variable."));
     }
     for (i, r) in v.rows.iter().enumerate() {
-        let overrides = r
-            .overrides
-            .iter()
-            .map(|o| format!("{}={}", o.target, o.value))
-            .collect::<Vec<_>>()
-            .join(", ");
+        // Secret values are shown only while unlocked (the reveal is TUI-only).
+        let revealed = v.reveal.get(&r.name);
+        let default = revealed.map_or(r.default.as_str(), |x| x.default.as_str());
+        let overrides = match revealed {
+            Some(x) => &x.overrides,
+            None => &r.overrides,
+        }
+        .iter()
+        .map(|o| format!("{}={}", o.target, o.value))
+        .collect::<Vec<_>>()
+        .join(", ");
         let files = r
             .files
             .iter()
@@ -136,7 +149,7 @@ fn draw_values(f: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::styled(
             format!(
                 "{:<18} {:<9} {:<16} {:<34} {}",
-                r.name, r.kind, r.default, overrides, files
+                r.name, r.kind, default, overrides, files
             ),
             style,
         ));
@@ -145,7 +158,7 @@ fn draw_values(f: &mut Frame, app: &App, area: Rect) {
         Paragraph::new(lines).block(
             Block::default()
                 .borders(Borders::ALL)
-                .title(" Values · Enter edit default · o add override · n new · Esc back "),
+                .title(" Values · Enter edit · o override · n new variable · s new secret · u unlock · L lock · Esc back "),
         ),
         table,
     );
@@ -154,9 +167,15 @@ fn draw_values(f: &mut Frame, app: &App, area: Rect) {
             super::app::ValueEdit::Default(n) => format!(" {n} default "),
             super::app::ValueEdit::Override(n) => format!(" {n} override: TARGET VALUE "),
             super::app::ValueEdit::New => " new variable: NAME VALUE ".to_string(),
+            super::app::ValueEdit::SecretDefault(n) => format!(" {n} secret value "),
+            super::app::ValueEdit::SecretOverride(n) => {
+                format!(" {n} secret override: TARGET VALUE ")
+            }
+            super::app::ValueEdit::NewSecret => " new secret: NAME VALUE ".to_string(),
+            super::app::ValueEdit::Unlock => " vault passphrase ".to_string(),
         };
         f.render_widget(
-            Paragraph::new(format!("{}█", i.text))
+            Paragraph::new(format!("{}█", i.edit.shown(&i.text)))
                 .block(Block::default().borders(Borders::ALL).title(prompt)),
             input,
         );

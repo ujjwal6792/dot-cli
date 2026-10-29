@@ -219,7 +219,10 @@ pub fn clashes(store: &Store) -> Result<BTreeMap<String, String>> {
 /// managed file but those (absolute paths). `None` when nothing clashes and
 /// chezmoi may be asked about everything.
 pub fn render_scope(store: &Store) -> Result<Option<Vec<String>>> {
-    let clashed = clashes(store)?;
+    let mut clashed = clashes(store)?;
+    for p in crate::values::locked_files(store)? {
+        clashed.entry(p).or_insert_with(|| "vault locked".into());
+    }
     if clashed.is_empty() {
         return Ok(None);
     }

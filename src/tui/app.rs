@@ -11,7 +11,8 @@ use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
     ActionReport, Done, Jobs, KEY_ACTION, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING, KEY_MACHINE,
-    KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STATUS, KEY_TRACKED, Payload, RegistryView,
+    KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STATUS, KEY_TRACKED, KEY_VALUES, Payload,
+    RegistryView, ValuesView,
 };
 use crate::assign::{self, Side, TargetRow, Tri};
 use crate::changes::{self, Change, CommitOpts, State};
@@ -116,6 +117,26 @@ pub enum ActionReq {
         target: Option<String>,
         value: String,
     },
+    /// `E` in Files: add a pending item storing this HOME-relative file encrypted.
+    Encrypt(String),
+    /// Set a secret's default or one override in the vault (immediately).
+    SecretSet {
+        name: String,
+        target: Option<String>,
+        value: Secret,
+    },
+    Unlock(Secret),
+    Lock,
+}
+
+/// Typed-in secret text; never printed by `Debug`.
+#[derive(Clone)]
+pub struct Secret(pub String);
+
+impl std::fmt::Debug for Secret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("Secret(…)")
+    }
 }
 
 /// What the Values input box is editing.
@@ -127,6 +148,29 @@ pub enum ValueEdit {
     Override(String),
     /// "NAME VALUE" for a new variable.
     New,
+    /// The default of a secret (typed text is masked).
+    SecretDefault(String),
+    /// "TARGET VALUE" for an override of a secret (the value is masked).
+    SecretOverride(String),
+    /// "NAME VALUE" for a new secret (the value is masked).
+    NewSecret,
+    /// The vault passphrase (masked).
+    Unlock,
+}
+
+impl ValueEdit {
+    /// What the input box shows for `text`: secret parts as bullets.
+    pub fn shown(&self, text: &str) -> String {
+        let dots = |s: &str| "•".repeat(s.chars().count());
+        match self {
+            ValueEdit::SecretDefault(_) | ValueEdit::Unlock => dots(text),
+            ValueEdit::SecretOverride(_) | ValueEdit::NewSecret => match text.split_once(' ') {
+                Some((a, b)) => format!("{a} {}", dots(b)),
+                None => text.to_string(),
+            },
+            _ => text.to_string(),
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -139,6 +183,8 @@ pub struct ValueInput {
 #[derive(Debug, Default)]
 pub struct ValuesScreen {
     pub rows: Vec<crate::values::Row>,
+    /// Decrypted secrets, only while unlocked.
+    pub reveal: std::collections::BTreeMap<String, crate::values::Reveal>,
     pub selected: usize,
     pub input: Option<ValueInput>,
 }
@@ -515,6 +561,16 @@ impl App {
                     self.tracked = Arc::new(*t);
                 }
             }
+            Payload::Values(r) => match r {
+                Ok(view) => {
+                    if let Some(v) = &mut self.values {
+                        v.selected = v.selected.min(view.rows.len().saturating_sub(1));
+                        v.rows = view.rows;
+                        v.reveal = view.reveal;
+                    }
+                }
+                Err(e) => self.message = Some(e),
+            },
             Payload::Registry(r) => {
                 if let Ok(v) = r {
                     self.registry = Some(Arc::new(*v));
@@ -1001,14 +1057,22 @@ impl App {
 
     /// Re-read the variables for the open Values screen.
     fn reload_values(&mut self) {
-        let Some(v) = &mut self.values else { return };
-        match crate::values::list(&self.store) {
-            Ok(rows) => {
-                v.selected = v.selected.min(rows.len().saturating_sub(1));
-                v.rows = rows;
-            }
-            Err(e) => self.message = Some(format!("{e:#}")),
+        if self.values.is_none() {
+            return;
         }
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_VALUES, move |_| {
+            Payload::Values(
+                crate::values::list(&store)
+                    .map(|rows| {
+                        Box::new(ValuesView {
+                            rows,
+                            reveal: crate::values::reveal(&store),
+                        })
+                    })
+                    .map_err(|e| format!("{e:#}")),
+            )
+        });
     }
 
     fn values_key(&mut self, key: KeyEvent) {
@@ -1023,6 +1087,37 @@ impl App {
                 KeyCode::Enter => {
                     let input = v.input.take().expect("checked");
                     let text = input.text.trim().to_string();
+                    let secret_req = match &input.edit {
+                        ValueEdit::Unlock => {
+                            // The passphrase is not trimmed.
+                            return self.request_action(ActionReq::Unlock(Secret(input.text)));
+                        }
+                        ValueEdit::SecretDefault(n) => Some((n.clone(), None, text.clone())),
+                        ValueEdit::SecretOverride(n) => text.split_once(' ').map(|(t, val)| {
+                            (n.clone(), Some(t.to_string()), val.trim().to_string())
+                        }),
+                        ValueEdit::NewSecret => text
+                            .split_once(' ')
+                            .map(|(n, val)| (n.to_string(), None, val.trim().to_string())),
+                        _ => None,
+                    };
+                    if matches!(
+                        input.edit,
+                        ValueEdit::SecretDefault(_)
+                            | ValueEdit::SecretOverride(_)
+                            | ValueEdit::NewSecret
+                    ) {
+                        return match secret_req {
+                            Some((name, target, value)) => {
+                                self.request_action(ActionReq::SecretSet {
+                                    name,
+                                    target,
+                                    value: Secret(value),
+                                })
+                            }
+                            None => self.message = Some("type: TARGET VALUE or NAME VALUE".into()),
+                        };
+                    }
                     let req = match &input.edit {
                         ValueEdit::Default(name) => Some((name.clone(), None, text)),
                         ValueEdit::Override(name) => text
@@ -1031,6 +1126,7 @@ impl App {
                         ValueEdit::New => text
                             .split_once(' ')
                             .map(|(n, val)| (n.to_string(), None, val.trim().into())),
+                        _ => None,
                     };
                     match req {
                         Some((name, target, value)) => {
@@ -1063,16 +1159,31 @@ impl App {
                     text: String::new(),
                 })
             }
+            KeyCode::Char('s') => {
+                v.input = Some(ValueInput {
+                    edit: ValueEdit::NewSecret,
+                    text: String::new(),
+                })
+            }
+            KeyCode::Char('u') => {
+                v.input = Some(ValueInput {
+                    edit: ValueEdit::Unlock,
+                    text: String::new(),
+                })
+            }
+            KeyCode::Char('L') => self.request_action(ActionReq::Lock),
             KeyCode::Enter | KeyCode::Char('e') | KeyCode::Char('o') => {
                 if let Some(row) = v.rows.get(v.selected) {
                     let over = key.code == KeyCode::Char('o');
+                    let secret = row.kind == "secret";
                     v.input = Some(ValueInput {
-                        edit: if over {
-                            ValueEdit::Override(row.name.clone())
-                        } else {
-                            ValueEdit::Default(row.name.clone())
+                        edit: match (secret, over) {
+                            (true, true) => ValueEdit::SecretOverride(row.name.clone()),
+                            (true, false) => ValueEdit::SecretDefault(row.name.clone()),
+                            (false, true) => ValueEdit::Override(row.name.clone()),
+                            (false, false) => ValueEdit::Default(row.name.clone()),
                         },
-                        text: if over {
+                        text: if over || secret {
                             String::new()
                         } else {
                             row.default.clone()
@@ -1150,6 +1261,13 @@ impl App {
                 if let Some(e) = self.files.selected_entry() {
                     let rel = self.files.rel_of(e);
                     return self.open_variant_picker(rel);
+                }
+                return;
+            }
+            KeyCode::Char('E') => {
+                if let Some(e) = self.files.selected_entry() {
+                    let rel = self.files.rel_of(e);
+                    return self.request_action(ActionReq::Encrypt(rel));
                 }
                 return;
             }
@@ -1467,6 +1585,36 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let mut added = pending::add(store, &lock, vec![item], &check)?;
             let item = added.remove(0).item;
             Ok(report(format!("Added {}: {}", item.label(), item.summary)))
+        }
+        ActionReq::Encrypt(path) => {
+            let hp = track::resolve_home_path(store, &path, &store.dirs.home)?;
+            let ctx = track::Ctx::load(store)?;
+            let item = crate::encfile::plan(store, &ctx, &hp, "human")?;
+            let lock = store.lock()?;
+            track::recheck(store, &lock, std::slice::from_ref(&item))?;
+            let ctx = track::Ctx::load(store)?;
+            let check = track::stale_checker(store, &ctx);
+            let mut added = pending::add(store, &lock, vec![item], &check)?;
+            let item = added.remove(0).item;
+            Ok(report(format!("Added {}: {}", item.label(), item.summary)))
+        }
+        ActionReq::SecretSet {
+            name,
+            target,
+            value,
+        } => {
+            crate::secrets::set(store, &name, target.as_deref(), &value.0)?;
+            Ok(report(format!(
+                "Secret {name} stored in the vault (staged)"
+            )))
+        }
+        ActionReq::Unlock(pass) => {
+            crate::vault::unlock(store, &pass.0)?;
+            Ok(report("Vault unlocked".into()))
+        }
+        ActionReq::Lock => {
+            crate::vault::session::end(store)?;
+            Ok(report("Vault locked".into()))
         }
         ActionReq::Apply(ids) => {
             let results = track::apply_pending(store, Some(&ids))?;

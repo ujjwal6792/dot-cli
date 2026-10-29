@@ -479,6 +479,11 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
         Action::ValueWire { .. } => {
             g.repo.extend(crate::values::guard(store, ctx, action)?);
         }
+        Action::Encrypt { path, .. } | Action::SecretMove { path, .. } => {
+            g.home
+                .insert(path.clone(), home_fingerprint(&home.join(path)));
+            g.repo.extend(crate::detect::guard(store, ctx, action));
+        }
         Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
             g.repo
                 .insert(format!("remote:{name}"), remote_state(store, name));
@@ -1392,6 +1397,16 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
         Action::ValueSet { .. } | Action::ValueUnset { .. } | Action::ValueWire { .. } => {
             let expected = crate::values::exec(store, &item.action)?;
             verify_and_stage(store, &expected, &[])
+        }
+        Action::Encrypt { .. } => {
+            let expected = crate::encfile::exec(store, &item.action)?;
+            verify_and_stage(store, &expected, &[])
+        }
+        Action::SecretMove { .. } => {
+            let expected = crate::detect::exec(store, &item.action)?;
+            let staged = verify_and_stage(store, &expected, &[])?;
+            crate::detect::prune(store)?;
+            Ok(staged)
         }
         Action::Assign { .. }
         | Action::MachineAdd { .. }

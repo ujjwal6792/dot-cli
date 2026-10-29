@@ -14,6 +14,9 @@ pub const VARIANT: &str = include_str!("../assets/home/.chezmoitemplates/dotward
 /// `home/.chezmoitemplates/dotwarden/value`: a variable's value for this machine.
 pub const VALUE: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/value");
 
+/// `home/.chezmoitemplates/dotwarden/file`: an encrypted whole file.
+pub const FILE: &str = include_str!("../assets/home/.chezmoitemplates/dotwarden/file");
+
 /// Files of the fixed template set, relative to the repository root.
 pub const FILES: &[(&str, &str)] = &[
     ("home/.chezmoiignore", CHEZMOIIGNORE),
@@ -21,4 +24,5 @@ pub const FILES: &[(&str, &str)] = &[
     ("home/.chezmoitemplates/dotwarden/select", SELECT),
     ("home/.chezmoitemplates/dotwarden/variant", VARIANT),
     ("home/.chezmoitemplates/dotwarden/value", VALUE),
+    ("home/.chezmoitemplates/dotwarden/file", FILE),
 ];

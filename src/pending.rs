@@ -137,6 +137,25 @@ pub enum Action {
         path: String,
         name: String,
     },
+    /// Store a tracked file encrypted in the vault (`files/<id>.age`).
+    Encrypt {
+        key: String,
+        path: String,
+        id: String,
+        /// The current source file of `path`.
+        source: String,
+    },
+    /// Move a value that looks like a secret (found at `line`, byte range
+    /// `start..end` of the HOME file; never the value itself) into the vault
+    /// as `name` and replace it by a reference.
+    SecretMove {
+        key: String,
+        path: String,
+        name: String,
+        line: usize,
+        start: usize,
+        end: usize,
+    },
 }
 
 /// The final assignment of one target path.
@@ -167,6 +186,8 @@ impl Action {
             Action::ValueSet { .. } => "value_set",
             Action::ValueUnset { .. } => "value_unset",
             Action::ValueWire { .. } => "value_wire",
+            Action::Encrypt { .. } => "encrypt",
+            Action::SecretMove { .. } => "secret_move",
         }
     }
 
@@ -199,7 +220,9 @@ impl Action {
             Action::VariantAdd { file, .. } | Action::VariantRemove { file, .. } => file,
             Action::ValueSet { key, .. }
             | Action::ValueUnset { key, .. }
-            | Action::ValueWire { key, .. } => key,
+            | Action::ValueWire { key, .. }
+            | Action::Encrypt { key, .. }
+            | Action::SecretMove { key, .. } => key,
         };
         (self.kind_name(), what)
     }

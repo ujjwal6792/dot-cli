@@ -58,13 +58,28 @@ pub struct Status {
     pub variants: Vec<crate::variants::Summary>,
     /// Variables whose value HOME holds differently at a reference position.
     pub value_changes: Vec<crate::values::ValueChange>,
-    pub vault: &'static str,
+    /// `none`, `locked` or `unlocked (N s left)`.
+    pub vault: String,
+    /// Files that need the vault to render and are skipped while it is locked.
+    pub vault_locked_files: Vec<String>,
 }
 
 fn trimmed(store: &Store, args: &[&str], cancel: Option<&CancelToken>) -> Option<String> {
     let out = store.git_cancellable(args, cancel).ok()?;
     let s = out.stdout.trim().to_string();
     (!s.is_empty()).then_some(s)
+}
+
+/// One-word vault state for status screens.
+pub fn vault_state(store: &Store) -> String {
+    if !crate::vault::exists(store) {
+        return "none".into();
+    }
+    let s = crate::vault::session::status(store);
+    match s.expires_in_seconds {
+        Some(n) if s.unlocked => format!("unlocked ({}m left)", n.div_ceil(60)),
+        _ => "locked".into(),
+    }
 }
 
 pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
@@ -82,7 +97,8 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             changes: Vec::new(),
             variants: Vec::new(),
             value_changes: Vec::new(),
-            vault: "none",
+            vault: "none".into(),
+            vault_locked_files: Vec::new(),
         });
     }
     let machine = store.local_machine_name()?.map(|name| {
@@ -166,7 +182,11 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         changes,
         variants,
         value_changes,
-        vault: "none",
+        vault: vault_state(store),
+        vault_locked_files: crate::values::locked_files(store)
+            .unwrap_or_default()
+            .into_iter()
+            .collect(),
     })
 }
 
@@ -256,9 +276,22 @@ impl Status {
             }
         }
         for v in &self.value_changes {
+            if v.secret {
+                s.push_str(&format!(
+                    "Secret {} changed (~/{}; staging updates {} in the vault, needs unlock)\n",
+                    v.name, v.path, v.updates
+                ));
+            } else {
+                s.push_str(&format!(
+                    "Variable {} changed: {} → {} (~/{}; staging updates {})\n",
+                    v.name, v.from, v.to, v.path, v.updates
+                ));
+            }
+        }
+        if !self.vault_locked_files.is_empty() {
             s.push_str(&format!(
-                "Variable {} changed: {} → {} (~/{}; staging updates {})\n",
-                v.name, v.from, v.to, v.path, v.updates
+                "Vault locked: {} file(s) need it and are not checked (`dw vault unlock`)\n",
+                self.vault_locked_files.len()
             ));
         }
         let blocked: Vec<_> = self.variants.iter().filter(|v| v.clash.is_some()).collect();

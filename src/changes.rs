@@ -177,6 +177,8 @@ pub struct Scan {
     pub changes: Vec<Change>,
     /// Files whose variants clash on this machine (path, reason): not classified.
     pub clashes: BTreeMap<String, String>,
+    /// Files that need the vault while it is locked (not classified).
+    pub locked: std::collections::BTreeSet<String>,
     targets: BTreeMap<String, Target>,
 }
 
@@ -188,6 +190,7 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
     let columns = status_columns(store)?;
     let last = last_written(store)?;
     let clashes = crate::variants::clashes(store)?;
+    let locked = crate::values::locked_files(store)?;
     let vars = crate::variants::Variants::read(&repo)?;
     let mut changes = Vec::new();
 
@@ -196,7 +199,11 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
         match repo_target(&repo, &vars, &path) {
             Some(target) => {
                 let present = fs::symlink_metadata(repo.join(&path)).is_ok();
-                if present && !targets.contains_key(&target) && !clashes.contains_key(&target) {
+                if present
+                    && !targets.contains_key(&target)
+                    && !clashes.contains_key(&target)
+                    && !locked.contains(&target)
+                {
                     continue; // assigned to other machines
                 }
                 let kind = match letter {
@@ -266,6 +273,7 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
     Ok(Scan {
         changes,
         clashes,
+        locked,
         targets,
     })
 }
@@ -352,6 +360,15 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
     for s in sel.unwrap_or_default() {
         if let Some(why) = scan.clashes.get(s) {
             return Err(refuse(format!("~/{s}: {why}")));
+        }
+        if scan.locked.iter().any(|l| covers(s, l)) {
+            return Err(DwError::new(
+                Kind::VaultLocked,
+                format!(
+                    "~/{s} needs the vault, which is locked; run `dw vault unlock` in a terminal"
+                ),
+            )
+            .into());
         }
     }
     let matched_any = |p: &str| {
@@ -455,10 +472,17 @@ pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Don
         if let Some(other) = new_values.insert(&ch.name, &ch.new)
             && other != ch.new
         {
-            return Err(refuse(format!(
-                "variable {} would get two values ({other:?} and {:?}); stage one file at a time",
-                ch.name, ch.new
-            )));
+            return Err(refuse(if resolver.is_secret(&ch.name) {
+                format!(
+                    "secret {} would get two values; stage one file at a time",
+                    ch.name
+                )
+            } else {
+                format!(
+                    "variable {} would get two values ({other:?} and {:?}); stage one file at a time",
+                    ch.name, ch.new
+                )
+            }));
         }
         let line = crate::values::describe(&resolver, ch);
         if !notes.contains(&line) {
@@ -837,6 +861,8 @@ pub struct Applied {
     pub conflicts: Vec<String>,
     /// Files chezmoi could not write (the others were written regardless).
     pub failed: Vec<String>,
+    /// Files that need the vault, skipped because it is locked.
+    pub vault_locked: Vec<String>,
     pub snapshot: Option<String>,
     pub error: Option<String>,
 }
@@ -862,7 +888,22 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
     };
     let files = pick(State::Incoming);
     let conflicts = pick(State::Conflict);
+    let vault_locked: Vec<String> = found
+        .locked
+        .iter()
+        .filter(|l| selected(paths, l))
+        .cloned()
+        .collect();
     for p in paths.unwrap_or_default() {
+        if vault_locked.iter().any(|l| covers(p, l)) {
+            return Err(DwError::new(
+                Kind::VaultLocked,
+                format!(
+                    "~/{p} needs the vault, which is locked; run `dw vault unlock` in a terminal"
+                ),
+            )
+            .into());
+        }
         if conflicts.contains(p) {
             return Err(DwError::new(
                 Kind::Conflict,
@@ -882,6 +923,7 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
         applied: files.clone(),
         conflicts,
         failed: Vec::new(),
+        vault_locked,
         snapshot: None,
         error: None,
     };
@@ -1031,6 +1073,7 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
     if opts.amend {
         ensure_amendable(store)?;
     }
+    crate::detect::commit_guard(store)?;
     if opts.messages.iter().any(|m| m.trim().is_empty()) {
         return Err(DwError::usage("the commit message is empty").into());
     }
@@ -1160,6 +1203,8 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
     let staged = staged_paths(store)?;
     let vars = crate::variants::Variants::read(&repo)?;
     let vchanges = crate::values::value_changes(store, &ctx, &scan.changes)?;
+    let resolver = crate::values::Resolver::load(store)?;
+    let known = crate::detect::known_pairs(store);
     let mut out = Vec::new();
     for c in &scan.changes {
         let wanted = if c.kind == "repo" {
@@ -1172,9 +1217,15 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
         }
         let diff = match c.state {
             State::Local | State::New => {
-                let old = scan.targets.get(&c.path).map(|t| t.text.as_str());
+                let old = scan.targets.get(&c.path).map(|t| t.text.clone());
                 let new = home_text(&store.dirs.home.join(&c.path));
-                unified(&c.path, old, new.as_deref())
+                let (old, new) = match new.as_deref().and_then(|h| {
+                    crate::values::masked_diff(store, &ctx, &resolver, &vars, &c.path, h)
+                }) {
+                    Some((o, n)) => (Some(o), Some(n)),
+                    None => (old, new),
+                };
+                unified(&c.path, old.as_deref(), new.as_deref())
             }
             State::Staged if c.kind == "repo" => {
                 git_literal(
@@ -1234,16 +1285,23 @@ pub fn diff(store: &Store, sel: Option<&[String]>) -> Result<Vec<FileDiff>> {
             .iter()
             .filter(|v| v.path == c.path)
             .map(|v| {
-                format!(
-                    "# variable {} changed: {} → {} (staging updates {})\n",
-                    v.name, v.from, v.to, v.updates
-                )
+                if v.secret {
+                    format!(
+                        "# secret {} changed (staging updates {} in the vault)\n",
+                        v.name, v.updates
+                    )
+                } else {
+                    format!(
+                        "# variable {} changed: {} → {} (staging updates {})\n",
+                        v.name, v.from, v.to, v.updates
+                    )
+                }
             })
             .collect();
         out.push(FileDiff {
             path: tilde(c),
             state: c.state,
-            diff: notes + &diff,
+            diff: notes + &crate::detect::redact(&diff, &known),
         });
     }
     Ok(out)

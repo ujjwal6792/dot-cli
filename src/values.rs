@@ -12,7 +12,7 @@ use std::fs;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::assign::{self, Known};
 use crate::changes::{Change, State};
@@ -35,13 +35,13 @@ const ESC1: &str = "{{ \"{\" }}";
 /// Detection ignores values shorter than this.
 const DETECT_MIN: usize = 3;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Override {
     pub target: String,
     pub value: String,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Var {
     pub name: String,
     pub default: String,
@@ -201,22 +201,84 @@ fn remove_var(repo: &Path, name: &str) -> Result<()> {
 /// Resolved values for this machine.
 pub struct Resolver {
     pub vars: BTreeMap<String, Var>,
+    /// Secrets (names only; values come from the vault).
+    pub secrets: BTreeMap<String, crate::secrets::Meta>,
     pub targets: Vec<String>,
+    /// The unlocked vault identity, when there is a session.
+    identity: Option<age::x25519::Identity>,
+    store: Store,
 }
 
 impl Resolver {
     pub fn load(store: &Store) -> Result<Self> {
         let vars = read_all(&store.repo())?;
+        let secrets = crate::secrets::read_meta(&store.repo());
+        let identity = if secrets.is_empty() {
+            None
+        } else {
+            crate::vault::session::identity(store)
+        };
         let targets = variants::this_targets(store)?.unwrap_or_default();
-        Ok(Self { vars, targets })
+        Ok(Self {
+            vars,
+            secrets,
+            targets,
+            identity,
+            store: store.clone(),
+        })
     }
 
+    pub fn is_secret(&self, name: &str) -> bool {
+        self.secrets.contains_key(name)
+    }
+
+    pub fn unlocked(&self) -> bool {
+        self.identity.is_some()
+    }
+
+    /// The value this machine receives. A secret needs the unlock session.
     pub fn value(&self, name: &str) -> Result<String> {
+        if self.is_secret(name) {
+            let id = self.identity.as_ref().ok_or_else(crate::vault::locked)?;
+            return crate::secrets::value_for(&self.store, id, name, &self.targets);
+        }
         let v = self
             .vars
             .get(name)
             .ok_or_else(|| refuse(format!("variable {name} does not exist")))?;
         Ok(v.pick(&self.targets)?.0)
+    }
+
+    /// What may be shown of a value: secrets only as their marker.
+    pub fn shown(&self, name: &str, value: &str) -> String {
+        if self.is_secret(name) {
+            crate::secrets::marker(name)
+        } else {
+            value.to_string()
+        }
+    }
+
+    /// The override target this machine's value comes from (`None`: default).
+    pub fn source_of(&self, name: &str) -> Option<String> {
+        if let Some(m) = self.secrets.get(name) {
+            let shadow = Var {
+                name: name.into(),
+                default: String::new(),
+                overrides: m
+                    .targets
+                    .iter()
+                    .map(|t| Override {
+                        target: t.clone(),
+                        value: String::new(),
+                    })
+                    .collect(),
+            };
+            return shadow.pick(&self.targets).ok().and_then(|p| p.1);
+        }
+        self.vars
+            .get(name)
+            .and_then(|v| v.pick(&self.targets).ok())
+            .and_then(|(_, t)| t)
     }
 }
 
@@ -340,6 +402,7 @@ pub struct Mapped {
 pub fn reverse(
     old: &[Seg],
     resolve: &dyn Fn(&str) -> Result<String>,
+    is_secret: &dyn Fn(&str) -> bool,
     home: &str,
 ) -> Result<Mapped, String> {
     let mut rendered = String::new();
@@ -455,9 +518,13 @@ pub fn reverse(
         if let Some(prev) = seen.get(name)
             && *prev != new
         {
-            return Err(format!(
-                "variable {name} has different text at different positions ({prev:?} and {new:?})"
-            ));
+            return Err(if is_secret(name) {
+                format!("secret {name} has different text at different positions")
+            } else {
+                format!(
+                    "variable {name} has different text at different positions ({prev:?} and {new:?})"
+                )
+            });
         }
         seen.insert(name.clone(), new.clone());
         if new != *value {
@@ -576,11 +643,19 @@ pub fn stage_plan(
     if (variant && !text.contains(MARKER)) || (!variant && !stored.ends_with(".tmpl")) {
         return Ok(None);
     }
+    if let Some(id) = crate::render::file_id(&text) {
+        return crate::encfile::stage_plan(store, rel, id).map(Some);
+    }
     let segs = parse(&text)
         .ok_or("is a template that dotwarden did not write; staging it is not supported")?;
     let home = fs::read_to_string(store.dirs.home.join(rel))
         .map_err(|_| "is not UTF-8 text; files with references hold text".to_string())?;
-    let mapped = reverse(&segs, &|n| resolver.value(n), &home)?;
+    let mapped = reverse(
+        &segs,
+        &|n| resolver.value(n),
+        &|n| resolver.is_secret(n),
+        &home,
+    )?;
     let refs = mapped.segs.iter().any(|s| matches!(s, Seg::Ref(_)));
     let bytes = if refs || !variant {
         to_template(&mapped.segs)
@@ -602,15 +677,19 @@ pub fn stage_plan(
 /// most specific target this machine matched.
 fn update_target(resolver: &Resolver, name: &str) -> String {
     resolver
-        .vars
-        .get(name)
-        .and_then(|v| v.pick(&resolver.targets).ok())
-        .and_then(|(_, t)| t)
+        .source_of(name)
         .map_or("the default".to_string(), |t| format!("the {t} override"))
 }
 
 /// "variable X changed: a → b (staging updates …)".
 pub fn describe(resolver: &Resolver, c: &VarChange) -> String {
+    if resolver.is_secret(&c.name) {
+        return format!(
+            "secret {} changed (staging updates {} in the vault)",
+            c.name,
+            update_target(resolver, &c.name)
+        );
+    }
     format!(
         "variable {} changed: {} → {} (staging updates {})",
         c.name,
@@ -630,6 +709,10 @@ pub fn apply_changes(store: &Store, changes: &[VarChange]) -> Result<()> {
         by_name.insert(&c.name, c);
     }
     for (name, c) in by_name {
+        if resolver.is_secret(name) {
+            crate::secrets::update_from_stage(store, name, &c.new, &resolver.targets)?;
+            continue;
+        }
         let mut v = resolver
             .vars
             .get(name)
@@ -655,13 +738,15 @@ pub struct ValueChange {
     pub from: String,
     pub to: String,
     pub updates: String,
+    /// A secret: `from` and `to` are markers, never values.
+    pub secret: bool,
 }
 
 /// The variables whose value HOME holds differently at a reference position,
 /// for local changes.
 pub fn value_changes(store: &Store, ctx: &Ctx, changes: &[Change]) -> Result<Vec<ValueChange>> {
     let resolver = Resolver::load(store)?;
-    if resolver.vars.is_empty() {
+    if resolver.vars.is_empty() && resolver.secrets.is_empty() {
         return Ok(Vec::new());
     }
     let vars = Variants::read(&store.repo())?;
@@ -678,9 +763,10 @@ pub fn value_changes(store: &Store, ctx: &Ctx, changes: &[Change]) -> Result<Vec
                 out.push(ValueChange {
                     path: c.path.clone(),
                     name: ch.name.clone(),
-                    from: ch.old.clone(),
-                    to: ch.new.clone(),
+                    from: resolver.shown(&ch.name, &ch.old),
+                    to: resolver.shown(&ch.name, &ch.new),
                     updates: update_target(&resolver, &ch.name),
+                    secret: resolver.is_secret(&ch.name),
                 });
             }
         }
@@ -759,6 +845,14 @@ pub fn plan_set(
     check_name(name)?;
     check_value(value)?;
     let repo = store.repo();
+    if let Some(k) = crate::secrets::read_meta(&repo)
+        .keys()
+        .find(|k| k.eq_ignore_ascii_case(name))
+    {
+        return Err(refuse(format!(
+            "{k} is a secret; its value is set with `dw values add-secret {k}` in a terminal"
+        )));
+    }
     let registry = repo::read_registry(&repo)?;
     let vars = read_all(&repo)?;
     let mut notes = Vec::new();
@@ -854,9 +948,13 @@ pub fn plan_unset(
     let repo = store.repo();
     let registry = repo::read_registry(&repo)?;
     let vars = read_all(&repo)?;
-    let before = vars
-        .get(name)
-        .ok_or_else(|| refuse(format!("variable {name} does not exist")))?;
+    let before = vars.get(name).ok_or_else(|| {
+        if crate::secrets::read_meta(&repo).contains_key(name) {
+            refuse(format!("{name} is a secret, not a variable"))
+        } else {
+            refuse(format!("variable {name} does not exist"))
+        }
+    })?;
     let mut after = before.clone();
     let (data, files, mut notes);
     match target {
@@ -909,20 +1007,27 @@ struct Wiring {
     count: usize,
     lines: Vec<usize>,
     value: String,
+    /// What may be shown of `value` (a marker for secrets).
+    shown: String,
     variant: bool,
 }
 
-fn wiring(store: &Store, ctx: &Ctx, path: &str, name: &str) -> Result<Wiring> {
+/// `known` is a value just found in a file (a new secret): used instead of
+/// resolving `name`.
+fn wiring(store: &Store, ctx: &Ctx, path: &str, name: &str, known: Option<&str>) -> Result<Wiring> {
     let repo = store.repo();
     let resolver = Resolver::load(store)?;
-    let var = resolver
-        .vars
-        .get(name)
-        .ok_or_else(|| refuse(format!("variable {name} does not exist")))?;
+    if !resolver.vars.contains_key(name) && !resolver.is_secret(name) {
+        return Err(refuse(format!("variable {name} does not exist")));
+    }
     if resolver.targets.is_empty() {
         return Err(refuse("this machine is not in the registry".into()));
     }
-    let (value, _) = var.pick(&resolver.targets)?;
+    let value = match known {
+        Some(v) => v.to_string(),
+        None => resolver.value(name)?,
+    };
+    let shown = resolver.shown(name, &value);
     let entry = ctx.tracked.files.get(path).ok_or_else(|| {
         refuse(format!(
             "{} is not a tracked file; track it first",
@@ -980,7 +1085,7 @@ fn wiring(store: &Store, ctx: &Ctx, path: &str, name: &str) -> Result<Wiring> {
     let (wired, count) = wire_segs(&segs, name, &value);
     if count == 0 {
         return Err(refuse(format!(
-            "the value of {name} on this machine ({value:?}) does not occur in {}",
+            "the value of {name} on this machine ({shown:?}) does not occur in {}",
             tilde(path)
         )));
     }
@@ -1017,6 +1122,7 @@ fn wiring(store: &Store, ctx: &Ctx, path: &str, name: &str) -> Result<Wiring> {
         count,
         lines,
         value,
+        shown,
         variant,
     })
 }
@@ -1029,7 +1135,7 @@ pub fn plan_wire(
     name: &str,
     requester: &str,
 ) -> Result<Pending> {
-    let w = wiring(store, ctx, &hp.rel, name)?;
+    let w = wiring(store, ctx, &hp.rel, name, None)?;
     let mut files = Vec::new();
     for r in &w.removes {
         files.push(change("remove", &hp.rel, r));
@@ -1043,7 +1149,7 @@ pub fn plan_wire(
         format!(
             "{} occurrence(s) of {:?} on line(s) {} become {{{{ includeTemplate \"dotwarden/value\" … \"{name}\" }}}}",
             w.count,
-            w.value,
+            w.shown,
             shown.join(", ")
         ),
         format!(
@@ -1059,7 +1165,7 @@ pub fn plan_wire(
     if w.value.chars().count() < DETECT_MIN {
         notes.push(format!(
             "warning: {:?} is short; check that every occurrence is meant",
-            w.value
+            w.shown
         ));
     }
     let preview = Preview {
@@ -1162,22 +1268,31 @@ pub fn exec(store: &Store, action: &Action) -> Result<BTreeSet<String>> {
             }
             Ok(BTreeSet::from([file_of(name)]))
         }
-        Action::ValueWire { path, name, .. } => {
-            let ctx = Ctx::load(store)?;
-            let w = wiring(store, &ctx, path, name)?;
-            let mut files = BTreeSet::new();
-            for (rel, text) in &w.writes {
-                write_repo(&repo, rel, text)?;
-                files.insert(rel.clone());
-            }
-            for rel in &w.removes {
-                fs::remove_file(repo.join(rel))?;
-                files.insert(rel.clone());
-            }
-            Ok(files)
-        }
+        Action::ValueWire { path, name, .. } => wire_in_repo(store, path, name, None),
         _ => unreachable!("not a value action"),
     }
+}
+
+/// Write the wiring of `name` into the file `path`; returns the files changed.
+pub fn wire_in_repo(
+    store: &Store,
+    path: &str,
+    name: &str,
+    known: Option<&str>,
+) -> Result<BTreeSet<String>> {
+    let repo = store.repo();
+    let ctx = Ctx::load(store)?;
+    let w = wiring(store, &ctx, path, name, known)?;
+    let mut files = BTreeSet::new();
+    for (rel, text) in &w.writes {
+        write_repo(&repo, rel, text)?;
+        files.insert(rel.clone());
+    }
+    for rel in &w.removes {
+        fs::remove_file(repo.join(rel))?;
+        files.insert(rel.clone());
+    }
+    Ok(files)
 }
 
 /// A renamed machine keeps its overrides; returns the files rewritten.
@@ -1203,18 +1318,25 @@ pub fn rename_machine(repo: &Path, old: &str, new: &str) -> Result<BTreeSet<Stri
 /// variable whose value this machine holds in their content. Returns notes.
 pub fn propose_wires(store: &Store, lock: &Lock, rels: &[String]) -> Result<Vec<String>> {
     let resolver = Resolver::load(store)?;
-    if resolver.vars.is_empty() || resolver.targets.is_empty() {
-        return Ok(Vec::new());
-    }
     let ctx = Ctx::load(store)?;
     let requester = pending::requester(store);
     let mut items = Vec::new();
+    let names: Vec<&String> = if resolver.targets.is_empty() {
+        Vec::new()
+    } else {
+        resolver
+            .vars
+            .keys()
+            .chain(resolver.secrets.keys())
+            .collect()
+    };
     for rel in rels {
         let Ok(text) = fs::read_to_string(store.dirs.home.join(rel)) else {
             continue;
         };
-        for v in resolver.vars.values() {
-            let Ok((value, _)) = v.pick(&resolver.targets) else {
+        for name in &names {
+            // Secrets can only be compared while unlocked.
+            let Ok(value) = resolver.value(name) else {
                 continue;
             };
             if value.chars().count() < DETECT_MIN || !text.contains(&value) {
@@ -1224,10 +1346,11 @@ pub fn propose_wires(store: &Store, lock: &Lock, rels: &[String]) -> Result<Vec<
                 abs: store.dirs.home.join(rel),
                 rel: rel.clone(),
             };
-            if let Ok(item) = plan_wire(store, &ctx, &hp, &v.name, &requester) {
+            if let Ok(item) = plan_wire(store, &ctx, &hp, name, &requester) {
                 items.push(item);
             }
         }
+        items.extend(crate::detect::moves(store, &ctx, rel, &text, &requester));
     }
     if items.is_empty() {
         return Ok(Vec::new());
@@ -1258,7 +1381,7 @@ pub fn list(store: &Store) -> Result<Vec<Row>> {
     let repo = store.repo();
     let resolver = Resolver::load(store)?;
     let used = usage(&repo, &source_tracked(&repo)?)?;
-    Ok(resolver
+    let mut rows: Vec<Row> = resolver
         .vars
         .values()
         .map(|v| {
@@ -1277,7 +1400,219 @@ pub fn list(store: &Store) -> Result<Vec<Row>> {
                 files: used.get(&v.name).cloned().unwrap_or_default(),
             }
         })
-        .collect())
+        .collect();
+    for m in resolver.secrets.values() {
+        let has_value = !m.placeholder && !resolver.targets.is_empty();
+        rows.push(Row {
+            name: m.name.clone(),
+            kind: "secret",
+            default: if m.placeholder {
+                "(placeholder: no value yet)".into()
+            } else {
+                crate::secrets::MASK.into()
+            },
+            overrides: m
+                .targets
+                .iter()
+                .map(|t| Override {
+                    target: t.clone(),
+                    value: crate::secrets::MASK.into(),
+                })
+                .collect(),
+            here: has_value.then(|| crate::secrets::MASK.to_string()),
+            here_from: has_value.then(|| {
+                resolver
+                    .source_of(&m.name)
+                    .unwrap_or_else(|| "default".into())
+            }),
+            files: used.get(&m.name).cloned().unwrap_or_default(),
+        });
+    }
+    rows.sort_by(|a, b| a.name.cmp(&b.name));
+    Ok(rows)
+}
+
+/// Texts to diff for a changed file that needs the vault: what it renders with
+/// markers instead of secrets, and HOME with secrets masked. `None` for files
+/// that do not need the vault.
+pub fn masked_diff(
+    store: &Store,
+    ctx: &Ctx,
+    resolver: &Resolver,
+    vars: &Variants,
+    rel: &str,
+    home: &str,
+) -> Option<(String, String)> {
+    let (stored, variant) = template_file(ctx, vars, &resolver.targets, rel)?;
+    let text = fs::read_to_string(store.repo().join(&stored)).ok()?;
+    if variant && !text.contains(MARKER) {
+        return None;
+    }
+    if crate::render::file_id(&text).is_some() {
+        return Some((
+            "«encrypted file»\n".into(),
+            "«encrypted file (content hidden)»\n".into(),
+        ));
+    }
+    let segs = parse(&text)?;
+    if !segs
+        .iter()
+        .any(|s| matches!(s, Seg::Ref(n) if resolver.is_secret(n)))
+    {
+        return None;
+    }
+    let mut old = String::new();
+    let mut known = Vec::new();
+    for s in &segs {
+        match s {
+            Seg::Lit(l) => old.push_str(l),
+            Seg::Ref(n) if resolver.is_secret(n) => {
+                old.push_str(&crate::secrets::marker(n));
+                if let Ok(v) = resolver.value(n) {
+                    known.push((n.clone(), v));
+                }
+            }
+            Seg::Ref(n) => old.push_str(&resolver.value(n).unwrap_or_default()),
+        }
+    }
+    let masked = mask_home(&old, home, &known);
+    Some((old, masked))
+}
+
+const HIDDEN: &str = "«secret position: HOME text hidden»\n";
+
+/// Does `line` match `pattern` (a rendered line holding markers), where each
+/// marker stands for any text?
+fn line_matches(pattern: &str, line: &str) -> bool {
+    let mut parts = Vec::new();
+    let mut rest = pattern;
+    while let Some(i) = rest.find("«secret:") {
+        parts.push(&rest[..i]);
+        match rest[i..].find('»') {
+            Some(j) => rest = &rest[i + j + '»'.len_utf8()..],
+            None => break,
+        }
+    }
+    parts.push(rest);
+    let (first, last) = (parts[0], parts[parts.len() - 1]);
+    if line.len() < first.len() + last.len() || !line.starts_with(first) || !line.ends_with(last) {
+        return false;
+    }
+    let mut at = first.len();
+    let end = line.len() - last.len();
+    for p in &parts[1..parts.len() - 1] {
+        match line[at..end].find(p) {
+            Some(i) => at += i + p.len(),
+            None => return false,
+        }
+    }
+    true
+}
+
+/// HOME text with every secret masked: known values become markers, and where
+/// the rendered text has a marker line HOME's line (whatever it holds there)
+/// is shown as that marker line, or hidden when the edit is not a plain
+/// replacement.
+pub fn mask_home(rendered: &str, home: &str, known: &[(String, String)]) -> String {
+    let mut text = home.to_string();
+    let mut by_len: Vec<_> = known.iter().filter(|(_, v)| !v.is_empty()).collect();
+    by_len.sort_by_key(|(_, v)| std::cmp::Reverse(v.len()));
+    for (n, v) in by_len {
+        text = text.replace(v.as_str(), &crate::secrets::marker(n));
+    }
+    let old_lines: Vec<&str> = rendered.split_inclusive('\n').collect();
+    let new_lines: Vec<&str> = text.split_inclusive('\n').collect();
+    let diff = similar::TextDiff::from_slices(&old_lines, &new_lines);
+    let mut out = String::new();
+    for op in diff.ops() {
+        match op.tag() {
+            similar::DiffTag::Equal => {
+                for l in &new_lines[op.new_range()] {
+                    out.push_str(l);
+                }
+            }
+            _ => {
+                let (o, n) = (op.old_range(), op.new_range());
+                let secret_here = old_lines[o.clone()].iter().any(|l| l.contains("«secret:"));
+                if !secret_here {
+                    for l in &new_lines[n] {
+                        out.push_str(l);
+                    }
+                } else if o.len() == n.len()
+                    && o.clone()
+                        .zip(n.clone())
+                        .all(|(a, b)| line_matches(old_lines[a], new_lines[b]))
+                {
+                    for l in &old_lines[o] {
+                        out.push_str(l);
+                    }
+                } else if !n.is_empty() {
+                    out.push_str(HIDDEN);
+                }
+            }
+        }
+    }
+    out
+}
+
+/// A secret's decrypted default and overrides: for the TUI Values screen
+/// only. Deliberately not `Serialize`.
+#[derive(Debug, Clone)]
+pub struct Reveal {
+    pub default: String,
+    pub overrides: Vec<Override>,
+}
+
+/// Decrypted secrets while the vault is unlocked (empty when locked).
+pub fn reveal(store: &Store) -> BTreeMap<String, Reveal> {
+    let Some(id) = crate::vault::session::identity(store) else {
+        return BTreeMap::new();
+    };
+    crate::secrets::read_meta(&store.repo())
+        .values()
+        .filter(|m| !m.placeholder)
+        .filter_map(|m| {
+            let d = crate::secrets::load_doc(store, &id, &m.name).ok()?;
+            Some((
+                m.name.clone(),
+                Reveal {
+                    default: d.default,
+                    overrides: d.overrides,
+                },
+            ))
+        })
+        .collect()
+}
+
+/// Files that cannot be rendered right now because the vault is locked.
+pub fn locked_files(store: &Store) -> Result<BTreeSet<String>> {
+    if !crate::vault::exists(store) || crate::vault::is_unlocked(store) {
+        return Ok(BTreeSet::new());
+    }
+    let repo = store.repo();
+    vault_files(&repo, &crate::source::load(&repo)?)
+}
+
+/// HOME paths whose stored files need the vault to render: references to
+/// secrets and encrypted files.
+pub fn vault_files(repo: &Path, tracked: &Tracked) -> Result<BTreeSet<String>> {
+    let secrets = crate::secrets::read_meta(repo);
+    let vars = Variants::read(repo)?;
+    let mut out = BTreeSet::new();
+    for (path, names) in references(repo, tracked, &vars) {
+        if names.iter().any(|n| secrets.contains_key(n)) {
+            out.insert(path);
+        }
+    }
+    for (path, e) in &tracked.files {
+        if e.source.ends_with(".tmpl")
+            && fs::read_to_string(repo.join(&e.source))
+                .is_ok_and(|t| t.starts_with(crate::render::FILE_MARKER))
+        {
+            out.insert(path.clone());
+        }
+    }
+    Ok(out)
 }
 
 fn source_tracked(repo: &Path) -> Result<Tracked> {
@@ -1327,10 +1662,10 @@ mod tests {
         ];
         let resolve =
             |n: &str| -> Result<String> { Ok(if n == "SIZE" { "12" } else { "Mono" }.to_string()) };
-        let same = reverse(&old, &resolve, "size = 12\nfont = Mono\n").unwrap();
+        let same = reverse(&old, &resolve, &|_| false, "size = 12\nfont = Mono\n").unwrap();
         assert_eq!(same.segs, old);
         assert!(same.changes.is_empty());
-        let edited = reverse(&old, &resolve, "size = 14\nfont = Mono # x\n").unwrap();
+        let edited = reverse(&old, &resolve, &|_| false, "size = 14\nfont = Mono # x\n").unwrap();
         assert_eq!(edited.changes.len(), 1);
         assert_eq!(
             (

@@ -36,7 +36,7 @@ struct Listed<'a> {
     stale: Option<String>,
 }
 
-fn print_json(v: &impl Serialize) -> Result<()> {
+pub(crate) fn print_json(v: &impl Serialize) -> Result<()> {
     println!("{}", serde_json::to_string_pretty(v)?);
     Ok(())
 }
@@ -74,7 +74,7 @@ fn results_exit(results: &[ItemResult]) -> ExitCode {
 }
 
 /// Add planned items to the pending list, show them, or apply them at once.
-fn submit(
+pub(crate) fn submit(
     store: &Store,
     items: Vec<Item>,
     apply: bool,
@@ -828,10 +828,13 @@ pub fn apply_cmd(
         for f in &a.failed {
             println!("FAILED  ~/{f}");
         }
+        for f in &a.vault_locked {
+            println!("skipped ~/{f}: vault locked (run `dw vault unlock`, then apply again)");
+        }
         if let Some(id) = &a.snapshot {
             println!("snapshot {id} taken first");
         }
-        if a.applied.is_empty() && a.failed.is_empty() {
+        if a.applied.is_empty() && a.failed.is_empty() && a.vault_locked.is_empty() {
             println!("Nothing incoming to apply.");
         }
         if let Some(e) = &a.error {
