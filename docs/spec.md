@@ -510,7 +510,21 @@ one-time human confirmation that the remote is private, stored per remote in
 - **Detection**: after `track` and `stage`, when a file's content contains this
   machine's value of an existing variable (3+ characters), a pending `wire`
   item is proposed (never applied automatically) and reported.
-- The `secret` kind plugs into the same table and reference mechanism (ticket 8).
+- The `secret` kind plugs into the same table and reference mechanism (ticket 8):
+  `home/.chezmoidata/dotwarden-values/<NAME>.toml` holds `kind = "secret"`, the
+  override `targets` (no values) and `placeholder = true` for a name without a
+  value; the values are in `vault/secrets/<NAME>.age`. `dw values add-secret
+  NAME [--target T] [--placeholder]` reads the value from a terminal only (agents:
+  placeholders only); a new secret needs only `recipient.txt`, changing an
+  existing one needs an unlock. The `dotwarden/value` helper template calls
+  `dw __secret NAME TARGETS` through chezmoi's `output` (`DOTWARDEN_HELPER`,
+  `DOTWARDEN_RENDER_TOKEN` in chezmoi's environment); `DOTWARDEN_MASK` renders
+  `«secret:NAME»` instead (previews as another machine). While locked, files
+  that need the vault are not classified or applied (exit 4 when named).
+  `dw encrypt PATH` turns a tracked file into a stub template
+  (`dotwarden/file`) plus `vault/files/<id>.age`; detection proposes a
+  `secret_move` pending item (file, line, byte range, no value); commits
+  holding key-like text are refused (`DOTWARDEN_ALLOW_SECRETS=1`, humans).
 - Secrets live in
   `vault/secrets/<NAME>.age` (default + overrides encrypted together); names are
   visible.

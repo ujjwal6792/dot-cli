@@ -1396,7 +1396,12 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
         }
         Action::ValueSet { .. } | Action::ValueUnset { .. } | Action::ValueWire { .. } => {
             let expected = crate::values::exec(store, &item.action)?;
-            verify_and_stage(store, &expected, &[])
+            let staged = verify_and_stage(store, &expected, &[])?;
+            if matches!(item.action, Action::ValueWire { .. }) {
+                // A value moved behind a reference must not linger as a loose blob.
+                crate::detect::prune(store)?;
+            }
+            Ok(staged)
         }
         Action::Encrypt { .. } => {
             let expected = crate::encfile::exec(store, &item.action)?;

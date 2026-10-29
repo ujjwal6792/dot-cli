@@ -500,3 +500,107 @@ fn grep_everywhere(t: &TestEnv, needle: &str) -> Vec<String> {
     }
     found
 }
+
+#[test]
+fn a_secret_found_on_track_is_proposed_moved_and_never_reaches_git() {
+    let t = env();
+    t.dw_ok(&["init", "--name", "mac"]);
+    init_vault(&t);
+    t.dw_ok(&["commit", "-m", "vault"]);
+    let found = "Zq8x7Lm2Pq9wRt5vYb3nKd6HfJs1AaGc";
+    write(&t, ".env", &format!("host = h\napi_token = {found}\n"));
+    let out = t.dw_ok(&["track", ".env", "--apply"]);
+    assert!(!out.contains(found));
+    let pending = t.dw_ok(&["pending"]);
+    assert!(
+        pending.contains("Move a secret of ~/.env") && !pending.contains(found),
+        "{pending}"
+    );
+    let json = t.dw_ok(&["pending", "--json"]);
+    assert!(!json.contains(found));
+    // Until it moves, the plaintext cannot be committed.
+    let r = dw(&t, &["commit", "-m", "env"]);
+    assert_ne!(r.code, 0);
+    assert!(!r.all().contains(found));
+    let d = t.dw_ok(&["diff"]);
+    assert!(!d.contains(found), "{d}");
+    t.dw_ok(&["pending", "apply", "1"]);
+    t.dw_ok(&["commit", "-m", "env"]);
+    assert!(
+        grep_everywhere(&t, found).is_empty(),
+        "{:?}",
+        grep_everywhere(&t, found)
+    );
+    assert_eq!(
+        read(&t, ".env"),
+        format!("host = h\napi_token = {found}\n"),
+        "HOME untouched"
+    );
+    assert!(t.dw_ok(&["values", "list"]).contains("API_TOKEN"));
+    // The same value appearing in another tracked file is matched against the secret.
+    write(&t, ".other", &format!("x={found}\n"));
+    t.dw_ok(&["track", ".other", "--apply"]);
+    assert!(
+        t.dw_ok(&["pending"])
+            .contains("Wire API_TOKEN into ~/.other")
+    );
+}
+
+#[test]
+fn canary_no_command_log_state_file_or_git_object_holds_a_secret_value() {
+    let (a, b) = wired_pair();
+    let canary = "CANARY-7f3a9c1e-5b2d";
+    assert_eq!(add_secret(&a, "CANARY", None, canary).code, 0);
+    write(&a, ".canary", &format!("c = {canary}\n"));
+    a.dw_ok(&["track", ".canary", "--apply"]);
+    a.dw_ok(&["values", "wire", ".canary", "CANARY", "--apply"]);
+    a.dw_ok(&["commit", "-m", "canary"]);
+    write(&a, ".canary", &format!("c = {canary}-changed\nd = 1\n"));
+    let mut outputs = String::new();
+    let cmds: &[&[&str]] = &[
+        &["status"],
+        &["diff"],
+        &["ls"],
+        &["pending"],
+        &["values", "list"],
+        &["values", "show", "CANARY"],
+        &["vault", "status"],
+        &["machine", "list"],
+        &["snapshot", "list"],
+        &["doctor"],
+        &["variant", "list"],
+        &["stage", "--dry-run"],
+        &["apply", "--all", "--dry-run"],
+        &["values", "wire", ".canary", "CANARY", "--dry-run"],
+        &["values", "add-secret", "CANARY", "--dry-run"],
+        &["encrypt", ".canary", "--dry-run"],
+        &["commit", "-m", "x", "--dry-run"],
+    ];
+    for c in cmds {
+        for json in [false, true] {
+            let mut v = c.to_vec();
+            if json {
+                v.push("--json");
+            }
+            let r = run(&a, &[], false, &v);
+            outputs.push_str(&r.all());
+        }
+        // Locked too.
+    }
+    ok(&a, &[], &["vault", "lock"]);
+    for c in cmds {
+        outputs.push_str(&run(&a, &[], false, c).all());
+        outputs.push_str(&run(&a, &[], true, c).all());
+    }
+    assert!(!outputs.contains(canary), "a command printed the secret");
+    assert!(outputs.contains("«secret:CANARY»") || outputs.contains("CANARY"));
+    // Stage (unlocked) keeps the vault current; nothing leaks into any file.
+    unlock(&a);
+    a.dw_ok(&["stage", ".canary"]);
+    a.dw_ok(&["commit", "-m", "changed"]);
+    sync(&a, &b);
+    for t in [&a, &b] {
+        let hits = grep_everywhere(t, canary);
+        assert!(hits.is_empty(), "plaintext in {hits:?}");
+    }
+}
