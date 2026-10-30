@@ -633,7 +633,8 @@ Default keys (lazygit-compatible, remappable in preferences): `Space` stage/trac
 `f` fetch, `d` discard, `e` `$EDITOR`, `o` open, `i` hide, `/` filter, `[` `]`
 tabs, `h`/`l` panels, `1`–`5` panels, `x` menu, `z` undo, `?` help, `@` command log,
 `+`/`_` screen mode, `y` copy path, `m` assign, `t` add a variant, `E` encrypt, `.` show hidden,
-`V` values, `G` open lazygit on the repository (suspends dotwarden), `Enter` drill
+`V` values, `G` open lazygit on the repository (suspends dotwarden), `H` history
+of the selected file (Files, Changes) on the Commits tab, `Enter` drill
 in / staging view, `Esc` back, `q` quit.
 
 Requirements: the event loop never blocks on I/O; background jobs (preview,

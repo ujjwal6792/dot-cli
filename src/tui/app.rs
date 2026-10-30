@@ -146,10 +146,51 @@ pub enum GitOp {
     StashPop(String),
     StashDrop(String),
     Restore(String),
+    RemoteAdd(String, String),
+    RemoteRemove(String),
 }
 
+/// Tabs of the Git panel.
+pub const GIT_TABS: [&str; 4] = ["Commits", "Branches", "Remotes", "Stash"];
+
 fn preview_git(store: &Store, op: &GitOp) -> anyhow::Result<String> {
+    use crate::remote::Host;
+    let agent = changes::agent(store).is_some();
     Ok(match op {
+        GitOp::RemoteAdd(name, url) => {
+            crate::remote::plan_add(store, name, url)?;
+            let check = match crate::remote::host_of(url) {
+                Host::Local => "A local path: never public.".to_string(),
+                Host::Known(_) => crate::remote::ensure_not_public(store, url, None)?
+                    .unwrap_or_else(|| "Not public. Checked again before every push.".into()),
+                Host::Unknown(_) if crate::remote::confirmed_private(store)?.contains(url) => {
+                    "Already confirmed private.".into()
+                }
+                Host::Unknown(host) => format!(
+                    "{host} cannot be checked for visibility.\ny confirms that {url} is private (stored in machine.toml)."
+                ),
+            };
+            format!(
+                "Add remote {name}\nURL: {url}\n{check}{}",
+                if agent {
+                    "\nQueued for human approval."
+                } else {
+                    ""
+                }
+            )
+        }
+        GitOp::RemoteRemove(name) => {
+            let url = crate::remote::remote_url(store, name)?
+                .ok_or_else(|| anyhow::anyhow!("no remote named {name}"))?;
+            format!(
+                "Remove remote {name}\nURL: {url}\nThe remote repository is not touched.{}",
+                if agent {
+                    "\nQueued for human approval."
+                } else {
+                    ""
+                }
+            )
+        }
         GitOp::Create(n) | GitOp::Switch(n) => {
             let files = crate::branches::change(store, n, matches!(op, GitOp::Create(_)), true)?;
             format!(
@@ -340,6 +381,8 @@ pub const TABS: [&str; 4] = ["Local", "Staged", "Incoming", "Conflicts"];
 #[derive(Debug)]
 pub enum Dialog {
     GitCreate(String),
+    /// `n` on the Remotes tab: "NAME URL".
+    RemoteAdd(String),
     GitConfirm {
         op: GitOp,
         preview: String,
@@ -374,9 +417,12 @@ pub struct App {
     pub git_selected: usize,
     pub branches: Vec<crate::branches::Branch>,
     pub stashes: Vec<crate::stashes::Stash>,
+    pub remotes: Vec<crate::remote::RemoteInfo>,
     pub commits: Vec<crate::history::Commit>,
     pub commit_selected: usize,
     commit_limit: usize,
+    /// The file whose history the Commits tab shows (`H`); `None` is all history.
+    pub commit_path: Option<String>,
     pub store: Arc<Store>,
     rules: Arc<HideRules>,
     jobs: Jobs,
@@ -427,9 +473,11 @@ impl App {
             git_selected: 0,
             branches: Vec::new(),
             stashes: Vec::new(),
+            remotes: Vec::new(),
             commits: Vec::new(),
             commit_selected: 0,
             commit_limit: 50,
+            commit_path: None,
             store,
             rules: Arc::new(rules),
             jobs: Jobs::new(tx),
@@ -632,9 +680,10 @@ impl App {
         }
         match done.payload {
             Payload::GitMeta(result) => match result {
-                Ok((branches, stashes)) => {
+                Ok((branches, stashes, remotes)) => {
                     self.branches = branches;
                     self.stashes = stashes;
+                    self.remotes = remotes;
                 }
                 Err(e) => self.message = Some(e),
             },
@@ -890,6 +939,27 @@ impl App {
                 }
                 _ => self.dialog = Some(Dialog::GitCreate(name)),
             },
+            Some(Dialog::RemoteAdd(mut text)) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => match text.trim().split_once(' ') {
+                    Some((name, url)) if !url.trim().is_empty() => {
+                        self.git_preview(GitOp::RemoteAdd(name.to_string(), url.trim().to_string()))
+                    }
+                    _ => {
+                        self.message = Some("type NAME URL".into());
+                        self.dialog = Some(Dialog::RemoteAdd(text));
+                    }
+                },
+                KeyCode::Backspace => {
+                    text.pop();
+                    self.dialog = Some(Dialog::RemoteAdd(text));
+                }
+                KeyCode::Char(c) => {
+                    text.push(c);
+                    self.dialog = Some(Dialog::RemoteAdd(text));
+                }
+                _ => self.dialog = Some(Dialog::RemoteAdd(text)),
+            },
             Some(Dialog::GitConfirm { op, preview, guard }) => match key.code {
                 KeyCode::Char('y') => self.request_action(ActionReq::Git(op, guard)),
                 KeyCode::Esc | KeyCode::Char('n') => {}
@@ -1111,6 +1181,11 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
             KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            KeyCode::Char('H') => {
+                if let Some(c) = selected {
+                    return self.open_history(c.path);
+                }
+            }
             KeyCode::Enter if tab == 2 => {
                 if let Some(c) = selected {
                     self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path])));
@@ -1263,9 +1338,13 @@ impl App {
         self.jobs.spawn("git-meta", move |_| {
             Payload::GitMeta(
                 (|| -> anyhow::Result<_> {
+                    if !meta_store.is_initialised() {
+                        return Ok(Default::default());
+                    }
                     Ok((
                         crate::branches::list(&meta_store)?,
                         crate::stashes::list(&meta_store)?,
+                        crate::remote::list(&meta_store)?,
                     ))
                 })()
                 .map_err(|e| format!("{e:#}")),
@@ -1273,11 +1352,28 @@ impl App {
         });
         let store = Arc::clone(&self.store);
         let count = self.commit_limit;
+        let path = self.commit_path.clone();
         self.jobs.spawn("commits", move |_| {
+            if !store.is_initialised() {
+                return Payload::Commits(Ok(Vec::new()));
+            }
             Payload::Commits(
-                crate::history::log(&store, None, 0, count).map_err(|e| format!("{e:#}")),
+                crate::history::log(&store, path.as_deref(), 0, count)
+                    .map_err(|e| format!("{e:#}")),
             )
         });
+    }
+
+    /// `H`: show the history of this file (HOME-relative or absolute) on the Commits tab.
+    fn open_history(&mut self, path: String) {
+        self.commit_path = Some(path);
+        self.commits.clear();
+        self.commit_selected = 0;
+        self.commit_limit = 50;
+        self.git_tab = 0;
+        self.diff = Load::Ready(Default::default());
+        self.focus = Panel::Git;
+        self.refresh_commits();
     }
 
     fn commit_diff(&mut self) {
@@ -1288,11 +1384,12 @@ impl App {
             return;
         };
         let hash = c.hash.clone();
+        let path = self.commit_path.clone();
         let store = Arc::clone(&self.store);
         self.diff = Load::Loading;
         self.jobs.spawn(KEY_DIFF, move |cancel| {
             use ansi_to_tui::IntoText;
-            let result = crate::history::diff(&store, &hash, None).and_then(|plain| {
+            let result = crate::history::diff(&store, &hash, path.as_deref()).and_then(|plain| {
                 let shown = changes::through_delta(&store, &plain, Some(cancel)).unwrap_or(plain);
                 Ok(shown.into_text()?)
             });
@@ -1303,8 +1400,14 @@ impl App {
     fn git_key(&mut self, key: KeyEvent) {
         match key.code {
             KeyCode::Char('[') | KeyCode::Char(']') => {
-                self.git_tab =
-                    (self.git_tab + if key.code == KeyCode::Char(']') { 1 } else { 2 }) % 3;
+                let n = GIT_TABS.len();
+                self.git_tab = (self.git_tab
+                    + if key.code == KeyCode::Char(']') {
+                        1
+                    } else {
+                        n - 1
+                    })
+                    % n;
                 self.git_selected = 0;
                 self.commit_diff();
                 return;
@@ -1315,15 +1418,22 @@ impl App {
                 }
                 return;
             }
+            KeyCode::Esc if self.git_tab == 0 && self.commit_path.is_some() => {
+                self.commit_path = None;
+                self.commit_selected = 0;
+                self.commit_limit = 50;
+                return self.refresh_commits();
+            }
             _ => {}
         }
         if self.git_tab != 0 {
-            let n = if self.git_tab == 1 {
-                self.branches.len()
-            } else {
-                self.stashes.len()
+            let n = match self.git_tab {
+                1 => self.branches.len(),
+                2 => self.remotes.len(),
+                _ => self.stashes.len(),
             };
             let branch = self.branches.get(self.git_selected).map(|b| b.name.clone());
+            let remote = self.remotes.get(self.git_selected).map(|r| r.name.clone());
             let stash = self.stashes.get(self.git_selected).map(|s| s.id.clone());
             match key.code {
                 KeyCode::Char('j') | KeyCode::Down => {
@@ -1345,13 +1455,21 @@ impl App {
                         self.git_preview(GitOp::Delete(b, key.code == KeyCode::Char('D')));
                     }
                 }
-                KeyCode::Char('s') if self.git_tab == 2 => self.git_preview(GitOp::StashPush),
-                KeyCode::Enter if self.git_tab == 2 => {
+                KeyCode::Char('n') if self.git_tab == 2 => {
+                    self.dialog = Some(Dialog::RemoteAdd(String::new()))
+                }
+                KeyCode::Char('d') if self.git_tab == 2 => {
+                    if let Some(r) = remote {
+                        self.git_preview(GitOp::RemoteRemove(r));
+                    }
+                }
+                KeyCode::Char('s') if self.git_tab == 3 => self.git_preview(GitOp::StashPush),
+                KeyCode::Enter if self.git_tab == 3 => {
                     if let Some(s) = stash {
                         self.git_preview(GitOp::StashPop(s));
                     }
                 }
-                KeyCode::Char('d') if self.git_tab == 2 => {
+                KeyCode::Char('d') if self.git_tab == 3 => {
                     if let Some(s) = stash {
                         self.git_preview(GitOp::StashDrop(s));
                     }
@@ -1709,6 +1827,12 @@ impl App {
         let before = self.files.selected_path();
         match key.code {
             KeyCode::Char(' ') => return self.toggle_selection(),
+            KeyCode::Char('H') => {
+                if let Some(p) = before {
+                    self.open_history(p.to_string_lossy().into_owned());
+                }
+                return;
+            }
             KeyCode::Char('i') => {
                 if let Some(e) = self.files.selected_entry() {
                     let (path, is_dir) = (self.files.cwd.join(&e.name), e.is_dir);
@@ -1890,6 +2014,40 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 }
                 GitOp::Restore(hash) => {
                     crate::restores::plan(store, hash, None, false)?;
+                }
+                GitOp::RemoteAdd(..) | GitOp::RemoteRemove(_) => {
+                    if changes::agent(store).is_some() {
+                        let requester = pending::requester(store);
+                        let item = match &op {
+                            GitOp::RemoteAdd(name, url) => {
+                                crate::remote::plan_add_item(store, name, url, &requester)?
+                            }
+                            GitOp::RemoteRemove(name) => {
+                                crate::remote::plan_remove_item(store, name, &requester)?
+                            }
+                            _ => unreachable!(),
+                        };
+                        let lock = store.lock()?;
+                        let ctx = track::Ctx::load(store)?;
+                        pending::add(store, &lock, vec![item], &track::stale_checker(store, &ctx))?;
+                        return Ok(report("Queued for human approval".into()));
+                    }
+                    let _lock = store.lock()?;
+                    return Ok(report(match &op {
+                        GitOp::RemoteAdd(name, url) => {
+                            // The y on the preview is the human confirming an unverifiable host.
+                            match crate::remote::add_locked(store, name, url, Some(&|_| Ok(true)))?
+                            {
+                                Some(w) => format!("Added remote {name}; {w}"),
+                                None => format!("Added remote {name}"),
+                            }
+                        }
+                        GitOp::RemoteRemove(name) => {
+                            crate::remote::remove_locked(store, name)?;
+                            format!("Removed remote {name}")
+                        }
+                        _ => unreachable!(),
+                    }));
                 }
                 GitOp::Delete(..) | GitOp::StashDrop(_) => {
                     let item = match &op {

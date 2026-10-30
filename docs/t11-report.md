@@ -48,3 +48,8 @@
 - Historical restore is limited to regular UTF-8 files received both then and now, with Dotwarden-owned templates. Historical rendering requires unlock if its render scope needs secrets; removed/unassigned targets are not resurrected.
 - No crash-recovery automation for an interrupted multi-file stash; recovery payload/index refs and safety snapshots are retained. Interactive terminal/editor testing and Linux remain unrun.
 - Work stops after T11B. No T10 or other ticket, merge, push, or GitHub changes.
+
+## Follow-up — file history and Remotes tab
+- `H` in Files or Changes shows that file's history (old spellings included) on Commits, with per-commit diffs limited to it; `Esc` returns to all commits. Spec §10 key list gains `H`.
+- Git tabs are now Commits / Branches / Remotes / Stash (spec §10). Remotes `n` adds (NAME URL), `d` removes; both preview then y/n. Known hosts are probed in the preview and public ones refused; for unverifiable hosts the human's y is the one-time private confirmation. Agents get pending items.
+- 2 new TUI tests (file history, remote add/confirm/remove); stash test updated for the 4th tab. Hand-break: ignoring the path in the TUI log failed the history test; restored.

@@ -68,7 +68,12 @@ const HELP: &[(&str, &str)] = &[
         "Branches n Enter d D",
         "create, switch, delete, force delete (y/n)",
     ),
+    ("Remotes n d", "add (NAME URL), remove (preview then y/n)"),
     ("Stash s Enter d", "push, pop, drop (path preview then y/n)"),
+    (
+        "H (Files, Changes)",
+        "history of the selected file in Git Commits; Esc there shows all",
+    ),
     (
         "E",
         "Files: store the selected tracked file encrypted (pending item)",
@@ -358,7 +363,15 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
         Panel::Machines => draw_machines(f, app, block, area, expanded),
         Panel::Git => {
             if app.git_tab != 0 {
-                let (title, rows): (&str, Vec<String>) = if app.git_tab == 1 {
+                let (title, rows): (&str, Vec<String>) = if app.git_tab == 2 {
+                    (
+                        " 4 Git · Remotes · [ ] tabs ",
+                        app.remotes
+                            .iter()
+                            .map(|r| format!("{} {} ({})", r.name, r.url, r.visibility))
+                            .collect(),
+                    )
+                } else if app.git_tab == 1 {
                     (
                         " 4 Git · Branches · [ ] tabs ",
                         app.branches
@@ -422,10 +435,20 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
                     ))
                 })
                 .collect();
+            let title = match &app.commit_path {
+                Some(p) => {
+                    let home = &app.store.dirs.home;
+                    format!(
+                        " 4 Git · History of {} · Esc all ",
+                        tilde(home, &home.join(p))
+                    )
+                }
+                None => " 4 Git · Commits · r revert ".to_string(),
+            };
             let mut state = ListState::default().with_selected(Some(app.commit_selected));
             f.render_stateful_widget(
                 List::new(items)
-                    .block(block.title(" 4 Git · Commits · r revert "))
+                    .block(block.title(title))
                     .highlight_style(Style::default().fg(Color::Yellow))
                     .highlight_symbol("› "),
                 area,
@@ -772,6 +795,16 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
     if app.focus == Panel::Git && app.git_tab != 0 {
         let text = if app.git_tab == 1 {
             "Branches: n create · Enter switch · d delete · D force delete.\nHOME never changes; staged overlaps refuse the switch.".into()
+        } else if app.git_tab == 2 {
+            let keys = "n add (NAME URL) · d remove; preview then y/n.\nPublic remotes are refused; unverifiable hosts need your confirmation.";
+            app.remotes
+                .get(app.git_selected)
+                .map_or(keys.to_string(), |r| {
+                    format!(
+                        "{}\nURL: {}\nVisibility: {}\n\n{keys}",
+                        r.name, r.url, r.visibility
+                    )
+                })
         } else {
             app.stashes.get(app.git_selected).map_or(
                 "s push a stash of tracked HOME and index changes".into(),
@@ -997,6 +1030,13 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             vec![
                 Line::from(format!("{name}█")),
                 Line::from("Enter preview · Esc cancel"),
+            ],
+        ),
+        Dialog::RemoteAdd(text) => (
+            " New remote ",
+            vec![
+                Line::from(format!("{text}█")),
+                Line::from("NAME URL · Enter preview · Esc cancel"),
             ],
         ),
         Dialog::GitConfirm { preview, .. } => {

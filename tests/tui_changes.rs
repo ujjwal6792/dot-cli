@@ -157,8 +157,7 @@ fn git_branches_create_switch_and_delete_have_previews() {
 fn git_stash_confirmation_lists_home_and_round_trips() {
     let mut tui = open(edited());
     tui.press('4');
-    tui.press(']');
-    tui.press(']');
+    tui.press('[');
     tui.press('s');
     let screen = tui.screen();
     assert!(screen.contains("HOME: .a"), "{screen}");
@@ -184,6 +183,63 @@ fn git_stash_confirmation_lists_home_and_round_trips() {
     tui.press('y');
     assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
     assert!(tui.app.stashes.is_empty());
+}
+
+#[test]
+fn h_shows_the_history_of_one_file_and_esc_shows_all_commits() {
+    let t = edited();
+    write(&t, ".b", "b\n");
+    t.dw_ok(&["track", ".b", "--apply"]);
+    t.dw_ok(&["commit", "-m", "only b"]);
+    let mut tui = open(t);
+    tui.press('H');
+    assert_eq!(tui.app.focus, Panel::Git);
+    let subjects: Vec<_> = tui.app.commits.iter().map(|c| c.subject.clone()).collect();
+    assert_eq!(subjects, ["base"]);
+    let screen = tui.screen();
+    assert!(screen.contains("History of ~/.a"), "{screen}");
+    assert!(
+        screen.contains("one"),
+        "the file's diff is shown:\n{screen}"
+    );
+    tui.send(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(tui.app.commits.iter().any(|c| c.subject == "only b"));
+    assert!(tui.app.commit_path.is_none());
+    assert!(!tui.screen().contains("History of"));
+}
+
+#[test]
+fn remotes_tab_adds_an_unverifiable_host_on_confirmation_and_removes() {
+    let mut tui = open(edited());
+    tui.press('4');
+    tui.press(']');
+    tui.press(']');
+    tui.press('n');
+    let url = "ssh://git.example.test/dots.git";
+    tui.type_text(&format!("origin {url}"));
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    let screen = tui.screen();
+    assert!(screen.contains("cannot be checked"), "{screen}");
+    tui.press('n');
+    assert!(tui.app.remotes.is_empty(), "n adds nothing");
+    tui.press('n');
+    tui.type_text(&format!("origin {url}"));
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    let list = tui.t.dw_json(&["remote", "list"]);
+    assert_eq!(list["remotes"][0]["url"], url);
+    assert_eq!(list["remotes"][0]["visibility"], "confirmed-private");
+    assert_eq!(tui.app.remotes.len(), 1);
+    tui.press('d');
+    assert!(tui.screen().contains("Remove remote origin"));
+    tui.press('y');
+    assert!(tui.app.remotes.is_empty());
+    assert!(
+        tui.t.dw_json(&["remote", "list"])["remotes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[test]
