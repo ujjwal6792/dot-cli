@@ -398,6 +398,9 @@ fn local_text(store: &Store, rel: &str) -> Result<(String, u32)> {
 
 /// Read the three inputs of the conflict at `rel` and merge them.
 pub fn load(store: &Store, rel: &str) -> Result<Loaded> {
+    if is_merge_path(store, rel)? {
+        return load_merge(store, rel);
+    }
     let scan = check_conflict(store, rel)?;
     let target = scan
         .targets
@@ -421,6 +424,120 @@ pub fn load(store: &Store, rel: &str) -> Result<Loaded> {
         has_base: base.is_some(),
         local,
         incoming: target.text.clone(),
+    })
+}
+
+// ---- repository merge conflicts (`dw pull --merge`) ------------------------
+
+/// Whether `rel` is a stored file conflicting in a merge in progress. Such
+/// paths are repository paths; local is the branch, incoming the remote's.
+pub fn is_merge_path(store: &Store, rel: &str) -> Result<bool> {
+    Ok(crate::remote::merge_in_progress(store)
+        && crate::remote::unmerged(store)?.iter().any(|p| p == rel))
+}
+
+/// The repository path of an unmerged stored file named by a repository path
+/// or by the HOME path it is stored for.
+pub fn find_merge_path(store: &Store, given: &str) -> Result<Option<String>> {
+    if !crate::remote::merge_in_progress(store) {
+        return Ok(None);
+    }
+    let repo = store.repo();
+    let given = given.strip_prefix("~/").unwrap_or(given);
+    let paths = crate::remote::unmerged(store)?;
+    if let Some(p) = paths.iter().find(|p| p.as_str() == given) {
+        return Ok(Some(p.clone()));
+    }
+    let vars = crate::variants::Variants::read(&repo)?;
+    Ok(paths
+        .into_iter()
+        .find(|p| p == given || changes::repo_target(&repo, &vars, p).is_some_and(|t| t == given)))
+}
+
+fn stage_text(store: &Store, rel: &str, n: u8) -> Option<String> {
+    let out = store.git(&["show", &format!(":{n}:{rel}")]).ok()?;
+    Some(out.stdout)
+}
+
+fn load_merge(store: &Store, rel: &str) -> Result<Loaded> {
+    let (ours, theirs) = (stage_text(store, rel, 2), stage_text(store, rel, 3));
+    let (Some(local), Some(incoming)) = (ours, theirs) else {
+        return Err(refuse(format!(
+            "{rel} was deleted on one side; use --take local or incoming"
+        )));
+    };
+    let base = stage_text(store, rel, 1);
+    let entries = store.git(&["ls-files", "-u", "--", rel])?.stdout;
+    if entries.lines().any(|l| !l.starts_with("100"))
+        || [&local, &incoming]
+            .iter()
+            .any(|s| s.contains(['\0', '\u{fffd}']))
+    {
+        return Err(refuse(format!(
+            "{rel} is not a regular UTF-8 text file; use --take local or incoming"
+        )));
+    }
+    Ok(Loaded {
+        rel: rel.to_string(),
+        chunks: merge(base.as_deref(), &local, &incoming),
+        has_base: base.is_some(),
+        local,
+        incoming,
+    })
+}
+
+fn resolve_merge(store: &Store, rel: &str, how: How) -> Result<Resolved> {
+    let abs = store.repo().join(rel);
+    let resolution = match &how {
+        How::Local => "local",
+        How::Incoming => "incoming",
+        _ => "merge",
+    };
+    match how {
+        How::Local | How::Incoming => {
+            let side = if how == How::Local {
+                "--ours"
+            } else {
+                "--theirs"
+            };
+            let stage = if how == How::Local { 2 } else { 3 };
+            if store
+                .git(&["cat-file", "-e", &format!(":{stage}:{rel}")])
+                .is_err()
+            {
+                // That side deleted the file.
+                store.git(&["rm", "--quiet", "--", rel])?;
+            } else {
+                store.git(&["checkout", side, "--", rel])?;
+                store.git(&["add", "--", rel])?;
+            }
+        }
+        How::Merge | How::Text(_) => {
+            let text = match how {
+                How::Text(t) => t,
+                _ => {
+                    let l = load_merge(store, rel)?;
+                    l.clean().ok_or_else(|| {
+                        anyhow::Error::from(DwError::new(
+                            Kind::Conflict,
+                            format!("{rel}: {}", l.describe()),
+                        ))
+                    })?
+                }
+            };
+            if has_markers(&text) {
+                return Err(refuse("conflict markers remain in the result".to_string()));
+            }
+            // Hunk results must not change an executable file's mode.
+            let mode = fs::symlink_metadata(&abs)?.permissions().mode() & 0o777;
+            write_private_keep_mode(&abs, text.as_bytes(), mode)?;
+            store.git(&["add", "--", rel])?;
+        }
+    }
+    Ok(Resolved {
+        path: rel.to_string(),
+        resolution,
+        snapshot: None,
     })
 }
 
@@ -489,6 +606,9 @@ pub fn resolve_locked(
     how: How,
     actor: &str,
 ) -> Result<Resolved> {
+    if is_merge_path(store, rel)? {
+        return resolve_merge(store, rel, how);
+    }
     let scan = check_conflict(store, rel)?;
     let incoming = scan.targets.get(rel).map(|t| t.text.clone());
     let how = match how {

@@ -68,6 +68,7 @@ pub struct RegistryView {
 /// The outcome of a mutation (toggle, drop, apply).
 #[derive(Debug)]
 pub struct ActionReport {
+    pub merge_conflicts: bool,
     pub message: String,
     /// Per-item results of an apply.
     pub results: Option<Vec<ItemResult>>,
@@ -75,8 +76,21 @@ pub struct ActionReport {
     pub amend_message: Option<String>,
 }
 
+/// Branches, stashes and remotes for the Git panel tabs.
+pub type GitMeta = (
+    Vec<crate::branches::Branch>,
+    Vec<crate::stashes::Stash>,
+    Vec<crate::remote::RemoteInfo>,
+);
+
 #[derive(Debug)]
 pub enum Payload {
+    GitMeta(Result<GitMeta, String>),
+    GitPreview {
+        op: super::app::GitOp,
+        preview: Result<(String, String), String>,
+    },
+    Commits(Result<Vec<crate::history::Commit>, String>),
     Status(Result<Box<Status>, String>),
     Listing {
         dir: PathBuf,

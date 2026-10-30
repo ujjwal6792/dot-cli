@@ -47,6 +47,7 @@ impl TestEnv {
         env.insert("PATH".into(), path);
         env.insert("HOME".into(), home.clone().into());
         env.insert("LANG".into(), "C".into());
+        env.insert("DOTWARDEN_SESSION_BACKEND".into(), "file".into());
         env.insert("DOTWARDEN_LIBEXEC".into(), libexec().into());
         Self { root, home, env }
     }

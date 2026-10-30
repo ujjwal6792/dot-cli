@@ -501,6 +501,28 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
                 .insert(path.clone(), home_fingerprint(&home.join(path)));
             g.repo.extend(crate::detect::guard(store, ctx, action));
         }
+        Action::StashDrop { id } => {
+            g.repo.insert(
+                format!("stash:{id}"),
+                crate::stashes::get(store, Some(id)).map_or("-".into(), |s| s.index_commit),
+            );
+        }
+        Action::BranchDelete { name, .. } => {
+            g.repo.insert(
+                format!("branch:{name}"),
+                store
+                    .git(&["rev-parse", &format!("refs/heads/{name}")])
+                    .map_or("-".into(), |o| o.stdout),
+            );
+            g.repo.insert(
+                "branch:current".into(),
+                crate::remote::current_branch(store)?,
+            );
+            g.repo.insert(
+                "branch:head".into(),
+                crate::history::resolve(store, "HEAD")?,
+            );
+        }
         Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => {
             g.repo
                 .insert(format!("remote:{name}"), remote_state(store, name));
@@ -1248,6 +1270,12 @@ pub(crate) fn unstaged(store: &Store) -> Result<BTreeSet<String>> {
 }
 
 pub(crate) fn ensure_repo_clean(store: &Store) -> Result<()> {
+    if crate::remote::merge_in_progress(store) {
+        return Err(refuse(
+            "a merge from `dw pull --merge` is in progress: resolve its conflicts with `dw resolve`,              then `dw pull --continue` (or `dw pull --abort`)"
+                .to_string(),
+        ));
+    }
     let dirty = unstaged(store)?;
     if dirty.is_empty() {
         return Ok(());
@@ -1426,6 +1454,8 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
             verify_and_stage(store, &expected_sources(item), &[DATA_FILE])
         }
         Action::Discard { .. }
+        | Action::StashDrop { .. }
+        | Action::BranchDelete { .. }
         | Action::Resolve { .. }
         | Action::RemoteAdd { .. }
         | Action::RemoteRemove { .. }
@@ -1563,6 +1593,12 @@ pub fn apply_items(store: &Store, lock: &Lock, items: &[Item]) -> Result<Vec<Ite
                     };
                     (Vec::new(), Some(note))
                 })
+            }
+            Action::StashDrop { id } => crate::stashes::drop_locked(store, id)
+                .map(|()| (Vec::new(), Some(format!("dropped stash {id}")))),
+            Action::BranchDelete { name, force } => {
+                crate::branches::delete_locked(store, name, *force)
+                    .map(|()| (Vec::new(), Some(format!("deleted branch {name}"))))
             }
             Action::RemoteAdd { .. } | Action::RemoteRemove { .. } | Action::Push { .. } => {
                 crate::remote::exec_action(store, &item.action).map(|note| (Vec::new(), Some(note)))

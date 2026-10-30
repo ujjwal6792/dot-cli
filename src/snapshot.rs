@@ -27,6 +27,8 @@ const META: &str = "meta.json";
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct SnapFile {
+    #[serde(default)]
+    pub encrypted: bool,
     /// HOME-relative path.
     pub path: String,
     /// `file` or `symlink`.
@@ -100,6 +102,28 @@ pub fn take_at(
     actor: &str,
     now: u64,
 ) -> Result<Option<Snapshot>> {
+    take_inner(store, rels, reason, actor, now, false)
+}
+
+/// Encrypt blobs before they ever reach disk (used by stash and historical restore).
+pub fn take_protected(
+    store: &Store,
+    rels: &[String],
+    reason: &str,
+    actor: &str,
+) -> Result<Option<Snapshot>> {
+    crate::vault::session::require(store)?;
+    take_inner(store, rels, reason, actor, now_unix(), true)
+}
+
+fn take_inner(
+    store: &Store,
+    rels: &[String],
+    reason: &str,
+    actor: &str,
+    now: u64,
+    protected: bool,
+) -> Result<Option<Snapshot>> {
     let home = &store.dirs.home;
     let root = store.dirs.snapshots_dir();
     let mut present = Vec::new();
@@ -133,8 +157,12 @@ pub fn take_at(
             let abs = home.join(rel);
             let meta = fs::symlink_metadata(&abs)?;
             if meta.file_type().is_symlink() {
+                if protected {
+                    bail!("protected snapshots currently support regular files only");
+                }
                 let link = fs::read_link(&abs)?.to_string_lossy().into_owned();
                 files.push(SnapFile {
+                    encrypted: false,
                     path: (*rel).clone(),
                     kind: "symlink".into(),
                     mode: 0,
@@ -154,9 +182,15 @@ pub fn take_at(
                     .open(dir.join(&blob))?;
                 let mut data = Vec::new();
                 std::io::Read::read_to_end(&mut src, &mut data)?;
-                std::io::Write::write_all(&mut dst, &data)?;
+                let payload = if protected {
+                    crate::vault::encrypt(store, &data)?
+                } else {
+                    data.clone()
+                };
+                std::io::Write::write_all(&mut dst, &payload)?;
                 dst.sync_all()?;
                 files.push(SnapFile {
+                    encrypted: protected,
                     path: (*rel).clone(),
                     kind: "file".into(),
                     mode: meta.mode() & 0o7777,
@@ -326,7 +360,16 @@ pub fn restore(
         check_destination(home, &f.path)?;
     }
     let rels: Vec<String> = chosen.iter().map(|f| f.path.clone()).collect();
-    let safety = take(store, &rels, "restore", actor)?.map(|s| s.id);
+    let protected = chosen.iter().any(|f| f.encrypted);
+    let identity = protected
+        .then(|| crate::vault::session::require(store))
+        .transpose()?;
+    let safety = if protected {
+        take_protected(store, &rels, "restore", actor)?
+    } else {
+        take(store, &rels, "restore", actor)?
+    }
+    .map(|s| s.id);
     let dir = entry_dir(store, id);
     for f in &chosen {
         let dest = home.join(&f.path);
@@ -345,8 +388,12 @@ pub fn restore(
             }
             _ => {
                 let blob = f.blob.as_deref().context("snapshot entry has no blob")?;
-                let data = fs::read(dir.join(blob))
+                let mut data = fs::read(dir.join(blob))
                     .with_context(|| format!("reading the snapshot copy of ~/{}", f.path))?;
+                if f.encrypted {
+                    data =
+                        crate::vault::decrypt(identity.as_ref().context("vault locked")?, &data)?;
+                }
                 fsutil::write_atomic(&dest, data)?;
                 fs::set_permissions(&dest, fs::Permissions::from_mode(f.mode))?;
             }

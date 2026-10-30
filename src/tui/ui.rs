@@ -19,7 +19,7 @@ pub fn is_single_panel(area: Rect) -> bool {
     area.width < NARROW_WIDTH || area.height < SHORT_HEIGHT
 }
 
-const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · V values · v range · r refresh";
+const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · V values · r refresh / Git revert";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
@@ -46,7 +46,7 @@ const HELP: &[(&str, &str)] = &[
         "c A d (Changes)",
         "commit, amend (Ctrl+J: new line), discard; Enter diff",
     ),
-    ("f p P", "fetch, pull (fast-forward), push (y/n)"),
+    ("f p P", "fetch, pull (rebase if diverged), push (y/n)"),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
     ("Enter (Pending)", "review and apply all checked items"),
@@ -61,7 +61,19 @@ const HELP: &[(&str, &str)] = &[
     ),
     ("< / >, Home / End", "first / last item"),
     (".", "show or hide items matched by hide rules"),
-    ("r", "refresh status and folder"),
+    ("r", "Git: revert (y/n); elsewhere: refresh"),
+    ("Git M C X", "merge pull, continue merge, abort merge"),
+    ("Git [ ] / R", "tabs; Commits R: review historical restore"),
+    (
+        "Branches n Enter d D",
+        "create, switch, delete, force delete (y/n)",
+    ),
+    ("Remotes n d", "add (NAME URL), remove (preview then y/n)"),
+    ("Stash s Enter d", "push, pop, drop (path preview then y/n)"),
+    (
+        "H (Files, Changes)",
+        "history of the selected file in Git Commits; Esc there shows all",
+    ),
     (
         "E",
         "Files: store the selected tracked file encrypted (pending item)",
@@ -186,7 +198,8 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     use crate::conflicts::Pick;
     let Some(c) = &app.conflict else { return };
     let title = format!(
-        " Conflict ~/{} · j/k hunk · l local · i incoming · b both · e editor · w write · Esc cancel ",
+        " Conflict {}{} · j/k hunk · l local · i incoming · b both · e editor · w write · Esc cancel ",
+        if c.stored { "repo:" } else { "~/" },
         c.path
     );
     let block = Block::default().borders(Borders::ALL).title(title);
@@ -259,8 +272,14 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     if c.confirm.is_some() {
         f.render_widget(
             Paragraph::new(format!(
-                "Write the result to ~/{} and stage it? y / n (a snapshot is taken first)",
-                c.path
+                "Write the result to {}{} and stage it? y / n ({})",
+                if c.stored { "repo:" } else { "~/" },
+                c.path,
+                if c.stored {
+                    "HOME stays unchanged"
+                } else {
+                    "a snapshot is taken first"
+                }
             ))
             .block(Block::default().borders(Borders::ALL)),
             confirm,
@@ -343,17 +362,97 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
         Panel::Changes => draw_changes(f, app, block, area, expanded),
         Panel::Machines => draw_machines(f, app, block, area, expanded),
         Panel::Git => {
-            let text = "Commits · Branches · Remotes · Stash\n(arrives with git support)";
-            let shown = if expanded {
-                text
-            } else {
-                text.lines().next().unwrap_or("")
+            if app.git_tab != 0 {
+                let (title, rows): (&str, Vec<String>) = if app.git_tab == 2 {
+                    (
+                        " 4 Git · Remotes · [ ] tabs ",
+                        app.remotes
+                            .iter()
+                            .map(|r| format!("{} {} ({})", r.name, r.url, r.visibility))
+                            .collect(),
+                    )
+                } else if app.git_tab == 1 {
+                    (
+                        " 4 Git · Branches · [ ] tabs ",
+                        app.branches
+                            .iter()
+                            .map(|b| {
+                                format!(
+                                    "{} {}{}",
+                                    if b.current { "*" } else { " " },
+                                    b.name,
+                                    if b.default {
+                                        " (default)"
+                                    } else if b.current {
+                                        " ⚠ non-default"
+                                    } else {
+                                        ""
+                                    }
+                                )
+                            })
+                            .collect(),
+                    )
+                } else {
+                    (
+                        " 4 Git · Stash · [ ] tabs ",
+                        app.stashes
+                            .iter()
+                            .map(|s| {
+                                format!(
+                                    "{} ({} HOME, {} index)",
+                                    s.id,
+                                    s.paths.len(),
+                                    s.index_paths.len()
+                                )
+                            })
+                            .collect(),
+                    )
+                };
+                let mut state = ListState::default().with_selected(Some(app.git_selected));
+                f.render_stateful_widget(
+                    List::new(rows)
+                        .block(block.title(title))
+                        .highlight_style(Style::default().fg(Color::Yellow))
+                        .highlight_symbol("› "),
+                    area,
+                    &mut state,
+                );
+                return;
+            }
+            let items: Vec<ListItem> = app
+                .commits
+                .iter()
+                .map(|c| {
+                    ListItem::new(format!(
+                        "{} {} {} — {}{}",
+                        if c.merge { "◆" } else { "●" },
+                        c.short,
+                        c.subject,
+                        c.author,
+                        c.agent
+                            .as_ref()
+                            .map_or(String::new(), |a| format!(" [Agent: {a}]"))
+                    ))
+                })
+                .collect();
+            let title = match &app.commit_path {
+                Some(p) => {
+                    let home = &app.store.dirs.home;
+                    format!(
+                        " 4 Git · History of {} · Esc all ",
+                        tilde(home, &home.join(p))
+                    )
+                }
+                None => " 4 Git · Commits · r revert ".to_string(),
             };
-            f.render_widget(
-                Paragraph::new(shown)
-                    .style(Style::default().fg(Color::DarkGray))
-                    .block(block),
+            let mut state = ListState::default().with_selected(Some(app.commit_selected));
+            f.render_stateful_widget(
+                List::new(items)
+                    .block(block.title(title))
+                    .highlight_style(Style::default().fg(Color::Yellow))
+                    .highlight_symbol("› "),
                 area,
+                &mut state,
             );
         }
     }
@@ -451,7 +550,15 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
                         (Some(a), Some(b)) => format!(" ↑{a} ↓{b}"),
                         _ => " (no upstream)".into(),
                     };
-                    format!("{}{sync}", r.branch.as_deref().unwrap_or("?"))
+                    format!(
+                        "{}{sync}{}",
+                        r.branch.as_deref().unwrap_or("?"),
+                        if r.branch.as_deref() != Some(&r.default_branch) {
+                            " ⚠ non-default"
+                        } else {
+                            ""
+                        }
+                    )
                 }
                 None => "not initialised".into(),
             };
@@ -685,16 +792,53 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         .borders(Borders::ALL)
         .border_style(border(false))
         .title(title);
-    if app.focus == Panel::Changes {
+    if app.focus == Panel::Git && app.git_tab != 0 {
+        let text = if app.git_tab == 1 {
+            "Branches: n create · Enter switch · d delete · D force delete.\nHOME never changes; staged overlaps refuse the switch.".into()
+        } else if app.git_tab == 2 {
+            let keys = "n add (NAME URL) · d remove; preview then y/n.\nPublic remotes are refused; unverifiable hosts need your confirmation.";
+            app.remotes
+                .get(app.git_selected)
+                .map_or(keys.to_string(), |r| {
+                    format!(
+                        "{}\nURL: {}\nVisibility: {}\n\n{keys}",
+                        r.name, r.url, r.visibility
+                    )
+                })
+        } else {
+            app.stashes.get(app.git_selected).map_or(
+                "s push a stash of tracked HOME and index changes".into(),
+                |s| {
+                    format!(
+                        "HOME: {}\nIndex: {}\nEnter pop · d drop · s push; preview then y/n",
+                        s.paths.join(", "),
+                        s.index_paths.join(", ")
+                    )
+                },
+            )
+        };
+        return f.render_widget(
+            Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
+            area,
+        );
+    }
+    if app.focus == Panel::Changes || app.focus == Panel::Git {
         let body = match &app.diff {
             Load::Loading => ratatui::text::Text::from("loading…"),
             Load::Failed(e) => ratatui::text::Text::from(e.clone()),
             Load::Ready(t) if t.lines.is_empty() => ratatui::text::Text::from("No change selected"),
             Load::Ready(t) => t.clone(),
         };
-        let title = app
-            .selected_change()
-            .map_or(" Diff ".to_string(), |c| format!(" {} ", c.path));
+        let title = if app.focus == Panel::Git {
+            app.commits
+                .get(app.commit_selected)
+                .map_or(" Commit ".into(), |c| {
+                    format!(" {} {} ", c.short, c.subject)
+                })
+        } else {
+            app.selected_change()
+                .map_or(" Diff ".to_string(), |c| format!(" {} ", c.path))
+        };
         return f.render_widget(Paragraph::new(body).block(block.title(title)), area);
     }
     let text: String = match app.focus {
@@ -879,6 +1023,32 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                     "y applies · n / Esc cancels",
                     Style::default().fg(Color::Yellow),
                 ),
+            ],
+        ),
+        Dialog::GitCreate(name) => (
+            " New branch ",
+            vec![
+                Line::from(format!("{name}█")),
+                Line::from("Enter preview · Esc cancel"),
+            ],
+        ),
+        Dialog::RemoteAdd(text) => (
+            " New remote ",
+            vec![
+                Line::from(format!("{text}█")),
+                Line::from("NAME URL · Enter preview · Esc cancel"),
+            ],
+        ),
+        Dialog::GitConfirm { preview, .. } => {
+            let mut lines: Vec<Line> = preview.lines().map(|s| Line::from(s.to_string())).collect();
+            lines.push(Line::from("y confirm · n cancel"));
+            (" Git preview ", lines)
+        }
+        Dialog::ConfirmRevert(hash) => (
+            " Revert commit ",
+            vec![
+                Line::from(format!("Create a revert commit for {hash}?")),
+                Line::from("y confirm · n cancel (HOME stays unchanged)"),
             ],
         ),
         Dialog::ConfirmPush => (

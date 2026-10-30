@@ -122,6 +122,196 @@ impl Tui {
 }
 
 #[test]
+fn git_branches_create_switch_and_delete_have_previews() {
+    let mut tui = open(edited());
+    tui.press('4');
+    tui.press(']');
+    tui.press('n');
+    tui.type_text("other");
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    assert!(matches!(tui.app.dialog, Some(Dialog::GitConfirm { .. })));
+    tui.press('y');
+    assert_eq!(tui.app.branches.len(), 2);
+    tui.press('j');
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    assert!(
+        tui.app
+            .branches
+            .iter()
+            .any(|b| b.name == "other" && b.current)
+    );
+    assert!(tui.screen().contains("non-default"));
+    tui.press('k');
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    tui.press('j');
+    tui.press('d');
+    assert!(tui.screen().contains("Delete"));
+    tui.press('y');
+    assert_eq!(tui.app.branches.len(), 1);
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+}
+
+#[test]
+fn git_stash_confirmation_lists_home_and_round_trips() {
+    let mut tui = open(edited());
+    tui.press('4');
+    tui.press('[');
+    tui.press('s');
+    let screen = tui.screen();
+    assert!(screen.contains("HOME: .a"), "{screen}");
+    tui.press('n');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+    tui.press('s');
+    fs::write(tui.t.home.join(".a"), "changed after preview\n").unwrap();
+    tui.press('y');
+    assert!(tui.app.stashes.is_empty());
+    assert!(
+        tui.app
+            .message
+            .as_deref()
+            .unwrap_or("")
+            .contains("changed since preview")
+    );
+    fs::write(tui.t.home.join(".a"), "two\n").unwrap();
+    tui.press('s');
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "one\n");
+    assert_eq!(tui.app.stashes.len(), 1);
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+    assert!(tui.app.stashes.is_empty());
+}
+
+#[test]
+fn h_shows_the_history_of_one_file_and_esc_shows_all_commits() {
+    let t = edited();
+    write(&t, ".b", "b\n");
+    t.dw_ok(&["track", ".b", "--apply"]);
+    t.dw_ok(&["commit", "-m", "only b"]);
+    let mut tui = open(t);
+    tui.press('H');
+    assert_eq!(tui.app.focus, Panel::Git);
+    let subjects: Vec<_> = tui.app.commits.iter().map(|c| c.subject.clone()).collect();
+    assert_eq!(subjects, ["base"]);
+    let screen = tui.screen();
+    assert!(screen.contains("History of ~/.a"), "{screen}");
+    assert!(
+        screen.contains("one"),
+        "the file's diff is shown:\n{screen}"
+    );
+    tui.send(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(tui.app.commits.iter().any(|c| c.subject == "only b"));
+    assert!(tui.app.commit_path.is_none());
+    assert!(!tui.screen().contains("History of"));
+}
+
+#[test]
+fn remotes_tab_adds_an_unverifiable_host_on_confirmation_and_removes() {
+    let mut tui = open(edited());
+    tui.press('4');
+    tui.press(']');
+    tui.press(']');
+    tui.press('n');
+    let url = "ssh://git.example.test/dots.git";
+    tui.type_text(&format!("origin {url}"));
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    let screen = tui.screen();
+    assert!(screen.contains("cannot be checked"), "{screen}");
+    tui.press('n');
+    assert!(tui.app.remotes.is_empty(), "n adds nothing");
+    tui.press('n');
+    tui.type_text(&format!("origin {url}"));
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    let list = tui.t.dw_json(&["remote", "list"]);
+    assert_eq!(list["remotes"][0]["url"], url);
+    assert_eq!(list["remotes"][0]["visibility"], "confirmed-private");
+    assert_eq!(tui.app.remotes.len(), 1);
+    tui.press('d');
+    assert!(tui.screen().contains("Remove remote origin"));
+    tui.press('y');
+    assert!(tui.app.remotes.is_empty());
+    assert!(
+        tui.t.dw_json(&["remote", "list"])["remotes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn git_history_restore_is_reviewed_as_incoming_before_apply() {
+    let t = edited();
+    t.dw_ok(&["stage", ".a"]);
+    t.dw_ok(&["commit", "-m", "second"]);
+    let head = t.git(&t.dirs().repo(), &["rev-parse", "HEAD"]);
+    let mut tui = open(t);
+    tui.press('4');
+    tui.press('j');
+    tui.press('R');
+    assert!(tui.screen().contains("Review restore"));
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+    tui.press('3');
+    tui.press(']');
+    tui.press(']');
+    assert!(tui.app.change_rows().iter().any(|c| c.kind == "restore"));
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('y');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "one\n");
+    assert_eq!(
+        tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]),
+        head
+    );
+}
+
+#[test]
+fn commits_cursor_diff_paging_and_revert_confirmation() {
+    let t = edited();
+    t.dw_ok(&["stage", ".a"]);
+    t.dw_ok(&["commit", "-m", "second"]);
+    // Real history beyond the initial page. Empty commits keep this inexpensive.
+    for i in 0..51 {
+        t.git(
+            &t.dirs().repo(),
+            &["commit", "--allow-empty", "-m", &format!("padding {i}")],
+        );
+    }
+    let mut tui = open(t);
+    tui.press('4');
+    assert_eq!(tui.app.commits.len(), 50);
+    for _ in 0..51 {
+        tui.press('j');
+    }
+    assert!(tui.app.commits.len() > 50);
+    assert_eq!(tui.app.commits[tui.app.commit_selected].subject, "second");
+    let screen = tui.screen();
+    assert!(screen.contains("two"), "{screen}");
+    tui.press('r');
+    assert!(matches!(tui.app.dialog, Some(Dialog::ConfirmRevert(_))));
+    let before = tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]);
+    tui.press('n');
+    assert_eq!(
+        tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]),
+        before
+    );
+    tui.press('r');
+    tui.press('y');
+    assert_ne!(
+        tui.t.git(&tui.t.dirs().repo(), &["rev-parse", "HEAD"]),
+        before
+    );
+    assert_eq!(
+        fs::read_to_string(tui.t.dirs().repo().join("home/dot_a")).unwrap(),
+        "one\n"
+    );
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+}
+
+#[test]
 fn space_stages_on_the_local_tab_and_unstages_on_the_staged_tab() {
     let mut tui = open(edited());
     assert_eq!(tui.app.focus, Panel::Changes);

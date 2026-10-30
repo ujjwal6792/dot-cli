@@ -85,6 +85,7 @@ impl Panel {
 /// A mutation waiting for its turn on the action queue.
 #[derive(Debug, Clone)]
 pub enum ActionReq {
+    Git(GitOp, String),
     /// Space: flip the tracked state of these HOME paths (absolute).
     Toggle(Vec<std::path::PathBuf>),
     /// `i`: hide (or un-hide) this absolute path, through a pending hide item.
@@ -107,6 +108,10 @@ pub enum ActionReq {
     ApplyIncoming(Option<Vec<String>>),
     Fetch,
     Pull,
+    MergePull,
+    ContinuePull,
+    AbortPull,
+    Revert(String),
     Push,
     /// Add one pending assignment item for these HOME-relative paths.
     Assign(Vec<String>, Vec<crate::machines::Edit>),
@@ -130,6 +135,103 @@ pub enum ActionReq {
     Lock,
     /// Write this finished text over the conflicting file (HOME-relative) and stage it.
     Resolve(String, Secret),
+}
+
+#[derive(Debug, Clone)]
+pub enum GitOp {
+    Create(String),
+    Switch(String),
+    Delete(String, bool),
+    StashPush,
+    StashPop(String),
+    StashDrop(String),
+    Restore(String),
+    RemoteAdd(String, String),
+    RemoteRemove(String),
+}
+
+/// Tabs of the Git panel.
+pub const GIT_TABS: [&str; 4] = ["Commits", "Branches", "Remotes", "Stash"];
+
+fn preview_git(store: &Store, op: &GitOp) -> anyhow::Result<String> {
+    use crate::remote::Host;
+    let agent = changes::agent(store).is_some();
+    Ok(match op {
+        GitOp::RemoteAdd(name, url) => {
+            crate::remote::plan_add(store, name, url)?;
+            let check = match crate::remote::host_of(url) {
+                Host::Local => "A local path: never public.".to_string(),
+                Host::Known(_) => crate::remote::ensure_not_public(store, url, None)?
+                    .unwrap_or_else(|| "Not public. Checked again before every push.".into()),
+                Host::Unknown(_) if crate::remote::confirmed_private(store)?.contains(url) => {
+                    "Already confirmed private.".into()
+                }
+                Host::Unknown(host) => format!(
+                    "{host} cannot be checked for visibility.\ny confirms that {url} is private (stored in machine.toml)."
+                ),
+            };
+            format!(
+                "Add remote {name}\nURL: {url}\n{check}{}",
+                if agent {
+                    "\nQueued for human approval."
+                } else {
+                    ""
+                }
+            )
+        }
+        GitOp::RemoteRemove(name) => {
+            let url = crate::remote::remote_url(store, name)?
+                .ok_or_else(|| anyhow::anyhow!("no remote named {name}"))?;
+            format!(
+                "Remove remote {name}\nURL: {url}\nThe remote repository is not touched.{}",
+                if agent {
+                    "\nQueued for human approval."
+                } else {
+                    ""
+                }
+            )
+        }
+        GitOp::Create(n) | GitOp::Switch(n) => {
+            let files = crate::branches::change(store, n, matches!(op, GitOp::Create(_)), true)?;
+            format!(
+                "{op:?}\nSource/index: {}\nHOME unchanged.{}",
+                files.join(", "),
+                if *n != crate::branches::default_name(store) {
+                    " Non-default branch."
+                } else {
+                    ""
+                }
+            )
+        }
+        GitOp::Delete(n, f) => crate::branches::plan_delete(store, n, *f)?.render(),
+        GitOp::StashDrop(id) => crate::stashes::plan_drop(store, Some(id))?.render(),
+        GitOp::StashPush | GitOp::StashPop(_) => {
+            let s = if let GitOp::StashPop(id) = op {
+                crate::stashes::pop(store, Some(id), true)?
+            } else {
+                crate::stashes::push(store, true)?
+            };
+            format!(
+                "{op:?}\nHOME: {}\nSource index: {}\nSnapshot before overwrite; untracked HOME excluded.",
+                s.paths.join(", "),
+                s.index_paths.join(", ")
+            )
+        }
+        GitOp::Restore(hash) => {
+            let cs = crate::restores::plan(store, hash, None, true)?;
+            format!(
+                "Review restore from {hash}\n{}\nHOME and HEAD unchanged until review/apply.",
+                cs.iter()
+                    .map(|c| format!(
+                        "~/{}{}",
+                        c.path,
+                        if c.conflict { " (Conflict)" } else { "" }
+                    ))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            )
+        }
+    })
 }
 
 /// Typed-in secret text; never printed by `Debug`.
@@ -195,6 +297,7 @@ pub struct ValuesScreen {
 /// The Conflicts screen (Enter on the Conflicts tab): hunks of one file.
 #[derive(Debug)]
 pub struct ConflictScreen {
+    pub stored: bool,
     pub path: String,
     pub data: Load<Box<super::jobs::ConflictData>>,
     /// The conflicting hunk in view.
@@ -277,6 +380,14 @@ pub const TABS: [&str; 4] = ["Local", "Staged", "Incoming", "Conflicts"];
 /// A modal dialog over the main screen.
 #[derive(Debug)]
 pub enum Dialog {
+    GitCreate(String),
+    /// `n` on the Remotes tab: "NAME URL".
+    RemoteAdd(String),
+    GitConfirm {
+        op: GitOp,
+        preview: String,
+        guard: String,
+    },
     /// The one review listing every selected item; Enter or `y` applies.
     Review(Vec<Item>),
     /// Per-item outcome of an apply, partial results included.
@@ -289,6 +400,7 @@ pub enum Dialog {
     ConfirmApply(Option<Vec<String>>),
     /// `P`: y/n before pushing.
     ConfirmPush,
+    ConfirmRevert(String),
     /// `m`: the assignment editor.
     Assign(AssignEditor),
 }
@@ -301,6 +413,16 @@ pub enum Load<T> {
 }
 
 pub struct App {
+    pub git_tab: usize,
+    pub git_selected: usize,
+    pub branches: Vec<crate::branches::Branch>,
+    pub stashes: Vec<crate::stashes::Stash>,
+    pub remotes: Vec<crate::remote::RemoteInfo>,
+    pub commits: Vec<crate::history::Commit>,
+    pub commit_selected: usize,
+    commit_limit: usize,
+    /// The file whose history the Commits tab shows (`H`); `None` is all history.
+    pub commit_path: Option<String>,
     pub store: Arc<Store>,
     rules: Arc<HideRules>,
     jobs: Jobs,
@@ -347,6 +469,15 @@ impl App {
     pub fn new(store: Arc<Store>, rules: HideRules, tx: Sender<Event>) -> Self {
         let root = store.dirs.home.clone();
         Self {
+            git_tab: 0,
+            git_selected: 0,
+            branches: Vec::new(),
+            stashes: Vec::new(),
+            remotes: Vec::new(),
+            commits: Vec::new(),
+            commit_selected: 0,
+            commit_limit: 50,
+            commit_path: None,
             store,
             rules: Arc::new(rules),
             jobs: Jobs::new(tx),
@@ -396,6 +527,7 @@ impl App {
         self.refresh_hide();
         self.reload_listing(None);
         self.background_fetch();
+        self.refresh_commits();
     }
 
     /// Fetch every remote without blocking; it never pulls or applies.
@@ -547,6 +679,32 @@ impl App {
             return;
         }
         match done.payload {
+            Payload::GitMeta(result) => match result {
+                Ok((branches, stashes, remotes)) => {
+                    self.branches = branches;
+                    self.stashes = stashes;
+                    self.remotes = remotes;
+                }
+                Err(e) => self.message = Some(e),
+            },
+            Payload::GitPreview { op, preview } => match preview {
+                Ok((preview, guard)) => {
+                    self.dialog = Some(Dialog::GitConfirm { op, preview, guard })
+                }
+                Err(e) => self.message = Some(e),
+            },
+            Payload::Commits(r) => match r {
+                Ok(commits) => {
+                    self.commits = commits;
+                    self.commit_selected = self
+                        .commit_selected
+                        .min(self.commits.len().saturating_sub(1));
+                    if self.focus == Panel::Git {
+                        self.commit_diff();
+                    }
+                }
+                Err(e) => self.message = Some(e),
+            },
             Payload::Status(r) => {
                 self.status = match r {
                     Ok(s) => Load::Ready(*s),
@@ -643,6 +801,11 @@ impl App {
                 self.action_running = false;
                 match r {
                     Ok(report) => {
+                        if report.merge_conflicts {
+                            self.focus = Panel::Changes;
+                            self.changes_tab = 3;
+                            self.changes_selected = 0;
+                        }
                         self.message = Some(report.message);
                         if let Some(text) = report.amend_message {
                             self.dialog = Some(Dialog::Commit(CommitBox { text, amend: true }));
@@ -654,6 +817,7 @@ impl App {
                     Err(e) => self.message = Some(e),
                 }
                 self.reload_values();
+                self.refresh_commits();
                 self.refresh_tracking();
                 self.refresh_hide();
                 self.refresh_status();
@@ -761,6 +925,50 @@ impl App {
                 KeyCode::Char('y') => self.request_action(ActionReq::Push),
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmPush),
+            },
+            Some(Dialog::GitCreate(mut name)) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => self.git_preview(GitOp::Create(name)),
+                KeyCode::Backspace => {
+                    name.pop();
+                    self.dialog = Some(Dialog::GitCreate(name));
+                }
+                KeyCode::Char(c) => {
+                    name.push(c);
+                    self.dialog = Some(Dialog::GitCreate(name));
+                }
+                _ => self.dialog = Some(Dialog::GitCreate(name)),
+            },
+            Some(Dialog::RemoteAdd(mut text)) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter => match text.trim().split_once(' ') {
+                    Some((name, url)) if !url.trim().is_empty() => {
+                        self.git_preview(GitOp::RemoteAdd(name.to_string(), url.trim().to_string()))
+                    }
+                    _ => {
+                        self.message = Some("type NAME URL".into());
+                        self.dialog = Some(Dialog::RemoteAdd(text));
+                    }
+                },
+                KeyCode::Backspace => {
+                    text.pop();
+                    self.dialog = Some(Dialog::RemoteAdd(text));
+                }
+                KeyCode::Char(c) => {
+                    text.push(c);
+                    self.dialog = Some(Dialog::RemoteAdd(text));
+                }
+                _ => self.dialog = Some(Dialog::RemoteAdd(text)),
+            },
+            Some(Dialog::GitConfirm { op, preview, guard }) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Git(op, guard)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::GitConfirm { op, preview, guard }),
+            },
+            Some(Dialog::ConfirmRevert(hash)) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Revert(hash)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::ConfirmRevert(hash)),
             },
             Some(Dialog::Assign(mut e)) if e.variant => {
                 let last = e.rows.len().saturating_sub(1);
@@ -973,6 +1181,11 @@ impl App {
             }
             KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
             KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            KeyCode::Char('H') => {
+                if let Some(c) = selected {
+                    return self.open_history(c.path);
+                }
+            }
             KeyCode::Enter if tab == 2 => {
                 if let Some(c) = selected {
                     self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path])));
@@ -980,7 +1193,11 @@ impl App {
             }
             KeyCode::Enter if tab == 3 => {
                 if let Some(c) = selected {
-                    self.open_conflict(c.path);
+                    if c.kind == "restore" {
+                        self.message = Some("Historical restore collides or is stale: clear with `dw restore --clear PATH`, preserve edits and re-plan".into());
+                    } else {
+                        self.open_conflict(c.path);
+                    }
                 }
             }
             KeyCode::Enter => self.request_diff(),
@@ -1041,6 +1258,9 @@ impl App {
     pub fn handle_key(&mut self, key: KeyEvent) {
         let before = self.focus;
         self.handle_key_inner(key);
+        if self.focus == Panel::Git && before != Panel::Git {
+            self.commit_diff();
+        }
         if self.focus == Panel::Changes && before != Panel::Changes {
             self.request_diff();
         }
@@ -1076,7 +1296,8 @@ impl App {
             KeyCode::Tab => return self.focus = self.focus.shifted(1),
             KeyCode::BackTab => return self.focus = self.focus.shifted(-1),
             KeyCode::Char(c @ '1'..='5') => {
-                return self.focus = Panel::ALL[c as usize - '1' as usize];
+                self.focus = Panel::ALL[c as usize - '1' as usize];
+                return;
             }
             KeyCode::Char('0') => return self.focus = Panel::Pending,
             KeyCode::Char('V') => {
@@ -1086,7 +1307,7 @@ impl App {
             KeyCode::Char('f') => return self.request_action(ActionReq::Fetch),
             KeyCode::Char('p') => return self.request_action(ActionReq::Pull),
             KeyCode::Char('P') => return self.dialog = Some(Dialog::ConfirmPush),
-            KeyCode::Char('r') => {
+            KeyCode::Char('r') if self.focus != Panel::Git => {
                 self.refresh_tracking();
                 self.refresh_hide();
                 self.refresh_status();
@@ -1099,6 +1320,7 @@ impl App {
             Panel::Pending => self.pending_key(key),
             Panel::Changes => self.changes_key(key),
             Panel::Machines => self.machines_key(key),
+            Panel::Git => self.git_key(key),
             _ => match key.code {
                 KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
                 KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
@@ -1109,6 +1331,198 @@ impl App {
 
     pub fn take_handoff(&mut self) -> Option<Handoff> {
         self.handoff.take()
+    }
+
+    fn refresh_commits(&mut self) {
+        let meta_store = Arc::clone(&self.store);
+        self.jobs.spawn("git-meta", move |_| {
+            Payload::GitMeta(
+                (|| -> anyhow::Result<_> {
+                    if !meta_store.is_initialised() {
+                        return Ok(Default::default());
+                    }
+                    Ok((
+                        crate::branches::list(&meta_store)?,
+                        crate::stashes::list(&meta_store)?,
+                        crate::remote::list(&meta_store)?,
+                    ))
+                })()
+                .map_err(|e| format!("{e:#}")),
+            )
+        });
+        let store = Arc::clone(&self.store);
+        let count = self.commit_limit;
+        let path = self.commit_path.clone();
+        self.jobs.spawn("commits", move |_| {
+            if !store.is_initialised() {
+                return Payload::Commits(Ok(Vec::new()));
+            }
+            Payload::Commits(
+                crate::history::log(&store, path.as_deref(), 0, count)
+                    .map_err(|e| format!("{e:#}")),
+            )
+        });
+    }
+
+    /// `H`: show the history of this file (HOME-relative or absolute) on the Commits tab.
+    fn open_history(&mut self, path: String) {
+        self.commit_path = Some(path);
+        self.commits.clear();
+        self.commit_selected = 0;
+        self.commit_limit = 50;
+        self.git_tab = 0;
+        self.diff = Load::Ready(Default::default());
+        self.focus = Panel::Git;
+        self.refresh_commits();
+    }
+
+    fn commit_diff(&mut self) {
+        if self.git_tab != 0 {
+            return;
+        }
+        let Some(c) = self.commits.get(self.commit_selected) else {
+            return;
+        };
+        let hash = c.hash.clone();
+        let path = self.commit_path.clone();
+        let store = Arc::clone(&self.store);
+        self.diff = Load::Loading;
+        self.jobs.spawn(KEY_DIFF, move |cancel| {
+            use ansi_to_tui::IntoText;
+            let result = crate::history::diff(&store, &hash, path.as_deref()).and_then(|plain| {
+                let shown = changes::through_delta(&store, &plain, Some(cancel)).unwrap_or(plain);
+                Ok(shown.into_text()?)
+            });
+            Payload::Diff(result.map_err(|e| format!("{e:#}")))
+        });
+    }
+
+    fn git_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('[') | KeyCode::Char(']') => {
+                let n = GIT_TABS.len();
+                self.git_tab = (self.git_tab
+                    + if key.code == KeyCode::Char(']') {
+                        1
+                    } else {
+                        n - 1
+                    })
+                    % n;
+                self.git_selected = 0;
+                self.commit_diff();
+                return;
+            }
+            KeyCode::Char('R') if self.git_tab == 0 => {
+                if let Some(c) = self.commits.get(self.commit_selected) {
+                    self.git_preview(GitOp::Restore(c.hash.clone()));
+                }
+                return;
+            }
+            KeyCode::Esc if self.git_tab == 0 && self.commit_path.is_some() => {
+                self.commit_path = None;
+                self.commit_selected = 0;
+                self.commit_limit = 50;
+                return self.refresh_commits();
+            }
+            _ => {}
+        }
+        if self.git_tab != 0 {
+            let n = match self.git_tab {
+                1 => self.branches.len(),
+                2 => self.remotes.len(),
+                _ => self.stashes.len(),
+            };
+            let branch = self.branches.get(self.git_selected).map(|b| b.name.clone());
+            let remote = self.remotes.get(self.git_selected).map(|r| r.name.clone());
+            let stash = self.stashes.get(self.git_selected).map(|s| s.id.clone());
+            match key.code {
+                KeyCode::Char('j') | KeyCode::Down => {
+                    self.git_selected = (self.git_selected + 1).min(n.saturating_sub(1))
+                }
+                KeyCode::Char('k') | KeyCode::Up => {
+                    self.git_selected = self.git_selected.saturating_sub(1)
+                }
+                KeyCode::Char('n') if self.git_tab == 1 => {
+                    self.dialog = Some(Dialog::GitCreate(String::new()))
+                }
+                KeyCode::Enter if self.git_tab == 1 => {
+                    if let Some(b) = branch {
+                        self.git_preview(GitOp::Switch(b));
+                    }
+                }
+                KeyCode::Char('d' | 'D') if self.git_tab == 1 => {
+                    if let Some(b) = branch {
+                        self.git_preview(GitOp::Delete(b, key.code == KeyCode::Char('D')));
+                    }
+                }
+                KeyCode::Char('n') if self.git_tab == 2 => {
+                    self.dialog = Some(Dialog::RemoteAdd(String::new()))
+                }
+                KeyCode::Char('d') if self.git_tab == 2 => {
+                    if let Some(r) = remote {
+                        self.git_preview(GitOp::RemoteRemove(r));
+                    }
+                }
+                KeyCode::Char('s') if self.git_tab == 3 => self.git_preview(GitOp::StashPush),
+                KeyCode::Enter if self.git_tab == 3 => {
+                    if let Some(s) = stash {
+                        self.git_preview(GitOp::StashPop(s));
+                    }
+                }
+                KeyCode::Char('d') if self.git_tab == 3 => {
+                    if let Some(s) = stash {
+                        self.git_preview(GitOp::StashDrop(s));
+                    }
+                }
+                _ => {}
+            }
+            return;
+        }
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.commit_selected =
+                    (self.commit_selected + 1).min(self.commits.len().saturating_sub(1));
+                if self.commit_selected + 1 == self.commits.len()
+                    && self.commits.len() == self.commit_limit
+                {
+                    self.commit_limit += 50;
+                    self.refresh_commits();
+                }
+                self.commit_diff();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.commit_selected = self.commit_selected.saturating_sub(1);
+                self.commit_diff();
+            }
+            KeyCode::Enter => self.commit_diff(),
+            KeyCode::Char('r') => {
+                if let Some(c) = self.commits.get(self.commit_selected) {
+                    self.dialog = Some(Dialog::ConfirmRevert(c.hash.clone()));
+                }
+            }
+            KeyCode::Char('M') => self.request_action(ActionReq::MergePull),
+            KeyCode::Char('C') => self.request_action(ActionReq::ContinuePull),
+            KeyCode::Char('X') => self.request_action(ActionReq::AbortPull),
+            KeyCode::Char('h') | KeyCode::Left => self.focus = self.focus.shifted(-1),
+            KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
+            _ => {}
+        }
+    }
+
+    fn git_preview(&mut self, op: GitOp) {
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn("git-preview", move |_| {
+            let preview = (|| -> anyhow::Result<_> {
+                let guard = crate::git_state::preview_guard(&store)?;
+                let text = preview_git(&store, &op)?;
+                if crate::git_state::preview_guard(&store)? != guard {
+                    anyhow::bail!("state changed during preview; try again");
+                }
+                Ok((text, guard))
+            })()
+            .map_err(|e| format!("{e:#}"));
+            Payload::GitPreview { op, preview }
+        });
     }
 
     /// The editor returned: its merge file becomes the result awaiting y/n.
@@ -1132,6 +1546,7 @@ impl App {
 
     fn open_conflict(&mut self, path: String) {
         self.conflict = Some(ConflictScreen {
+            stored: self.selected_change().is_some_and(|c| c.kind == "merge"),
             path: path.clone(),
             data: Load::Loading,
             cursor: 0,
@@ -1412,6 +1827,12 @@ impl App {
         let before = self.files.selected_path();
         match key.code {
             KeyCode::Char(' ') => return self.toggle_selection(),
+            KeyCode::Char('H') => {
+                if let Some(p) = before {
+                    self.open_history(p.to_string_lossy().into_owned());
+                }
+                return;
+            }
             KeyCode::Char('i') => {
                 if let Some(e) = self.files.selected_entry() {
                     let (path, is_dir) = (self.files.cwd.join(&e.name), e.is_dir);
@@ -1484,6 +1905,7 @@ impl App {
 
 fn report(message: String) -> ActionReport {
     ActionReport {
+        merge_conflicts: false,
         message,
         results: None,
         amend_message: None,
@@ -1527,6 +1949,12 @@ fn render_diff(
     cancel: &crate::exec::CancelToken,
 ) -> anyhow::Result<ratatui::text::Text<'static>> {
     use ansi_to_tui::IntoText;
+    if c.kind == "restore" {
+        let plain = crate::restores::preview(store, &c.path)?;
+        return Ok(changes::through_delta(store, &plain, Some(cancel))
+            .unwrap_or(plain)
+            .into_text()?);
+    }
     if c.state == State::Incoming {
         return Ok(format!(
             "~/{} has an incoming change.\n\nSpace or Enter applies it to HOME (a snapshot is taken first); a applies all.",
@@ -1566,6 +1994,105 @@ fn render_diff(
 /// Run one queued mutation on a worker thread.
 fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
     match req {
+        ActionReq::Git(op, guard) => {
+            if crate::git_state::preview_guard(store)? != guard {
+                return Err(crate::error::DwError::new(
+                    crate::error::Kind::Stale,
+                    "state changed since preview; review again",
+                )
+                .into());
+            }
+            match &op {
+                GitOp::Create(n) | GitOp::Switch(n) => {
+                    crate::branches::change(store, n, matches!(op, GitOp::Create(_)), false)?;
+                }
+                GitOp::StashPush => {
+                    crate::stashes::push(store, false)?;
+                }
+                GitOp::StashPop(id) => {
+                    crate::stashes::pop(store, Some(id), false)?;
+                }
+                GitOp::Restore(hash) => {
+                    crate::restores::plan(store, hash, None, false)?;
+                }
+                GitOp::RemoteAdd(..) | GitOp::RemoteRemove(_) => {
+                    if changes::agent(store).is_some() {
+                        let requester = pending::requester(store);
+                        let item = match &op {
+                            GitOp::RemoteAdd(name, url) => {
+                                crate::remote::plan_add_item(store, name, url, &requester)?
+                            }
+                            GitOp::RemoteRemove(name) => {
+                                crate::remote::plan_remove_item(store, name, &requester)?
+                            }
+                            _ => unreachable!(),
+                        };
+                        let lock = store.lock()?;
+                        let ctx = track::Ctx::load(store)?;
+                        pending::add(store, &lock, vec![item], &track::stale_checker(store, &ctx))?;
+                        return Ok(report("Queued for human approval".into()));
+                    }
+                    let _lock = store.lock()?;
+                    return Ok(report(match &op {
+                        GitOp::RemoteAdd(name, url) => {
+                            // The y on the preview is the human confirming an unverifiable host.
+                            match crate::remote::add_locked(store, name, url, Some(&|_| Ok(true)))?
+                            {
+                                Some(w) => format!("Added remote {name}; {w}"),
+                                None => format!("Added remote {name}"),
+                            }
+                        }
+                        GitOp::RemoteRemove(name) => {
+                            crate::remote::remove_locked(store, name)?;
+                            format!("Removed remote {name}")
+                        }
+                        _ => unreachable!(),
+                    }));
+                }
+                GitOp::Delete(..) | GitOp::StashDrop(_) => {
+                    let item = match &op {
+                        GitOp::Delete(n, f) => crate::branches::plan_delete(store, n, *f)?,
+                        GitOp::StashDrop(id) => crate::stashes::plan_drop(store, Some(id))?,
+                        _ => unreachable!(),
+                    };
+                    if changes::agent(store).is_some() {
+                        let lock = store.lock()?;
+                        let ctx = track::Ctx::load(store)?;
+                        pending::add(store, &lock, vec![item], &track::stale_checker(store, &ctx))?;
+                        return Ok(report("Queued for human approval".into()));
+                    }
+                    let done = track::apply_now(store, &[item])?;
+                    if let Some(bad) = done.iter().find(|r| r.status != track::Outcome::Applied) {
+                        anyhow::bail!("{}", bad.message.as_deref().unwrap_or("operation refused"));
+                    }
+                }
+            }
+            Ok(report(format!(
+                "Completed {op:?}; review Changes for Incoming/Conflicts"
+            )))
+        }
+        ActionReq::Revert(hash) => {
+            let c = crate::history::revert(store, &hash, changes::agent(store).as_deref())?;
+            Ok(report(format!("Reverted in {}; see Incoming", c.short)))
+        }
+        ActionReq::MergePull => {
+            let p = crate::remote::pull(store, None, crate::remote::PullMode::Merge)?;
+            let mut r = report(if p.conflicts.is_empty() {
+                "Pulled; see Incoming".into()
+            } else {
+                "Merge conflicts: resolve in Changes → Conflicts, then Git C (continue), or X (abort)".into()
+            });
+            r.merge_conflicts = !p.conflicts.is_empty();
+            Ok(r)
+        }
+        ActionReq::ContinuePull => {
+            crate::remote::pull_continue(store)?;
+            Ok(report("Merge committed; see Incoming".into()))
+        }
+        ActionReq::AbortPull => {
+            crate::remote::pull_abort(store)?;
+            Ok(report("Merge aborted".into()))
+        }
         ActionReq::Toggle(paths) => {
             let requester = "human";
             let mut messages = Vec::new();
@@ -1587,6 +2114,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 (n, m) => format!("{n} pending changes updated, {m} refused: {}", refused[0]),
             };
             Ok(ActionReport {
+                merge_conflicts: false,
                 message,
                 results: None,
                 amend_message: None,
@@ -1596,6 +2124,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let hp = track::resolve_home_path(store, &path.to_string_lossy(), &store.dirs.home)?;
             let t = track::toggle_hide(store, &hp, is_dir, "human")?;
             Ok(ActionReport {
+                merge_conflicts: false,
                 message: t.message,
                 results: None,
                 amend_message: None,
@@ -1605,6 +2134,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let lock = store.lock()?;
             let gone = pending::drop_items(store, &lock, &[id])?;
             Ok(ActionReport {
+                merge_conflicts: false,
                 message: format!("Dropped {}: {}", gone[0].label(), gone[0].summary),
                 results: None,
                 amend_message: None,
@@ -1697,7 +2227,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             }))
         }
         ActionReq::Pull => {
-            let p = crate::remote::pull(store, None)?;
+            let p = crate::remote::pull(store, None, crate::remote::PullMode::Rebase)?;
             Ok(report(if p.commits == 0 {
                 format!("Up to date with {}", p.remote)
             } else {
@@ -1794,6 +2324,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 .filter(|r| r.status == track::Outcome::Applied)
                 .count();
             Ok(ActionReport {
+                merge_conflicts: false,
                 message: format!("Applied {applied} of {} item(s)", results.len()),
                 results: Some(results),
                 amend_message: None,
