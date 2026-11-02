@@ -328,6 +328,11 @@ fn a_tracks_the_rest_of_the_folder_and_a_second_a_untracks_or_drops_all() {
     tui.enter("skills");
 
     tui.press('a');
+    assert!(
+        tui.screen().contains("Added 2 pending items"),
+        "{}",
+        tui.screen()
+    );
     let mut got = summaries(&tui.t);
     got.sort();
     assert_eq!(
@@ -346,6 +351,21 @@ fn a_tracks_the_rest_of_the_folder_and_a_second_a_untracks_or_drops_all() {
         ["Untrack ~/skills/one (1 file)"],
         "the pending tracks are dropped, the tracked folder is untracked"
     );
+    assert!(
+        tui.screen()
+            .contains("Dropped 2 pending items, 1 untrack added"),
+        "{}",
+        tui.screen()
+    );
+}
+
+#[test]
+fn the_footer_fits_100_columns() {
+    let mut tui = open(initialised());
+    let screen = tui.screen();
+    let last = screen.lines().last().unwrap();
+    assert!(last.contains("? help") && last.contains("q quit"), "{last}");
+    assert!(last.ends_with("r refresh"), "cut off: {last}");
 }
 
 #[test]
@@ -425,7 +445,7 @@ fn v_selects_a_range_and_space_flips_every_entry_in_it() {
             .message
             .as_deref()
             .unwrap_or("")
-            .contains("3 pending changes updated"),
+            .contains("Added 2 pending items, 1 untrack added"),
         "{:?}",
         tui.app.message
     );

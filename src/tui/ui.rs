@@ -19,7 +19,8 @@ pub fn is_single_panel(area: Rect) -> bool {
     area.width < NARROW_WIDTH || area.height < SHORT_HEIGHT
 }
 
-const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · a all · m assign · t variant · V values · r refresh / Git revert";
+const FOOTER: &str =
+    " q quit · ? help · 1-5 · 0 pending · Space track · a all · m assign · V values · r refresh";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),

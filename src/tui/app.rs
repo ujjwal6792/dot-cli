@@ -2136,22 +2136,48 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
         ActionReq::Toggle(paths) => {
             let requester = "human";
             let mut messages = Vec::new();
+            let (mut tracks, mut untracks, mut dropped) = (0, 0, 0);
             let mut refused = Vec::new();
             for p in &paths {
                 let result =
                     track::resolve_home_path(store, &p.to_string_lossy(), &store.dirs.home)
                         .and_then(|hp| track::toggle(store, &hp, requester));
                 match result {
-                    Ok(t) => messages.push(t.message),
+                    Ok(t) => {
+                        match (&t.added, &t.dropped) {
+                            (Some(i), _) if matches!(i.action, pending::Action::Untrack { .. }) => {
+                                untracks += 1
+                            }
+                            (Some(_), _) => tracks += 1,
+                            (_, Some(_)) => dropped += 1,
+                            _ => {}
+                        }
+                        messages.push(t.message)
+                    }
                     Err(e) if crate::lock::is_busy(&e) => return Err(e),
                     Err(e) => refused.push(format!("{e:#}")),
                 }
             }
+            let items = |n: usize| if n == 1 { "item" } else { "items" };
+            let mut parts = Vec::new();
+            if tracks > 0 {
+                parts.push(format!("Added {tracks} pending {}", items(tracks)));
+            }
+            if dropped > 0 {
+                parts.push(format!("Dropped {dropped} pending {}", items(dropped)));
+            }
+            if untracks > 0 {
+                let s = if untracks == 1 { "untrack" } else { "untracks" };
+                parts.push(format!("{untracks} {s} added"));
+            }
+            if !refused.is_empty() {
+                parts.push(format!("{} refused: {}", refused.len(), refused[0]));
+            }
             let message = match (messages.len(), refused.len()) {
-                (_, 0) if messages.len() == 1 => messages.remove(0),
-                (n, 0) => format!("{n} pending changes updated"),
+                (1, 0) => messages.remove(0),
                 (0, _) => return Err(anyhow::anyhow!(refused.join("; "))),
-                (n, m) => format!("{n} pending changes updated, {m} refused: {}", refused[0]),
+                _ if parts.is_empty() => "No pending changes".to_string(),
+                _ => parts.join(", "),
             };
             Ok(ActionReport {
                 merge_conflicts: false,
