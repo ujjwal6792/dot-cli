@@ -634,7 +634,7 @@ delta, preview, assignment editor). Bottom-right: Pending list. `V` opens Values
 full screen. Narrow terminals show the focused panel only.
 
 Default keys (lazygit-compatible, remappable in preferences): `Space` stage/track,
-`a` stage all (in Files: track all visible entries of the folder, or untrack/drop them when all already are), `v` range select, `c` commit, `A` amend, `P` push, `p` pull,
+`a` stage all (in Files: track all visible entries of the folder, or untrack/drop them when all already are); `A` in Files drops every pending item of the folder, `v` range select, `c` commit, `A` amend, `P` push, `p` pull,
 `f` fetch, `d` discard, `e` `$EDITOR`, `o` open, `i` hide, `/` filter, `[` `]`
 tabs, `h`/`l` panels, `1`–`5` panels, `x` menu, `z` undo, `?` help, `@` command log,
 `+`/`_` screen mode, `y` copy path, `m` assign, `t` add a variant, `E` encrypt, `.` show hidden,

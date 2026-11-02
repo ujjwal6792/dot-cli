@@ -455,6 +455,25 @@ fn a_flagged_file_is_refused_with_details_and_a_second_a_still_deselects_all() {
 }
 
 #[test]
+fn shift_a_drops_all_pending_in_the_folder_and_keeps_tracked_entries() {
+    let t = initialised();
+    write(&t, "d/one", "1");
+    write(&t, "d/two", "2");
+    write(&t, "d/kept", "3");
+    t.dw_ok(&["track", "d/kept", "--apply"]);
+    let mut tui = open(t);
+    tui.enter("d");
+    tui.press('a');
+    assert_eq!(pending(&tui.t).len(), 2);
+    tui.press('A');
+    assert!(pending(&tui.t).is_empty());
+    assert!(tui.screen().contains("Dropped 2 pending items"));
+    assert!(tui.screen().contains("✓  kept"), "{}", tui.screen());
+    tui.press('A');
+    assert!(tui.screen().contains("nothing pending in this folder"));
+}
+
+#[test]
 fn a_folder_with_a_flagged_file_is_tracked_without_it() {
     let t = initialised();
     write(&t, "proj/ok.md", "fine");

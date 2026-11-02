@@ -31,7 +31,7 @@ const HELP: &[(&str, &str)] = &[
     ("j / k, ↓ / ↑", "move selection"),
     (
         "Space / a (Files)",
-        "track / untrack (pending item); a = all in this folder",
+        "track / untrack; a = all in folder, A = drop its pending",
     ),
     ("v", "Files: start / end a range selection, then Space"),
     ("m / t", "Files/Changes: assign (m), add a variant ◆ (t)"),

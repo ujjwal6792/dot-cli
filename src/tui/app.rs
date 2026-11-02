@@ -1905,11 +1905,30 @@ impl App {
         }
     }
 
+    /// `A` in Files: drop every pending item of the visible entries; adds nothing.
+    fn drop_all_pending(&mut self) {
+        let marks = self.pending_marks();
+        let paths: Vec<_> = self
+            .files
+            .visible()
+            .iter()
+            .filter(|e| marks.contains_key(&self.files.rel_of(e)))
+            .map(|e| self.files.cwd.join(&e.name))
+            .collect();
+        self.range_anchor = None;
+        if paths.is_empty() {
+            self.message = Some("nothing pending in this folder".into());
+        } else {
+            self.request_action(ActionReq::Toggle(paths));
+        }
+    }
+
     fn files_key(&mut self, key: KeyEvent) {
         let before = self.files.selected_path();
         match key.code {
             KeyCode::Char(' ') => return self.toggle_selection(),
             KeyCode::Char('a') => return self.toggle_all(),
+            KeyCode::Char('A') => return self.drop_all_pending(),
             KeyCode::Char('H') => {
                 if let Some(p) = before {
                     self.open_history(p.to_string_lossy().into_owned());
