@@ -55,10 +55,15 @@ fn hand_off<B: Backend>(
     mut h: app::Handoff,
 ) -> Result<()> {
     event::pause_input(true);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     let status = h.command.status();
     crossterm::terminal::enable_raw_mode()?;
-    crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+    crossterm::execute!(
+        std::io::stdout(),
+        crossterm::terminal::EnterAlternateScreen,
+        crossterm::event::EnableMouseCapture
+    )?;
     terminal.clear().map_err(|e| anyhow!("{e}"))?;
     event::pause_input(false);
     app.finish_handoff(h.session, status.map_err(|e| e.to_string()));
@@ -74,7 +79,9 @@ pub fn run(store: Store) -> Result<()> {
     let input = event::spawn_input(tx.clone(), Arc::clone(&stop));
     let mut app = App::new(store, rules, tx);
     let mut terminal = ratatui::init();
+    crossterm::execute!(std::io::stdout(), crossterm::event::EnableMouseCapture)?;
     let result = run_loop(&mut terminal, &mut app, &rx);
+    let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableMouseCapture);
     ratatui::restore();
     stop.store(true, Ordering::SeqCst);
     let _ = input.join();

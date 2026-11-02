@@ -12,7 +12,8 @@ use std::sync::mpsc::{Receiver, Sender, channel};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
-    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers,
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyEventState, KeyModifiers, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::Terminal;
 use ratatui::backend::TestBackend;
@@ -516,6 +517,68 @@ fn a_and_shift_a_pressed_back_to_back_each_see_the_result_of_the_one_before() {
     tui.settle();
     assert_eq!(summaries(&tui.t).len(), 2, "{}", tui.screen());
     assert!(tui.screen().contains("+ one"), "{}", tui.screen());
+}
+
+#[test]
+fn enter_on_a_commit_drills_into_its_files_and_the_diff_scrolls() {
+    let t = initialised();
+    let long: String = (0..80).map(|i| format!("line {i}\n")).collect();
+    write(&t, ".alpha", &long);
+    write(&t, ".beta", "b\n");
+    t.dw_ok(&["track", ".alpha", ".beta", "--apply"]);
+    t.dw_ok(&["commit", "-m", "two files"]);
+    write(&t, ".gamma", "g\n");
+    t.dw_ok(&["track", ".gamma", "--apply"]);
+    t.dw_ok(&["commit", "-m", "later"]);
+    let mut tui = open(t);
+    tui.press('4');
+    tui.press('j'); // "two files" (newest first: later, two files, ...)
+    let commit = tui.app.commit_selected;
+    tui.press_key(KeyCode::Enter);
+    assert_eq!(tui.app.commit_level, 1);
+    assert_eq!(tui.app.commit_files.len(), 2, "{:?}", tui.app.commit_files);
+    let screen = tui.screen();
+    assert!(
+        screen.contains("~/.alpha") && screen.contains("~/.beta"),
+        "{screen}"
+    );
+
+    tui.press('j');
+    assert_eq!(
+        tui.app.commit_selected, commit,
+        "j moves between files, not commits"
+    );
+    assert_eq!(tui.app.commit_file_selected, 1);
+    tui.press('k');
+    assert_eq!(tui.app.commit_file_selected, 0);
+
+    tui.press_key(KeyCode::Enter);
+    assert_eq!(tui.app.commit_level, 2);
+    assert_eq!(tui.app.main_scroll, 0);
+    tui.press('j');
+    tui.press('j');
+    assert_eq!(tui.app.main_scroll, 2);
+    assert_eq!(tui.app.commit_selected, commit);
+    tui.press_key(KeyCode::PageDown);
+    assert_eq!(tui.app.main_scroll, 12);
+    tui.app
+        .handle_event(Event::Input(TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: 60,
+            row: 5,
+            modifiers: KeyModifiers::NONE,
+        })));
+    assert_eq!(tui.app.main_scroll, 15, "the wheel scrolls the main view");
+
+    tui.press_key(KeyCode::Esc);
+    assert_eq!(tui.app.commit_level, 1);
+    tui.press_key(KeyCode::Esc);
+    assert_eq!(tui.app.commit_level, 0);
+    tui.press('j');
+    assert_ne!(
+        tui.app.commit_selected, commit,
+        "back on the commit list j moves commits"
+    );
 }
 
 #[test]

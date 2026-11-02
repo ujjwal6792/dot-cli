@@ -95,6 +95,8 @@ pub enum Payload {
         preview: Result<(String, String), String>,
     },
     Commits(Result<Vec<crate::history::Commit>, String>),
+    /// The files of one commit (hash first), for the Git panel drill-in.
+    CommitFiles(String, Result<Vec<(String, String)>, String>),
     Status(Result<Box<Status>, String>),
     Listing {
         dir: PathBuf,

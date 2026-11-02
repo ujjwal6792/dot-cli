@@ -160,6 +160,52 @@ pub fn diff(store: &Store, commit: &str, path: Option<&str>) -> Result<String> {
     Ok(crate::conflicts::masked(store, &out.stdout))
 }
 
+/// The files a commit changed (against its first parent) as (shown name, repository path).
+pub fn commit_files(store: &Store, commit: &str) -> Result<Vec<(String, String)>> {
+    let hash = resolve(store, commit)?;
+    let out = store.git(&[
+        "show",
+        "--first-parent",
+        "-m",
+        "--format=",
+        "--name-only",
+        "-z",
+        &hash,
+    ])?;
+    let mut files: Vec<(String, String)> = out
+        .stdout
+        .split('\0')
+        .map(|p| p.trim_start_matches('\n'))
+        .filter(|p| !p.is_empty())
+        .map(|p| {
+            let shown = crate::source::decode_source_path(&store.repo(), p)
+                .map(|(t, _)| format!("~/{t}"))
+                .unwrap_or_else(|| p.to_string());
+            (shown, p.to_string())
+        })
+        .collect();
+    files.sort();
+    files.dedup();
+    Ok(files)
+}
+
+/// The masked diff of one repository path of a commit.
+pub fn diff_file(store: &Store, commit: &str, repo_path: &str) -> Result<String> {
+    let hash = resolve(store, commit)?;
+    let out = store.git(&[
+        "--literal-pathspecs",
+        "show",
+        "--no-color",
+        "--first-parent",
+        "-m",
+        "--format=",
+        &hash,
+        "--",
+        repo_path,
+    ])?;
+    Ok(crate::conflicts::masked(store, &out.stdout))
+}
+
 /// Header lines of a commit for `dw show`.
 pub fn header(c: &Commit) -> String {
     let mut s = format!(

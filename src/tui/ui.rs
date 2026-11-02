@@ -64,7 +64,10 @@ const HELP: &[(&str, &str)] = &[
     (".", "show or hide items matched by hide rules"),
     ("r", "Git: revert (y/n); elsewhere: refresh"),
     ("Git M C X", "merge pull, continue merge, abort merge"),
-    ("Git [ ] / R", "tabs; Commits R: review historical restore"),
+    (
+        "Git [ ] R Enter",
+        "tabs; restore; Enter: files, diff (j/k scroll)",
+    ),
     (
         "Branches n Enter d D",
         "create, switch, delete, force delete (y/n)",
@@ -414,6 +417,32 @@ fn draw_panel(f: &mut Frame, app: &mut App, panel: Panel, area: Rect, expanded: 
                     List::new(rows)
                         .block(block.title(title))
                         .highlight_style(Style::default().fg(Color::Yellow))
+                        .highlight_symbol("› "),
+                    area,
+                    &mut state,
+                );
+                return;
+            }
+            if app.commit_level > 0 {
+                let short = app
+                    .commits
+                    .get(app.commit_selected)
+                    .map_or(String::new(), |c| c.short.clone());
+                let rows: Vec<String> = app.commit_files.iter().map(|f| f.0.clone()).collect();
+                let mut state = ListState::default().with_selected(Some(app.commit_file_selected));
+                let hint = if app.commit_level == 2 {
+                    "Esc back"
+                } else {
+                    "Enter diff · Esc back"
+                };
+                f.render_stateful_widget(
+                    List::new(rows)
+                        .block(block.title(format!(" 4 Git · Files of {short} · {hint} ")))
+                        .highlight_style(if app.commit_level == 1 {
+                            Style::default().fg(Color::Yellow)
+                        } else {
+                            Style::default().fg(Color::DarkGray)
+                        })
                         .highlight_symbol("› "),
                     area,
                     &mut state,
@@ -840,7 +869,18 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
             app.selected_change()
                 .map_or(" Diff ".to_string(), |c| format!(" {} ", c.path))
         };
-        return f.render_widget(Paragraph::new(body).block(block.title(title)), area);
+        let title = match app.commit_files.get(app.commit_file_selected) {
+            Some(file) if app.focus == Panel::Git && app.commit_level > 0 => {
+                format!("{title}· {} ", file.0)
+            }
+            _ => title,
+        };
+        return f.render_widget(
+            Paragraph::new(body)
+                .scroll((app.main_scroll, 0))
+                .block(block.title(title)),
+            area,
+        );
     }
     let text: String = match app.focus {
         Panel::Files => {
@@ -868,7 +908,10 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         },
     };
     f.render_widget(
-        Paragraph::new(text).wrap(Wrap { trim: false }).block(block),
+        Paragraph::new(text)
+            .wrap(Wrap { trim: false })
+            .scroll((app.main_scroll, 0))
+            .block(block),
         area,
     );
 }

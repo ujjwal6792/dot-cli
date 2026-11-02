@@ -5,7 +5,9 @@ use std::collections::{BTreeMap, BTreeSet, VecDeque};
 use std::sync::mpsc::Sender;
 use std::sync::{Arc, Mutex};
 
-use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::event::{
+    Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseEventKind,
+};
 
 use super::event::Event;
 use super::files::{self, FilesState};
@@ -441,6 +443,13 @@ pub struct App {
     pub remotes: Vec<crate::remote::RemoteInfo>,
     pub commits: Vec<crate::history::Commit>,
     pub commit_selected: usize,
+    /// Drill-in level of the Commits tab: 0 commits, 1 the commit's files, 2 the diff.
+    pub commit_level: u8,
+    /// (shown name, repository path) of the files of the selected commit.
+    pub commit_files: Vec<(String, String)>,
+    pub commit_file_selected: usize,
+    /// First line shown of the main view (diffs and previews); reset on every reload.
+    pub main_scroll: u16,
     commit_limit: usize,
     /// The file whose history the Commits tab shows (`H`); `None` is all history.
     pub commit_path: Option<String>,
@@ -500,6 +509,10 @@ impl App {
             remotes: Vec::new(),
             commits: Vec::new(),
             commit_selected: 0,
+            commit_level: 0,
+            commit_files: Vec::new(),
+            commit_file_selected: 0,
+            main_scroll: 0,
             commit_limit: 50,
             commit_path: None,
             store,
@@ -670,6 +683,7 @@ impl App {
     }
 
     fn request_preview(&mut self) {
+        self.main_scroll = 0;
         let Some(path) = self.files.selected_path() else {
             self.preview = Load::Ready(String::new());
             return;
@@ -689,6 +703,11 @@ impl App {
                 self.handle_key(key)
             }
             Event::Input(TermEvent::Resize(w, h)) => self.size = (w, h),
+            Event::Input(TermEvent::Mouse(m)) => match m.kind {
+                MouseEventKind::ScrollDown => self.scroll_main(3),
+                MouseEventKind::ScrollUp => self.scroll_main(-3),
+                _ => {}
+            },
             Event::Input(_) => {}
             Event::Job(done) => self.handle_job(done),
             Event::Tick => {
@@ -723,10 +742,20 @@ impl App {
             },
             Payload::Commits(r) => match r {
                 Ok(commits) => {
+                    let open = self
+                        .commits
+                        .get(self.commit_selected)
+                        .map(|c| c.hash.clone());
                     self.commits = commits;
                     self.commit_selected = self
                         .commit_selected
                         .min(self.commits.len().saturating_sub(1));
+                    let same =
+                        self.commits.get(self.commit_selected).map(|c| &c.hash) == open.as_ref();
+                    if self.commit_level > 0 && same {
+                        return;
+                    }
+                    self.commit_level = 0;
                     if self.focus == Panel::Git {
                         self.commit_diff();
                     }
@@ -743,6 +772,12 @@ impl App {
                     .min(self.change_rows().len().saturating_sub(1));
                 if self.focus == Panel::Changes {
                     self.request_diff();
+                }
+            }
+            Payload::CommitFiles(hash, r) => {
+                if self.commits.get(self.commit_selected).map(|c| &c.hash) == Some(&hash) {
+                    self.commit_files = r.unwrap_or_default();
+                    self.commit_file_selected = 0;
                 }
             }
             Payload::Diff(r) => {
@@ -1214,6 +1249,7 @@ impl App {
     }
 
     fn request_diff(&mut self) {
+        self.main_scroll = 0;
         let Some(c) = self.selected_change().cloned() else {
             self.diff = Load::Ready(ratatui::text::Text::default());
             return;
@@ -1450,11 +1486,20 @@ impl App {
         };
         let hash = c.hash.clone();
         let path = self.commit_path.clone();
+        let file = (self.commit_level > 0)
+            .then(|| self.commit_files.get(self.commit_file_selected))
+            .flatten()
+            .map(|f| f.1.clone());
         let store = Arc::clone(&self.store);
         self.diff = Load::Loading;
+        self.main_scroll = 0;
         self.jobs.spawn(KEY_DIFF, move |cancel| {
             use ansi_to_tui::IntoText;
-            let result = crate::history::diff(&store, &hash, path.as_deref()).and_then(|plain| {
+            let shown = match &file {
+                Some(f) => crate::history::diff_file(&store, &hash, f),
+                None => crate::history::diff(&store, &hash, path.as_deref()),
+            };
+            let result = shown.and_then(|plain| {
                 let shown = changes::through_delta(&store, &plain, Some(cancel)).unwrap_or(plain);
                 Ok(shown.into_text()?)
             });
@@ -1462,7 +1507,82 @@ impl App {
         });
     }
 
+    /// Enter on a commit: list its files and focus the list.
+    fn open_commit_files(&mut self) {
+        let Some(c) = self.commits.get(self.commit_selected) else {
+            return;
+        };
+        let hash = c.hash.clone();
+        self.commit_level = 1;
+        self.commit_files.clear();
+        self.commit_file_selected = 0;
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn("commit-files", move |_| {
+            let files = crate::history::commit_files(&store, &hash).map_err(|e| format!("{e:#}"));
+            Payload::CommitFiles(hash, files)
+        });
+        self.commit_diff();
+    }
+
+    /// Number of lines in the main view's current text, to bound scrolling.
+    fn main_lines(&self) -> usize {
+        match (self.focus, &self.diff, &self.preview) {
+            (Panel::Changes | Panel::Git, Load::Ready(t), _) => t.lines.len(),
+            (Panel::Files, _, Load::Ready(t)) => t.lines().count() + 3,
+            _ => 0,
+        }
+    }
+
+    pub fn scroll_main(&mut self, delta: isize) {
+        let last = self.main_lines().saturating_sub(1);
+        self.main_scroll = self
+            .main_scroll
+            .saturating_add_signed(delta.clamp(-1000, 1000) as i16)
+            .min(last as u16);
+    }
+
+    /// j/k/PgUp/PgDn/Home/End while the diff of a commit file has focus.
+    fn commit_diff_key(&mut self, key: KeyEvent) {
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => self.scroll_main(1),
+            KeyCode::Char('k') | KeyCode::Up => self.scroll_main(-1),
+            KeyCode::PageDown => self.scroll_main(10),
+            KeyCode::PageUp => self.scroll_main(-10),
+            KeyCode::Char('<') | KeyCode::Home => self.main_scroll = 0,
+            KeyCode::Char('>') | KeyCode::End => self.scroll_main(isize::MAX),
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => self.commit_level = 1,
+            _ => {}
+        }
+    }
+
+    /// j/k/Enter/Esc while the files of a commit have focus.
+    fn commit_files_key(&mut self, key: KeyEvent) {
+        let last = self.commit_files.len().saturating_sub(1);
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                self.commit_file_selected = (self.commit_file_selected + 1).min(last);
+                self.commit_diff();
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                self.commit_file_selected = self.commit_file_selected.saturating_sub(1);
+                self.commit_diff();
+            }
+            KeyCode::Enter | KeyCode::Char('l') | KeyCode::Right => self.commit_level = 2,
+            KeyCode::Esc | KeyCode::Char('h') | KeyCode::Left => {
+                self.commit_level = 0;
+                self.commit_diff();
+            }
+            _ => {}
+        }
+    }
+
     fn git_key(&mut self, key: KeyEvent) {
+        if self.git_tab == 0 && self.commit_level == 2 {
+            return self.commit_diff_key(key);
+        }
+        if self.git_tab == 0 && self.commit_level == 1 {
+            return self.commit_files_key(key);
+        }
         match key.code {
             KeyCode::Char('[') | KeyCode::Char(']') => {
                 let n = GIT_TABS.len();
@@ -1559,7 +1679,7 @@ impl App {
                 self.commit_selected = self.commit_selected.saturating_sub(1);
                 self.commit_diff();
             }
-            KeyCode::Enter => self.commit_diff(),
+            KeyCode::Enter => self.open_commit_files(),
             KeyCode::Char('r') => {
                 if let Some(c) = self.commits.get(self.commit_selected) {
                     self.dialog = Some(Dialog::ConfirmRevert(c.hash.clone()));
