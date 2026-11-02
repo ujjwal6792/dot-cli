@@ -1781,6 +1781,296 @@ pub(crate) fn state_restore(store: &Store, backup: Option<Vec<u8>>) -> Result<()
     }
 }
 
+/// Items a review can apply together: plain file tracking, untracking and hide rules.
+fn batchable(item: &Item) -> bool {
+    matches!(
+        item.action,
+        Action::Track { .. }
+            | Action::Untrack { .. }
+            | Action::HideAdd { .. }
+            | Action::HideRemove { .. }
+    )
+}
+
+/// Apply the effects of `items` with one chezmoi `add` run, one write of the
+/// data file and one `git add`, and return the repository paths staged for each
+/// item (as `exec_item` would have). Any error leaves a partial state for the
+/// caller to roll back.
+fn exec_batch(store: &Store, ctx: &Ctx, items: &[&Item]) -> Result<Vec<Vec<String>>> {
+    let repo = store.repo();
+    let home = &store.dirs.home;
+    let mut rels: BTreeSet<&str> = BTreeSet::new();
+    for item in items {
+        if let Action::Track { files, .. } = &item.action {
+            for f in files {
+                if ctx.rules.is_hidden(&home.join(&f.path), false) {
+                    bail!("~/{} is hidden by a hide rule", f.path);
+                }
+                if !f.symlink {
+                    rels.insert(f.path.as_str());
+                }
+            }
+        }
+    }
+    let rels: Vec<String> = rels.into_iter().map(String::from).collect();
+    let found = crate::detect::inspect(store, &rels)?;
+    let mut plain: BTreeSet<&str> = BTreeSet::new();
+    for item in items {
+        if let Action::Track { files, .. } = &item.action {
+            plain.extend(
+                files
+                    .iter()
+                    .map(|f| f.path.as_str())
+                    .filter(|p| !found.iter().any(|x| x.rel == *p)),
+            );
+        }
+    }
+    let plain: Vec<&str> = plain.into_iter().collect();
+    for chunk in plain.chunks(CHUNK) {
+        let mut args: Vec<std::ffi::OsString> = vec!["add".into(), "--secrets=ignore".into()];
+        args.extend(chunk.iter().map(|p| home.join(p).into()));
+        store.chezmoi_locked(&args)?;
+    }
+
+    let mut expected: Vec<BTreeSet<String>> = items.iter().map(|i| expected_sources(i)).collect();
+    let mut extras: Vec<Vec<String>> = vec![Vec::new(); items.len()];
+    let mut taken = crate::detect::taken(store);
+    for (n, item) in items.iter().enumerate() {
+        let Action::Track { files, .. } = &item.action else {
+            continue;
+        };
+        for f in found
+            .iter()
+            .filter(|f| files.iter().any(|t| t.path == f.rel))
+        {
+            let san = crate::detect::sanitize(store, f, &mut taken)?;
+            crate::detect::write_extra(store, &san.extra)?;
+            extras[n].extend(san.extra.iter().map(|(r, _)| r.clone()));
+            crate::detect::add_sanitized(store, &f.rel, &san.bytes)?;
+            for c in item.preview.files.iter().filter(|c| c.target == f.rel) {
+                expected[n].remove(&c.source);
+                expected[n].insert(format!("{}.tmpl", c.source));
+            }
+        }
+    }
+
+    // Data file: tracked folders recorded or forgotten, assignments removed.
+    let mut folders = source::read_folders(&repo)?;
+    let before = folders.clone();
+    let mut keys: BTreeSet<&String> = BTreeSet::new();
+    for item in items {
+        match &item.action {
+            Action::Track {
+                path,
+                record_folder: true,
+                ..
+            } => {
+                folders.insert(path.clone());
+            }
+            Action::Untrack {
+                forget_folders,
+                assignments,
+                ..
+            } => {
+                for f in forget_folders {
+                    folders.remove(f);
+                }
+                keys.extend(assignments);
+            }
+            _ => {}
+        }
+    }
+    let mut touches_data = vec![false; items.len()];
+    for (n, item) in items.iter().enumerate() {
+        touches_data[n] = match &item.action {
+            Action::Track { record_folder, .. } => *record_folder,
+            Action::Untrack {
+                forget_folders,
+                assignments,
+                variants,
+                ..
+            } => !forget_folders.is_empty() || !assignments.is_empty() || !variants.is_empty(),
+            _ => false,
+        };
+    }
+
+    let root = repo.join(source::source_root(&repo));
+    for item in items {
+        match &item.action {
+            Action::Untrack {
+                files, variants, ..
+            } => {
+                crate::variants::remove_all(store, variants)?;
+                for t in files {
+                    let entry = ctx
+                        .tracked
+                        .files
+                        .get(t)
+                        .with_context(|| format!("~/{t} is no longer tracked"))?;
+                    let file = repo.join(&entry.source);
+                    fs::remove_file(&file)
+                        .with_context(|| format!("removing {}", file.display()))?;
+                    let mut dir = file.parent();
+                    while let Some(d) = dir {
+                        if d == root || !d.starts_with(&root) || fs::remove_dir(d).is_err() {
+                            break;
+                        }
+                        dir = d.parent();
+                    }
+                }
+            }
+            Action::HideAdd { pattern } => hide::add_rule(&repo, pattern)?,
+            Action::HideRemove { pattern } => hide::remove_rule(&repo, pattern)?,
+            _ => {}
+        }
+    }
+    if folders != before {
+        source::write_folders(&repo, &folders)?;
+    }
+    if !keys.is_empty() {
+        crate::repo::edit_data(&repo, |doc| {
+            let dw = crate::repo::dotwarden_table(doc)?;
+            if let Some(t) = dw.get_mut("assignments").and_then(|a| a.as_table_mut()) {
+                for k in &keys {
+                    t.remove(k);
+                }
+            }
+            Ok(())
+        })?;
+    }
+
+    let want: BTreeSet<String> = expected.iter().flatten().cloned().collect();
+    let mut optional: Vec<&str> = vec![DATA_FILE, hide::HIDE_FILE];
+    optional.extend(extras.iter().flatten().map(String::as_str));
+    let staged: BTreeSet<String> = verify_and_stage(store, &want, &optional)?
+        .into_iter()
+        .collect();
+    Ok(items
+        .iter()
+        .enumerate()
+        .map(|(n, item)| {
+            let mut mine: BTreeSet<String> = expected[n].iter().cloned().collect();
+            mine.extend(extras[n].iter().cloned());
+            if touches_data[n] {
+                mine.insert(DATA_FILE.to_string());
+            }
+            if matches!(
+                item.action,
+                Action::HideAdd { .. } | Action::HideRemove { .. }
+            ) {
+                mine.insert(hide::HIDE_FILE.to_string());
+            }
+            mine.into_iter().filter(|p| staged.contains(p)).collect()
+        })
+        .collect())
+}
+
+/// Apply a run of batchable items as one transaction; when it fails, roll back
+/// and apply the items one by one so each failure is attributed to its item.
+fn apply_run(store: &Store, lock: &Lock, run: &[Item], out: &mut Vec<ItemResult>) -> Result<()> {
+    ensure_repo_clean(store)?;
+    let ctx = Ctx::load(store)?;
+    let mut slots: Vec<Option<ItemResult>> = Vec::new();
+    let mut live: Vec<usize> = Vec::new();
+    for (n, item) in run.iter().enumerate() {
+        match stale_reason(store, &ctx, item)? {
+            Some(reason) => slots.push(Some(item_result(
+                item,
+                Outcome::Stale,
+                Some(reason),
+                vec![],
+            ))),
+            None => {
+                slots.push(None);
+                live.push(n);
+            }
+        }
+    }
+    let mut batched = false;
+    if live.len() >= 2 {
+        let items: Vec<&Item> = live.iter().map(|n| &run[*n]).collect();
+        let tree = index_tree(store)?;
+        let backup = state_backup(store)?;
+        match exec_batch(store, &ctx, &items) {
+            Ok(staged) => {
+                let mut tracked_now: Vec<String> = Vec::new();
+                for ((n, item), staged) in live.iter().zip(&items).zip(staged) {
+                    let mut r = item_result(item, Outcome::Applied, None, staged);
+                    match &item.action {
+                        Action::Untrack { files, .. } => r.forgotten = files.clone(),
+                        Action::Track { files, .. } => tracked_now
+                            .extend(files.iter().filter(|f| !f.symlink).map(|f| f.path.clone())),
+                        _ => {}
+                    }
+                    slots[*n] = Some(r);
+                }
+                if !tracked_now.is_empty() {
+                    // Detection only proposes; a failure here must not fail the apply.
+                    let _ = crate::values::propose_wires(store, lock, &tracked_now);
+                }
+                batched = true;
+            }
+            Err(_) => {
+                if let Err(re) = rollback(store, &tree) {
+                    bail!(
+                        "ROLLBACK FAILED ({re:#}); run `git reset --hard` and `git clean -fd` in {}",
+                        store.repo().display()
+                    );
+                }
+                state_restore(store, backup)
+                    .context("chezmoi's state could not be restored after a failed batch")?;
+            }
+        }
+    }
+    if !batched {
+        for n in live {
+            slots[n] = apply_items(store, lock, std::slice::from_ref(&run[n]))?.pop();
+        }
+    }
+    out.extend(slots.into_iter().flatten());
+    Ok(())
+}
+
+fn item_result(
+    item: &Item,
+    status: Outcome,
+    message: Option<String>,
+    staged: Vec<String>,
+) -> ItemResult {
+    ItemResult {
+        id: item.id,
+        kind: item.action.kind_name(),
+        summary: item.summary.clone(),
+        status,
+        message,
+        staged,
+        forgotten: Vec::new(),
+    }
+}
+
+/// Apply `items` in order under one lock: runs of track, untrack and hide items
+/// go through one transaction, the rest one at a time. Results are appended to
+/// `out` as they are known, so a caller can act on them after an error.
+fn apply_review(
+    store: &Store,
+    lock: &Lock,
+    items: &[Item],
+    out: &mut Vec<ItemResult>,
+) -> Result<()> {
+    let mut i = 0;
+    while i < items.len() {
+        let len = items[i..].iter().take_while(|it| batchable(it)).count();
+        if len >= 2 {
+            apply_run(store, lock, &items[i..i + len], out)?;
+            i += len;
+        } else {
+            out.extend(apply_items(store, lock, &items[i..=i])?);
+            i += 1;
+        }
+    }
+    Ok(())
+}
+
 /// Apply `items` in order, each all-or-nothing. A stale item is skipped and a
 /// failed one is rolled back (repository and chezmoi state); the others still
 /// apply. The caller holds the lock.
@@ -1932,8 +2222,8 @@ pub fn cleanup_state(store: &Store, results: &[ItemResult]) -> Vec<String> {
 }
 
 /// Apply stored items by id (all when `ids` is `None`), removing those that
-/// applied from the list. The lock is taken per item, so a long batch never
-/// blocks other commands for longer than its largest item.
+/// applied from the list. The lock is held once for the whole review, which
+/// applies the selected items as one transaction (see [`apply_run`]).
 pub fn apply_pending(store: &Store, ids: Option<&[u64]>) -> Result<Vec<ItemResult>> {
     let list = pending::load(store)?;
     let chosen: Vec<u64> = match ids {
@@ -1950,19 +2240,24 @@ pub fn apply_pending(store: &Store, ids: Option<&[u64]>) -> Result<Vec<ItemResul
         }
     };
     let mut results = Vec::new();
-    for id in chosen {
-        let lock = store.lock()?;
-        let Some(item) = pending::load(store)?.get(id).cloned() else {
-            continue; // dropped by someone else meanwhile
-        };
-        let mut r = apply_items(store, &lock, std::slice::from_ref(&item))?;
-        if r.iter().any(|x| x.status == Outcome::Applied) {
-            pending::drop_items(store, &lock, &[id])?;
-        }
-        results.append(&mut r);
-        drop(lock);
-        crate::lock::yield_to_waiters();
+    let lock = store.lock()?;
+    let list = pending::load(store)?;
+    // Items someone else dropped meanwhile are skipped.
+    let items: Vec<Item> = chosen
+        .iter()
+        .filter_map(|id| list.get(*id).cloned())
+        .collect();
+    let outcome = apply_review(store, &lock, &items, &mut results);
+    let applied: Vec<u64> = results
+        .iter()
+        .filter(|r| r.status == Outcome::Applied)
+        .filter_map(|r| r.id)
+        .collect();
+    if !applied.is_empty() {
+        pending::drop_items(store, &lock, &applied)?;
     }
+    drop(lock);
+    outcome?;
     let warnings = cleanup_state(store, &results);
     attach_warnings(&mut results, warnings);
     Ok(results)
@@ -1978,15 +2273,13 @@ fn attach_warnings(results: &mut [ItemResult], warnings: Vec<String>) {
     }
 }
 
-/// Apply freshly planned items immediately without storing them (lock per item).
+/// Apply freshly planned items immediately without storing them (one lock, one transaction).
 pub fn apply_now(store: &Store, items: &[Item]) -> Result<Vec<ItemResult>> {
     let mut results = Vec::new();
-    for item in items {
-        let lock = store.lock()?;
-        results.append(&mut apply_items(store, &lock, std::slice::from_ref(item))?);
-        drop(lock);
-        crate::lock::yield_to_waiters();
-    }
+    let lock = store.lock()?;
+    let outcome = apply_review(store, &lock, items, &mut results);
+    drop(lock);
+    outcome?;
     let warnings = cleanup_state(store, &results);
     attach_warnings(&mut results, warnings);
     Ok(results)

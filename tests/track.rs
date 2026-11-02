@@ -1569,7 +1569,7 @@ fn slow_planning_does_not_block_other_commands() {
 }
 
 #[test]
-fn a_batch_releases_the_lock_between_items() {
+fn a_waiting_command_proceeds_once_the_review_is_applied() {
     let t = setup();
     for f in [".a", ".b", ".c"] {
         write(&t, f, f);
@@ -1589,7 +1589,8 @@ fn a_batch_releases_the_lock_between_items() {
             .unwrap()
     });
     std::thread::sleep(std::time::Duration::from_millis(400));
-    // The batch needs ~4.5 s; with the lock held throughout this would time out.
+    // The review is one transaction (~1.5 s of chezmoi): the lock is held until it
+    // is done, and the waiting commands then go through instead of timing out.
     let started = std::time::Instant::now();
     let r = dw_with(
         &t,
@@ -1721,19 +1722,46 @@ fn an_edit_with_the_same_size_and_restored_mtime_makes_the_item_stale() {
     assert_eq!(git_status(&t), "");
 }
 
-/// A libexec whose chezmoi appends a line to `log` per run, then runs the real one.
-fn counting_libexec(t: &TestEnv, log: &std::path::Path) -> std::path::PathBuf {
+/// A libexec whose chezmoi and git append their name to `log` per run, then run
+/// the real ones. A chezmoi `add` that names a path ending in `fail_on` exits 1.
+fn counting_libexec(t: &TestEnv, log: &std::path::Path, fail_on: &str) -> std::path::PathBuf {
     let fake = t.root.path().join("counting-libexec");
-    fs::create_dir_all(&fake).unwrap();
-    let _ = symlink(common::libexec().join("git"), fake.join("git"));
-    let script = format!(
-        "#!/bin/sh\necho run >> {}\nexec {} \"$@\"\n",
-        log.display(),
-        common::libexec().join("chezmoi").display()
+    let real = common::libexec();
+    fs::create_dir_all(fake.join("git/bin")).unwrap();
+    for d in ["libexec", "share", "etc"] {
+        let _ = symlink(real.join("git").join(d), fake.join("git").join(d));
+    }
+    let _ = symlink(real.join("delta"), fake.join("delta"));
+    let sh = |path: std::path::PathBuf, body: String| {
+        fs::write(&path, body).unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o755)).unwrap();
+    };
+    sh(
+        fake.join("chezmoi"),
+        format!(
+            "#!/bin/sh\necho chezmoi >> {log}\nif [ \"$(printf %s \"$*\" | grep -c ' add ')\" != 0 ] && [ -n \"{fail}\" ]; then\n\
+             for a in \"$@\"; do case \"$a\" in *{fail}) echo \"boom: cannot add $a\" >&2; exit 1;; esac; done\nfi\n\
+             exec {real}/chezmoi \"$@\"\n",
+            log = log.display(),
+            fail = fail_on,
+            real = real.display()
+        ),
     );
-    fs::write(fake.join("chezmoi"), script).unwrap();
-    fs::set_permissions(fake.join("chezmoi"), fs::Permissions::from_mode(0o755)).unwrap();
+    sh(
+        fake.join("git/bin/git"),
+        format!(
+            "#!/bin/sh\necho git >> {}\nexec {}/git/bin/git \"$@\"\n",
+            log.display(),
+            real.display()
+        ),
+    );
     fake
+}
+
+fn spawns(log: &std::path::Path) -> (usize, usize) {
+    let text = fs::read_to_string(log).unwrap_or_default();
+    let n = |w: &str| text.lines().filter(|l| *l == w).count();
+    (n("chezmoi"), n("git"))
 }
 
 #[test]
@@ -1745,7 +1773,7 @@ fn tracking_many_folders_runs_chezmoi_a_bounded_number_of_times() {
         }
     }
     let log = t.root.path().join("chezmoi.log");
-    let fake = counting_libexec(&t, &log);
+    let fake = counting_libexec(&t, &log, "");
     let dirs: Vec<String> = (0..20).map(|d| format!("skills/d{d}")).collect();
     let mut args = vec!["track"];
     args.extend(dirs.iter().map(String::as_str));
@@ -1757,4 +1785,82 @@ fn tracking_many_folders_runs_chezmoi_a_bounded_number_of_times() {
         "100 files in 20 folders took {runs} chezmoi runs"
     );
     assert_eq!(pending_ids(&t).len(), 20);
+}
+
+#[test]
+fn applying_a_review_runs_a_bounded_number_of_chezmoi_and_git_processes() {
+    let t = setup();
+    for d in 0..10 {
+        for f in 0..5 {
+            write(&t, &format!("skills/d{d}/f{f}.md"), &format!("{d}-{f}"));
+        }
+    }
+    let dirs: Vec<String> = (0..10).map(|d| format!("skills/d{d}")).collect();
+    let mut args = vec!["track"];
+    args.extend(dirs.iter().map(String::as_str));
+    ok(&t, &args);
+    let log = t.root.path().join("apply.log");
+    let fake = counting_libexec(&t, &log, "");
+    let r = dw_with(
+        &t,
+        &[("DOTWARDEN_LIBEXEC", fake.to_str().unwrap())],
+        &["pending", "apply", "--all"],
+    );
+    assert_eq!(r.code, 0, "{}{}", r.err, r.out);
+    assert_eq!(managed(&t).len(), 50);
+    let (chezmoi, git) = spawns(&log);
+    assert!(chezmoi <= 2, "10 items took {chezmoi} chezmoi runs");
+    assert!(git <= 12, "10 items took {git} git runs");
+    assert!(pending_ids(&t).is_empty());
+}
+
+#[test]
+fn a_failing_item_in_a_review_is_retried_alone_and_named() {
+    let t = setup();
+    for f in [".a", ".b", ".c"] {
+        write(&t, f, f);
+    }
+    ok(&t, &["track", ".a", ".b", ".c"]);
+    let log = t.root.path().join("fail.log");
+    let fake = counting_libexec(&t, &log, "/.b");
+    let r = dw_with(
+        &t,
+        &[("DOTWARDEN_LIBEXEC", fake.to_str().unwrap())],
+        &["pending", "apply", "--all", "--json"],
+    );
+    assert_ne!(r.code, 0, "{}{}", r.err, r.out);
+    let j = r.json();
+    let results = j["applied"].as_array().expect("applied");
+    let by = |s: &str| {
+        results
+            .iter()
+            .find(|x| x["summary"].as_str().unwrap().ends_with(s))
+            .unwrap_or_else(|| panic!("no result for {s}: {j}"))
+            .clone()
+    };
+    assert_eq!(by("~/.a")["status"], "applied");
+    assert_eq!(by("~/.c")["status"], "applied");
+    let b = by("~/.b");
+    assert_eq!(b["status"], "failed");
+    assert!(b["message"].as_str().unwrap().contains("/.b"), "{b}");
+    assert_eq!(
+        managed(&t),
+        BTreeSet::from([".a".to_string(), ".c".to_string()])
+    );
+    assert_eq!(
+        pending_ids(&t).len(),
+        1,
+        "only the failed item stays pending"
+    );
+    let status = t.git(
+        &t.dirs().repo(),
+        &["status", "--porcelain", "--untracked-files=all"],
+    );
+    assert!(
+        status
+            .lines()
+            .all(|l| l.starts_with("A ") || l.starts_with("M ")),
+        "partial state left behind:\n{status}"
+    );
+    assert!(!status.contains("dot_b"), "{status}");
 }

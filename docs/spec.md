@@ -591,7 +591,9 @@ one-time human confirmation that the remote is private, stored per remote in
 - Track, untrack, assign, encrypt, variant and value-metadata changes are added to
   the **pending list**, persisted in `pending.json` and shared by CLI and TUI. Each
   item shows exactly what will change (files, rules, data). One review applies
-  the selected items; items can be dropped. Stage/unstage/commit are immediate
+  the selected items as one transaction (one lock, one chezmoi `add`, one data
+  write, one `git add`); on failure it is rolled back and the items are retried
+  individually. Items can be dropped. Stage/unstage/commit are immediate
   (lazygit behaviour); `z` undoes.
 - Agents (CLI without an interactive human approval) may: inspect anything except
   secret values; track, untrack, stage, unstage, assign, commit; add secret
