@@ -6,7 +6,7 @@
 //! repository is reset to it when anything fails. The result is staged in git
 //! (`git add`); committing belongs to the change model.
 
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ffi::OsStr;
 use std::fs;
 use std::os::unix::fs::MetadataExt;
@@ -647,8 +647,12 @@ fn preview_add(store: &Store, files: &[TrackFile]) -> Result<Vec<FileChange>> {
     let repo = store.repo();
     let mut out = Vec::new();
     for chunk in files.chunks(CHUNK) {
-        let mut args: Vec<std::ffi::OsString> =
-            vec!["add".into(), "--dry-run".into(), "--verbose".into()];
+        let mut args: Vec<std::ffi::OsString> = vec![
+            "add".into(),
+            "--secrets=ignore".into(),
+            "--dry-run".into(),
+            "--verbose".into(),
+        ];
         args.extend(chunk.iter().map(|f| store.dirs.home.join(&f.path).into()));
         let o = store.chezmoi(&args)?;
         for (source, is_dir) in parse_dry_run(&o.stdout)? {
@@ -693,8 +697,73 @@ fn plural(n: usize, one: &str, many: &str) -> String {
     format!("{n} {}", if n == 1 { one } else { many })
 }
 
+/// Everything planning a track needs before chezmoi is asked for the preview.
+struct TrackPrep {
+    folder: bool,
+    record_folder: bool,
+    files: Vec<TrackFile>,
+    summary: String,
+    notes: Vec<String>,
+}
+
 /// Plan tracking `hp`: a file, a symlink or a folder.
 pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> Result<Item> {
+    let prep = prepare_track(store, ctx, hp)?;
+    let changes = preview_add(store, &prep.files)?;
+    finish_track(store, ctx, hp, requester, prep, changes)
+}
+
+/// Plan tracking every path with one chezmoi preview for all of them (chezmoi
+/// starts slowly, so one run per folder dominates). Each result is what
+/// `plan_track` would give for that path alone; a failed combined preview falls
+/// back to per-path previews so errors stay attributed to their path.
+pub fn plan_track_many(
+    store: &Store,
+    ctx: &Ctx,
+    hps: &[&HomePath],
+    requester: &str,
+) -> Vec<Result<Item>> {
+    let preps: Vec<Result<TrackPrep>> =
+        hps.iter().map(|hp| prepare_track(store, ctx, hp)).collect();
+    let all: Vec<TrackFile> = preps
+        .iter()
+        .flatten()
+        .flat_map(|p| p.files.iter().cloned())
+        .collect();
+    let combined = if all.is_empty() {
+        None
+    } else {
+        preview_add(store, &all).ok()
+    };
+    // target -> index into `combined`
+    let by_target: Option<HashMap<&str, usize>> = combined.as_ref().map(|c| {
+        c.iter()
+            .enumerate()
+            .map(|(i, f)| (f.target.as_str(), i))
+            .collect()
+    });
+    hps.iter()
+        .zip(preps)
+        .map(|(hp, prep)| {
+            let prep = prep?;
+            let changes = match (&combined, &by_target) {
+                (Some(c), Some(idx)) => {
+                    let mut own: Vec<FileChange> = prep
+                        .files
+                        .iter()
+                        .filter_map(|f| idx.get(f.path.as_str()).map(|i| c[*i].clone()))
+                        .collect();
+                    own.sort_by(|a, b| a.source.cmp(&b.source));
+                    own
+                }
+                _ => preview_add(store, &prep.files)?,
+            };
+            finish_track(store, ctx, hp, requester, prep, changes)
+        })
+        .collect()
+}
+
+fn prepare_track(store: &Store, ctx: &Ctx, hp: &HomePath) -> Result<TrackPrep> {
     let meta = fs::symlink_metadata(&hp.abs)
         .map_err(|_| refuse(format!("~/{} does not exist", hp.rel)))?;
     let is_dir = meta.is_dir();
@@ -821,7 +890,30 @@ pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> R
             f.rel
         ));
     }
-    let changes = preview_add(store, &files)?;
+    Ok(TrackPrep {
+        folder,
+        record_folder,
+        files,
+        summary,
+        notes,
+    })
+}
+
+fn finish_track(
+    store: &Store,
+    ctx: &Ctx,
+    hp: &HomePath,
+    requester: &str,
+    prep: TrackPrep,
+    changes: Vec<FileChange>,
+) -> Result<Item> {
+    let TrackPrep {
+        folder,
+        record_folder,
+        files,
+        summary,
+        notes,
+    } = prep;
     let want: BTreeSet<&str> = files.iter().map(|f| f.path.as_str()).collect();
     let got: BTreeSet<&str> = changes.iter().map(|c| c.target.as_str()).collect();
     if want != got {
@@ -1018,9 +1110,20 @@ pub fn plan_paths(
     let ctx = Ctx::load(store)?;
     let mut items: Vec<Item> = Vec::new();
     let mut errors: Vec<(Kind, String)> = Vec::new();
-    for arg in args {
-        let result = resolve_home_path(store, arg, cwd).and_then(|hp| match plan {
-            Plan::Track => plan_track(store, &ctx, &hp, requester),
+    let resolved: Vec<Result<HomePath>> = args
+        .iter()
+        .map(|arg| resolve_home_path(store, arg, cwd))
+        .collect();
+    let mut tracked = match plan {
+        Plan::Track => {
+            let hps: Vec<&HomePath> = resolved.iter().flatten().collect();
+            plan_track_many(store, &ctx, &hps, requester).into_iter()
+        }
+        Plan::Untrack => Vec::new().into_iter(),
+    };
+    for hp in resolved {
+        let result = hp.and_then(|hp| match plan {
+            Plan::Track => tracked.next().expect("one plan per resolved path"),
             Plan::Untrack => plan_untrack(store, &ctx, &hp, requester),
         });
         match result {
@@ -1058,8 +1161,8 @@ fn covers(path: &str, rel: &str) -> bool {
 
 /// A pending track/untrack item for a folder above `rel` or for something below
 /// it: toggling `rel` would overlap it.
-fn overlapping_item<'a>(list: &'a pending::List, rel: &str) -> Option<&'a Item> {
-    list.items.iter().find(|i| match &i.action {
+fn overlapping_item<'a>(items: &'a [Item], rel: &str) -> Option<&'a Item> {
+    items.iter().find(|i| match &i.action {
         Action::Track { path, .. } | Action::Untrack { path, .. } => {
             covers(path, rel) || covers(rel, path)
         }
@@ -1067,8 +1170,8 @@ fn overlapping_item<'a>(list: &'a pending::List, rel: &str) -> Option<&'a Item> 
     })
 }
 
-fn same_path_item<'a>(list: &'a pending::List, rel: &str) -> Option<&'a Item> {
-    list.items.iter().find(|i| {
+fn same_path_item<'a>(items: &'a [Item], rel: &str) -> Option<&'a Item> {
+    items.iter().find(|i| {
         matches!(&i.action, Action::Track { path, .. } | Action::Untrack { path, .. } if path == rel)
     })
 }
@@ -1089,84 +1192,190 @@ pub fn stale_checker<'a>(store: &'a Store, ctx: &'a Ctx) -> impl Fn(&Item) -> bo
 /// inside one) is refused instead of added. Planning, which runs chezmoi,
 /// happens before the lock is taken; freshness is re-checked inside it.
 pub fn toggle(store: &Store, hp: &HomePath, requester: &str) -> Result<Toggled> {
+    toggle_many(store, std::slice::from_ref(hp), requester)?.remove(0)
+}
+
+/// [`toggle`] for many paths at once: the pending list and repository state are
+/// read once, chezmoi previews all new tracks in one run, and the pending list
+/// is written once. Each path gets its own result, as if toggled in order; an
+/// `Err` for the whole call is a busy lock or an unreadable pending list.
+pub fn toggle_many(
+    store: &Store,
+    hps: &[HomePath],
+    requester: &str,
+) -> Result<Vec<Result<Toggled>>> {
+    let mut results: Vec<Option<Result<Toggled>>> = hps.iter().map(|_| None).collect();
+    let mut todo: Vec<usize> = (0..hps.len()).collect();
     for _ in 0..3 {
+        if todo.is_empty() {
+            break;
+        }
         let list = pending::load(store)?;
-        let decision = if let Some(existing) = same_path_item(&list, &hp.rel) {
-            Decision::Drop(existing.id.expect("stored"))
-        } else {
-            if let Some(o) = overlapping_item(&list, &hp.rel) {
-                return Err(refuse(format!(
-                    "~/{} overlaps pending item {} ({}); drop that item first",
-                    hp.rel,
-                    o.label(),
-                    o.summary
-                )));
+        let ctx = Ctx::load(store)?;
+        // Items pending in the list plus those this batch has decided to add.
+        let mut work: Vec<Item> = list.items.clone();
+        let mut decisions: Vec<(usize, Decision)> = Vec::new();
+        let mut tracks: Vec<usize> = Vec::new(); // positions in `decisions` awaiting a plan
+        for &i in &todo {
+            let hp = &hps[i];
+            if let Some(existing) = same_path_item(&work, &hp.rel) {
+                match existing.id {
+                    Some(id) => decisions.push((i, Decision::Drop(id))),
+                    None => {
+                        results[i] = Some(Ok(Toggled {
+                            message: format!("Already pending as {}", existing.summary),
+                            ..Toggled::default()
+                        }))
+                    }
+                }
+                continue;
             }
-            let ctx = Ctx::load(store)?;
+            if let Some(o) = overlapping_item(&work, &hp.rel) {
+                results[i] = Some(Err(overlap_error(hp, o)));
+                continue;
+            }
             let is_dir = fs::symlink_metadata(&hp.abs).is_ok_and(|m| m.is_dir());
             let untrack = if is_dir {
                 ctx.tracked.folders.contains(&hp.rel) || ctx.tracked.under(&hp.rel).next().is_some()
             } else {
                 ctx.tracked.is_tracked(&hp.rel)
             };
-            Decision::Add(Box::new(if untrack {
-                plan_untrack(store, &ctx, hp, requester)?
+            if untrack {
+                match plan_untrack(store, &ctx, hp, requester) {
+                    Ok(item) => {
+                        work.push(item.clone());
+                        decisions.push((i, Decision::Add(Box::new(item))));
+                    }
+                    Err(e) => results[i] = Some(Err(e)),
+                }
             } else {
-                plan_track(store, &ctx, hp, requester)?
-            }))
-        };
+                tracks.push(decisions.len());
+                // Placeholder, replaced once the batch preview is in.
+                decisions.push((i, Decision::Drop(0)));
+            }
+        }
+        let track_hps: Vec<&HomePath> = tracks.iter().map(|d| &hps[decisions[*d].0]).collect();
+        let planned = plan_track_many(store, &ctx, &track_hps, requester);
+        let mut keep: Vec<(usize, Decision)> = Vec::new();
+        let mut planned = planned.into_iter();
+        let mut next_track = tracks.iter().peekable();
+        for (pos, (i, d)) in decisions.into_iter().enumerate() {
+            if next_track.peek() == Some(&&pos) {
+                next_track.next();
+                match planned.next().expect("one plan per track") {
+                    Ok(item) => {
+                        // An earlier add in this batch may now overlap this one.
+                        if let Some(o) = overlapping_item(&work, &hps[i].rel) {
+                            results[i] = Some(Err(overlap_error(&hps[i], o)));
+                        } else {
+                            work.push(item.clone());
+                            keep.push((i, Decision::Add(Box::new(item))));
+                        }
+                    }
+                    Err(e) => results[i] = Some(Err(e)),
+                }
+            } else {
+                keep.push((i, d));
+            }
+        }
+
         let lock = store.lock()?;
         let list = pending::load(store)?;
-        match decision {
-            Decision::Drop(id) => {
-                if list.get(id).is_none() {
-                    return Ok(Toggled {
-                        message: format!("#{id} was already dropped"),
-                        ..Toggled::default()
-                    });
+        let ctx = Ctx::load(store)?;
+        let mut drop_ids: Vec<u64> = Vec::new();
+        let mut drop_at: Vec<(usize, u64)> = Vec::new();
+        let mut adds: Vec<(usize, Item)> = Vec::new();
+        let mut retry: Vec<usize> = Vec::new();
+        let mut live: Vec<Item> = list.items.clone();
+        for (i, d) in keep {
+            let hp = &hps[i];
+            match d {
+                Decision::Drop(id) => {
+                    if list.get(id).is_none() {
+                        results[i] = Some(Ok(Toggled {
+                            message: format!("#{id} was already dropped"),
+                            ..Toggled::default()
+                        }));
+                    } else if !drop_ids.contains(&id) {
+                        drop_ids.push(id);
+                        drop_at.push((i, id));
+                    }
                 }
-                let mut gone = pending::drop_items(store, &lock, &[id])?;
-                let item = gone.remove(0);
-                return Ok(Toggled {
+                Decision::Add(item) => {
+                    if let Some(same) = same_path_item(&live, &hp.rel) {
+                        results[i] = Some(Ok(Toggled {
+                            message: format!(
+                                "Already pending as {}: {}",
+                                same.label(),
+                                same.summary
+                            ),
+                            ..Toggled::default()
+                        }));
+                        continue;
+                    }
+                    if let Some(o) = overlapping_item(&live, &hp.rel) {
+                        results[i] = Some(Err(overlap_error(hp, o)));
+                        continue;
+                    }
+                    match stale_reason(store, &ctx, &item) {
+                        Err(e) => results[i] = Some(Err(e)),
+                        Ok(Some(_)) => retry.push(i), // the world moved while planning
+                        Ok(None) => {
+                            live.push((*item).clone());
+                            adds.push((i, *item));
+                        }
+                    }
+                }
+            }
+        }
+        if !drop_ids.is_empty() {
+            let gone = pending::drop_items(store, &lock, &drop_ids)?;
+            for (i, id) in drop_at {
+                let item = gone
+                    .iter()
+                    .find(|g| g.id == Some(id))
+                    .expect("dropped")
+                    .clone();
+                results[i] = Some(Ok(Toggled {
                     message: format!("Dropped {}: {}", item.label(), item.summary),
                     dropped: Some(item),
                     added: None,
-                });
-            }
-            Decision::Add(item) => {
-                if let Some(same) = same_path_item(&list, &hp.rel) {
-                    return Ok(Toggled {
-                        message: format!("Already pending as {}: {}", same.label(), same.summary),
-                        ..Toggled::default()
-                    });
-                }
-                if let Some(o) = overlapping_item(&list, &hp.rel) {
-                    return Err(refuse(format!(
-                        "~/{} overlaps pending item {} ({}); drop that item first",
-                        hp.rel,
-                        o.label(),
-                        o.summary
-                    )));
-                }
-                let ctx = Ctx::load(store)?;
-                if stale_reason(store, &ctx, &item)?.is_some() {
-                    continue; // the world moved while planning: plan again
-                }
-                let check = stale_checker(store, &ctx);
-                let mut added = pending::add(store, &lock, vec![*item], &check)?;
-                let item = added.remove(0).item;
-                return Ok(Toggled {
-                    message: format!("Added {}: {}", item.label(), item.summary),
-                    added: Some(item),
-                    dropped: None,
-                });
+                }));
             }
         }
+        if !adds.is_empty() {
+            let check = stale_checker(store, &ctx);
+            let items: Vec<Item> = adds.iter().map(|(_, it)| it.clone()).collect();
+            let added = pending::add(store, &lock, items, &check)?;
+            for ((i, _), a) in adds.iter().zip(added) {
+                results[*i] = Some(Ok(Toggled {
+                    message: format!("Added {}: {}", a.item.label(), a.item.summary),
+                    added: Some(a.item),
+                    dropped: None,
+                }));
+            }
+        }
+        todo = retry;
     }
-    Err(refuse(format!(
-        "~/{} kept changing while it was being planned; try again",
-        hp.rel
-    )))
+    for i in todo {
+        results[i] = Some(Err(refuse(format!(
+            "~/{} kept changing while it was being planned; try again",
+            hps[i].rel
+        ))));
+    }
+    Ok(results
+        .into_iter()
+        .map(|r| r.expect("every path has a result"))
+        .collect())
+}
+
+fn overlap_error(hp: &HomePath, o: &Item) -> anyhow::Error {
+    refuse(format!(
+        "~/{} overlaps pending item {} ({}); drop that item first",
+        hp.rel,
+        o.label(),
+        o.summary
+    ))
 }
 
 /// `i` in the TUI: hide the path with an anchored rule through a pending item;
@@ -1411,7 +1620,8 @@ fn exec_item(store: &Store, ctx: &Ctx, item: &Item) -> Result<Vec<String>> {
                 .filter(|f| !found.iter().any(|x| x.rel == f.path))
                 .collect();
             for chunk in plain.chunks(CHUNK) {
-                let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
+                let mut args: Vec<std::ffi::OsString> =
+                    vec!["add".into(), "--secrets=ignore".into()];
                 args.extend(chunk.iter().map(|f| home.join(&f.path).into()));
                 store.chezmoi_locked(&args)?;
             }
@@ -1686,8 +1896,19 @@ pub fn cleanup_state(store: &Store, results: &[ItemResult]) -> Vec<String> {
             cur = parent;
         }
     }
-    let keys: Vec<String> = keys.into_iter().collect();
     let mut warnings = Vec::new();
+    // Deleting needs a chezmoi run per key: skip keys that have no record.
+    let recorded = match crate::changes::last_written(store) {
+        Ok(m) => m,
+        Err(e) => {
+            warnings.push(format!("could not clean chezmoi's state: {e:#}"));
+            return warnings;
+        }
+    };
+    let keys: Vec<String> = keys
+        .into_iter()
+        .filter(|k| recorded.contains_key(&store.dirs.home.join(k).to_string_lossy().into_owned()))
+        .collect();
     for chunk in keys.chunks(25) {
         let done = (|| -> Result<()> {
             let _lock = store.lock()?;

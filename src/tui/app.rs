@@ -2370,10 +2370,21 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let mut messages = Vec::new();
             let (mut tracks, mut untracks, mut dropped) = (0, 0, 0);
             let mut refused = Vec::new();
+            let mut hps = Vec::new();
+            let mut origin = Vec::new();
             for p in &paths {
-                let result =
-                    track::resolve_home_path(store, &p.to_string_lossy(), &store.dirs.home)
-                        .and_then(|hp| track::toggle(store, &hp, requester));
+                match track::resolve_home_path(store, &p.to_string_lossy(), &store.dirs.home) {
+                    Ok(hp) => {
+                        hps.push(hp);
+                        origin.push(p);
+                    }
+                    Err(e) => refused.push((p.clone(), format!("{e:#}"))),
+                }
+            }
+            for (p, result) in origin
+                .into_iter()
+                .zip(track::toggle_many(store, &hps, requester)?)
+            {
                 match result {
                     Ok(t) => {
                         match (&t.added, &t.dropped) {
@@ -2386,7 +2397,6 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                         }
                         messages.push(t.message)
                     }
-                    Err(e) if crate::lock::is_busy(&e) => return Err(e),
                     Err(e) => refused.push((p.clone(), format!("{e:#}"))),
                 }
             }

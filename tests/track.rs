@@ -1720,3 +1720,41 @@ fn an_edit_with_the_same_size_and_restored_mtime_makes_the_item_stale() {
     assert_eq!(r.code, 7, "{}", r.out);
     assert_eq!(git_status(&t), "");
 }
+
+/// A libexec whose chezmoi appends a line to `log` per run, then runs the real one.
+fn counting_libexec(t: &TestEnv, log: &std::path::Path) -> std::path::PathBuf {
+    let fake = t.root.path().join("counting-libexec");
+    fs::create_dir_all(&fake).unwrap();
+    let _ = symlink(common::libexec().join("git"), fake.join("git"));
+    let script = format!(
+        "#!/bin/sh\necho run >> {}\nexec {} \"$@\"\n",
+        log.display(),
+        common::libexec().join("chezmoi").display()
+    );
+    fs::write(fake.join("chezmoi"), script).unwrap();
+    fs::set_permissions(fake.join("chezmoi"), fs::Permissions::from_mode(0o755)).unwrap();
+    fake
+}
+
+#[test]
+fn tracking_many_folders_runs_chezmoi_a_bounded_number_of_times() {
+    let t = setup();
+    for d in 0..20 {
+        for f in 0..5 {
+            write(&t, &format!("skills/d{d}/f{f}.md"), &format!("{d}-{f}"));
+        }
+    }
+    let log = t.root.path().join("chezmoi.log");
+    let fake = counting_libexec(&t, &log);
+    let dirs: Vec<String> = (0..20).map(|d| format!("skills/d{d}")).collect();
+    let mut args = vec!["track"];
+    args.extend(dirs.iter().map(String::as_str));
+    let r = dw_with(&t, &[("DOTWARDEN_LIBEXEC", fake.to_str().unwrap())], &args);
+    assert_eq!(r.code, 0, "{}{}", r.err, r.out);
+    let runs = fs::read_to_string(&log).unwrap().lines().count();
+    assert!(
+        runs <= 3,
+        "100 files in 20 folders took {runs} chezmoi runs"
+    );
+    assert_eq!(pending_ids(&t).len(), 20);
+}

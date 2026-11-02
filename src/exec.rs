@@ -80,6 +80,27 @@ impl Drain {
     }
 }
 
+/// With `DOTWARDEN_TRACE_EXEC` set, every external run is logged to stderr with
+/// its duration, to find where time goes.
+struct Trace(Option<(String, Instant)>);
+
+impl Trace {
+    fn start(cmd: &Command) -> Self {
+        Self(std::env::var_os("DOTWARDEN_TRACE_EXEC").map(|_| {
+            let d = describe(cmd);
+            (d.chars().take(100).collect(), Instant::now())
+        }))
+    }
+}
+
+impl Drop for Trace {
+    fn drop(&mut self) {
+        if let Some((d, t)) = &self.0 {
+            eprintln!("exec {:>7.1}ms {d}", t.elapsed().as_secs_f64() * 1e3);
+        }
+    }
+}
+
 /// Run `cmd` to completion, capturing output. When `cancel` fires the child is
 /// killed and an error is returned. stdin is closed. Returns shortly after the
 /// child exits even if a grandchild keeps its output pipes open.
@@ -95,6 +116,7 @@ pub fn run_with_input(
     cancel: Option<&CancelToken>,
 ) -> Result<Output> {
     let desc = format!("{:?}", cmd.get_program());
+    let _trace = Trace::start(&cmd);
     let mut child = cmd
         .stdin(if input.is_some() {
             Stdio::piped()

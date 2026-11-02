@@ -603,7 +603,8 @@ pub(crate) fn stage_with(
         let mut results = Vec::new();
         let mut run = || -> Result<()> {
             for chunk in files.chunks(CHUNK) {
-                let mut args: Vec<std::ffi::OsString> = vec!["add".into()];
+                let mut args: Vec<std::ffi::OsString> =
+                    vec!["add".into(), "--secrets=ignore".into()];
                 args.extend(chunk.iter().map(|f| store.dirs.home.join(f).into()));
                 store.chezmoi_locked(&args)?;
             }
@@ -802,19 +803,9 @@ pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<D
     let tree = track::index_tree(store)?;
     let backup = track::state_backup(store)?;
     let run = || -> Result<()> {
-        let in_head = |p: &str| {
-            git_literal(
-                store,
-                &[
-                    "cat-file".as_ref(),
-                    "-e".as_ref(),
-                    format!("HEAD:{p}").as_ref(),
-                ],
-            )
-            .is_ok()
-        };
+        let in_head = head_paths(store, &sources);
         let (present, gone): (Vec<&String>, Vec<&String>) =
-            sources.iter().partition(|p| in_head(p));
+            sources.iter().partition(|p| in_head.contains(p.as_str()));
         fn paths<'a>(v: &[&'a String]) -> Vec<&'a OsStr> {
             v.iter().map(|p| OsStr::new(p.as_str())).collect()
         }
@@ -851,6 +842,32 @@ pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<D
     Ok(done)
 }
 
+/// Which of `paths` exist in HEAD, from a few `ls-tree` runs rather than a
+/// `cat-file` per path. Without a commit none do.
+fn head_paths(store: &Store, paths: &[String]) -> BTreeSet<String> {
+    let mut found = BTreeSet::new();
+    for chunk in paths.chunks(CHUNK) {
+        let mut args: Vec<&OsStr> = vec![
+            "ls-tree".as_ref(),
+            "-r".as_ref(),
+            "-z".as_ref(),
+            "--name-only".as_ref(),
+            "HEAD".as_ref(),
+            "--".as_ref(),
+        ];
+        args.extend(chunk.iter().map(|p| OsStr::new(p.as_str())));
+        if let Ok(o) = git_literal(store, &args) {
+            found.extend(
+                o.stdout
+                    .split('\0')
+                    .filter(|p| !p.is_empty())
+                    .map(String::from),
+            );
+        }
+    }
+    found
+}
+
 /// Put chezmoi's last-written record of each target back to the committed
 /// version (or drop it for files that are no longer tracked), so the file shows
 /// as Local rather than Incoming.
@@ -859,8 +876,14 @@ pub(crate) fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> R
         return Ok(());
     }
     let committed = self::targets(store)?;
+    // `chezmoi state set/delete` takes one key per run, so only touch records
+    // that are not already as wanted.
+    let dump = store.chezmoi(&["state", "dump", "--format", "json"])?;
+    let dump: Value = serde_json::from_str(&dump.stdout).context("reading chezmoi state")?;
+    let current = dump["entryState"].as_object();
     for rel in targets {
         let key = store.dirs.home.join(rel).to_string_lossy().into_owned();
+        let existing = current.and_then(|m| m.get(&key));
         match committed.get(*rel) {
             Some(t) => {
                 let value = if t.link {
@@ -868,6 +891,9 @@ pub(crate) fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> R
                 } else {
                     serde_json::json!({"type": "file", "mode": t.perm, "contentsSHA256": t.sha()})
                 };
+                if existing == Some(&value) {
+                    continue;
+                }
                 store.chezmoi_locked(&[
                     "state".to_string(),
                     "set".into(),
@@ -876,6 +902,7 @@ pub(crate) fn restore_last_written(store: &Store, targets: &BTreeSet<&str>) -> R
                     format!("--value={value}"),
                 ])?;
             }
+            None if existing.is_none() => {}
             None => {
                 store.chezmoi_locked(&[
                     "state".to_string(),
