@@ -436,10 +436,14 @@ pub fn stage_cmd(
     stage: bool,
     paths: &[String],
     all: bool,
+    by: &crate::hunks::Selection,
     dry_run: bool,
     json: bool,
 ) -> Result<ExitCode> {
     let verb = if stage { "stage" } else { "unstage" };
+    if !(by.hunks.is_empty() && by.lines.is_empty()) {
+        return hunks_stage_cmd(store, stage, paths, by, dry_run, json);
+    }
     let sel = home_selectors(store, paths, all, verb)?;
     let done = if stage {
         changes::stage(store, sel.as_deref(), dry_run)?
@@ -463,6 +467,66 @@ pub fn stage_cmd(
         }
         for n in &done.notes {
             println!("{n}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+fn hunks_stage_cmd(
+    store: &Store,
+    stage: bool,
+    paths: &[String],
+    by: &crate::hunks::Selection,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let [path] = paths else {
+        return Err(DwError::new(Kind::Usage, "--hunk and --line take exactly one file").into());
+    };
+    let rel = track::resolve_home_path(store, path, &cwd()?)?.rel;
+    let side = if stage {
+        crate::hunks::Side::Stage
+    } else {
+        crate::hunks::Side::Unstage
+    };
+    let done = crate::hunks::apply(store, &rel, side, by, None, dry_run)?;
+    if json {
+        print_json(&done)?;
+    } else {
+        let tense = match (dry_run, stage) {
+            (true, true) => "would stage",
+            (true, false) => "would unstage",
+            (false, true) => "staged",
+            (false, false) => "unstaged",
+        };
+        println!("{tense} {} changed line(s) of {}", done.lines, done.path);
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn hunks_cmd(store: &Store, path: &str, staged: bool, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let rel = track::resolve_home_path(store, path, &cwd()?)?.rel;
+    let side = if staged {
+        crate::hunks::Side::Unstage
+    } else {
+        crate::hunks::Side::Stage
+    };
+    let view = crate::hunks::open(store, &rel, side)?;
+    if json {
+        return print_json(&view).map(|_| ExitCode::SUCCESS);
+    }
+    if let Some(why) = &view.readonly {
+        println!("read-only: {why}");
+    }
+    for h in &view.hunks {
+        println!("hunk {} {}", h.number, h.header);
+        for l in &h.lines {
+            match l.id {
+                Some(id) => println!("{id:>5} {}{}", l.tag, l.text),
+                None => println!("      {}{}", l.tag, l.text),
+            }
         }
     }
     Ok(ExitCode::SUCCESS)
