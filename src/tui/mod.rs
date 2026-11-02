@@ -5,6 +5,7 @@ pub mod app;
 pub mod event;
 pub mod files;
 pub mod jobs;
+pub mod log;
 pub mod ui;
 
 use std::sync::Arc;

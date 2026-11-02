@@ -174,6 +174,7 @@ fn git_stash_confirmation_lists_home_and_round_trips() {
             .unwrap_or("")
             .contains("changed since preview")
     );
+    tui.send(KeyCode::Esc, KeyModifiers::NONE);
     fs::write(tui.t.home.join(".a"), "two\n").unwrap();
     tui.press('s');
     tui.press('y');

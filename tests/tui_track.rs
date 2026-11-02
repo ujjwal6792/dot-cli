@@ -403,6 +403,96 @@ fn a_folder_preview_lists_what_the_browser_would_list() {
 }
 
 #[test]
+fn a_flagged_file_is_refused_with_details_and_a_second_a_still_deselects_all() {
+    const PLANTED: &str = "Zx9Qw3Er7Ty1Ui5Op2As8Df4Gh6Jk0Lz";
+    let t = initialised();
+    write(&t, "skills/notes.md", "n");
+    write(&t, "skills/one/SKILL.md", "1");
+    write(
+        &t,
+        "skills/leak.txt",
+        &format!("x\ntoken = \"{PLANTED}\"\n"),
+    );
+    let mut tui = open(t);
+    tui.enter("skills");
+
+    tui.press('a');
+    let got = summaries(&tui.t);
+    assert_eq!(got.len(), 2, "{got:?}");
+    assert!(!got.iter().any(|s| s.contains("leak")), "{got:?}");
+    let screen = tui.screen();
+    assert!(
+        screen.contains("Added 2 pending items, 1 refused"),
+        "{screen}"
+    );
+    assert!(
+        screen.contains("leak.txt") && screen.contains("line 2, TOKEN"),
+        "details dialog:\n{screen}"
+    );
+    assert!(screen.contains("tui.log"), "{screen}");
+    assert!(!screen.contains(PLANTED), "{screen}");
+
+    tui.press_key(KeyCode::Esc);
+    assert!(tui.app.dialog.is_none());
+    tui.press('a');
+    assert!(
+        pending(&tui.t).is_empty(),
+        "the refused entry does not block deselecting: {:?}",
+        summaries(&tui.t)
+    );
+
+    let log = tui.t.dirs().state_dir().join("tui.log");
+    let text = fs::read_to_string(&log).unwrap();
+    assert!(
+        text.contains("leak.txt") && text.contains("line 2, TOKEN"),
+        "{text}"
+    );
+    assert!(!text.contains(PLANTED), "the log never holds a value");
+    assert_eq!(
+        fs::metadata(&log).unwrap().permissions().mode() & 0o777,
+        0o600
+    );
+}
+
+#[test]
+fn a_folder_with_a_flagged_file_is_tracked_without_it() {
+    let t = initialised();
+    write(&t, "proj/ok.md", "fine");
+    write(
+        &t,
+        "proj/bad.env",
+        "password = \"Zx9Qw3Er7Ty1Ui5Op2As8Df4Gh6Jk0Lz\"\n",
+    );
+    let mut tui = open(t);
+    tui.select("proj");
+    tui.press(' ');
+    let items = pending(&tui.t);
+    assert_eq!(items.len(), 1);
+    let text = items[0].to_string();
+    assert!(
+        text.contains("Track folder ~/proj (1 file, 1 skipped"),
+        "{text}"
+    );
+    assert!(
+        text.contains("skipped: possible secret in ~/proj/bad.env (line 1, PASSWORD)"),
+        "{text}"
+    );
+    assert!(text.contains("dw vault init"), "{text}");
+    assert!(!text.contains("Zx9Qw3"), "{text}");
+
+    let (code, out) = cli(&tui.t, &["track", "proj/bad.env"]);
+    assert_ne!(code, 0);
+    assert!(
+        out.contains("bad.env") && out.contains("line 1, PASSWORD"),
+        "{out}"
+    );
+    assert!(
+        !out.contains("appear(s)") && !out.contains("Zx9Qw3"),
+        "{out}"
+    );
+}
+
+#[test]
 fn hidden_entries_are_refused_with_the_reason_in_the_footer() {
     let t = initialised();
     write(&t, ".cache/x", "c");
@@ -767,6 +857,7 @@ fn space_never_creates_an_item_that_overlaps_a_pending_folder_item() {
     let msg = tui.app.message.clone().unwrap_or_default();
     assert!(msg.contains("overlaps pending item #1"), "{msg}");
     assert_eq!(pending(&tui.t).len(), 2, "no overlapping item was added");
+    tui.press_key(KeyCode::Esc);
     // The folder above a pending file item.
     tui.press('h');
     tui.select("e");
@@ -774,6 +865,7 @@ fn space_never_creates_an_item_that_overlaps_a_pending_folder_item() {
     let msg = tui.app.message.clone().unwrap_or_default();
     assert!(msg.contains("overlaps pending item #2"), "{msg}");
     assert_eq!(pending(&tui.t).len(), 2);
+    tui.press_key(KeyCode::Esc);
     // The folder item itself still toggles off.
     tui.select("d");
     tui.press(' ');

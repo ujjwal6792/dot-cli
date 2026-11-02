@@ -994,6 +994,15 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             ));
             (" Result ", l)
         }
+        Dialog::Details { text, .. } => {
+            let mut l: Vec<Line> = text.lines().map(|t| Line::from(t.to_string())).collect();
+            l.push(Line::from(""));
+            l.push(Line::styled(
+                "j / k scroll · Esc or Enter closes",
+                Style::default().fg(Color::Yellow),
+            ));
+            (" Details ", l)
+        }
         Dialog::Commit(b) => {
             let mut l: Vec<Line> = b
                 .text
@@ -1143,7 +1152,20 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
         ),
     };
     let w = area.width.saturating_sub(4).min(90);
-    let h = (lines.len() as u16 + 2).min(area.height.saturating_sub(2));
+    let rows = if matches!(dialog, Dialog::Details { .. }) {
+        let inner = usize::from(w.saturating_sub(2).max(1));
+        lines
+            .iter()
+            .map(|l| l.width().div_ceil(inner).max(1))
+            .sum::<usize>()
+    } else {
+        lines.len()
+    };
+    let scroll = match dialog {
+        Dialog::Details { scroll, .. } => *scroll,
+        _ => 0,
+    };
+    let h = (rows as u16 + 2).min(area.height.saturating_sub(2));
     let rect = Rect {
         x: area.x + area.width.saturating_sub(w) / 2,
         y: area.y + area.height.saturating_sub(h) / 2,
@@ -1154,6 +1176,7 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
     f.render_widget(
         Paragraph::new(lines)
             .wrap(Wrap { trim: false })
+            .scroll((scroll, 0))
             .block(Block::default().borders(Borders::ALL).title(title)),
         rect,
     );

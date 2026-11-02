@@ -58,6 +58,7 @@ Machine-local (never committed):
 | `$XDG_STATE_HOME/dotwarden/snapshots/` | Snapshots (0700) |
 | `$XDG_STATE_HOME/dotwarden/pending.json` | Pending list, shared by CLI and TUI |
 | `$XDG_STATE_HOME/dotwarden/activity.jsonl` | Local activity log (no values) |
+| `$XDG_STATE_HOME/dotwarden/tui.log` | TUI action errors and refusals with timestamps (0600, trimmed to ~64 KB; paths, lines and hints only, never values) |
 | `$XDG_STATE_HOME/dotwarden/machine.toml` | This machine's registry name and remote-privacy confirmations |
 | `~/.config/dotwarden/config.toml` | Preferences: an ordinary, trackable dotfile |
 
@@ -568,7 +569,11 @@ one-time human confirmation that the remote is private, stored per remote in
   the secret scanner, produce a pending item proposing: create/update secret and
   replace the value with a reference. When HOME holds a different value at a
   reference position, the change is shown as "secret NAME changed"; staging it
-  updates the vault (requires unlock) and keeps the reference.
+  updates the vault (requires unlock) and keeps the reference. Without a vault,
+  tracking a single flagged file is refused (message: file, line, hint, never the
+  value); tracking a folder tracks its clean files and lists the flagged ones as
+  "skipped: possible secret" in the item (they stay New). Assignments whose value
+  is code, an env var name, a placeholder or a plain word are not flagged.
 - **Masking**: no CLI output, diff, log, pending item, activity record or preview
   ever contains a secret value. When locked, lines of HOME that correspond to
   reference positions are hidden in diffs.

@@ -403,6 +403,11 @@ pub enum Dialog {
     ConfirmRevert(String),
     /// `m`: the assignment editor.
     Assign(AssignEditor),
+    /// The full text of a failure or of refusals; j/k scroll, Esc or Enter closes.
+    Details {
+        text: String,
+        scroll: u16,
+    },
 }
 
 #[derive(Debug)]
@@ -443,6 +448,9 @@ pub struct App {
     /// One-line feedback shown in the footer until the next key press.
     pub message: Option<String>,
     pub dialog: Option<Dialog>,
+    /// Paths in the current folder that a toggle refused in this session; `a`
+    /// does not wait for them. Cleared whenever the listing reloads.
+    refused_paths: BTreeSet<std::path::PathBuf>,
     /// Active tab of the Changes panel (index into [`TABS`]) and the row in it.
     pub changes_tab: usize,
     pub changes_selected: usize,
@@ -506,6 +514,7 @@ impl App {
             machine_preview: None,
             hide_stamp: None,
             actions: VecDeque::new(),
+            refused_paths: BTreeSet::new(),
             action_running: false,
             last_fetch: None,
         }
@@ -633,6 +642,7 @@ impl App {
     }
 
     fn reload_listing(&mut self, reselect: Option<std::ffi::OsString>) {
+        self.refused_paths.clear();
         self.files.begin_load(reselect);
         self.preview = Load::Ready(String::new());
         let dir = self.files.cwd.clone();
@@ -809,6 +819,10 @@ impl App {
                             self.changes_selected = 0;
                         }
                         self.message = Some(report.message);
+                        self.refused_paths.extend(report.refused);
+                        if let Some(detail) = report.detail {
+                            self.show_details(detail);
+                        }
                         if let Some(text) = report.amend_message {
                             self.dialog = Some(Dialog::Commit(CommitBox { text, amend: true }));
                         }
@@ -816,7 +830,13 @@ impl App {
                             self.dialog = Some(Dialog::Result(results));
                         }
                     }
-                    Err(e) => self.message = Some(e),
+                    Err(e) => {
+                        if e.starts_with("Busy:") {
+                            self.message = Some(e);
+                        } else {
+                            self.show_details(e);
+                        }
+                    }
                 }
                 self.reload_values();
                 self.refresh_commits();
@@ -838,6 +858,18 @@ impl App {
                 }
             }
         }
+    }
+
+    /// Log a failure, show it in full in a dialog and keep a short summary in the footer.
+    fn show_details(&mut self, text: String) {
+        let state = self.store.dirs.state_dir();
+        super::log::append(&state, &text);
+        let first = text.lines().next().unwrap_or_default();
+        let short: String = first.chars().take(80).collect();
+        let more = if short.len() < first.len() { "…" } else { "" };
+        self.message = Some(format!("{short}{more} (details open)"));
+        let text = format!("{text}\n\nlog: {}", super::log::path(&state));
+        self.dialog = Some(Dialog::Details { text, scroll: 0 });
     }
 
     fn set_pending(&mut self, list: List) {
@@ -1018,6 +1050,18 @@ impl App {
                     _ => {}
                 }
                 self.dialog = Some(Dialog::Assign(e));
+            }
+            Some(Dialog::Details { text, scroll }) => {
+                let last = text.lines().count().saturating_sub(1) as u16;
+                let scroll = match key.code {
+                    KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => return,
+                    KeyCode::Char('j') | KeyCode::Down => (scroll + 1).min(last),
+                    KeyCode::Char('k') | KeyCode::Up => scroll.saturating_sub(1),
+                    KeyCode::PageDown => (scroll + 10).min(last),
+                    KeyCode::PageUp => scroll.saturating_sub(10),
+                    _ => scroll,
+                };
+                self.dialog = Some(Dialog::Details { text, scroll });
             }
             Some(Dialog::Result(_)) | None => {}
         }
@@ -1831,7 +1875,9 @@ impl App {
         let marks = self.pending_marks();
         let settled = |e: &files::Entry| {
             let rel = self.files.rel_of(e);
-            marks.contains_key(&rel)
+            e.hidden
+                || self.refused_paths.contains(&self.files.cwd.join(&e.name))
+                || marks.contains_key(&rel)
                 || !matches!(
                     self.tracked.state_of(&rel, e.is_dir),
                     crate::source::TrackState::New | crate::source::TrackState::Untracked
@@ -1847,7 +1893,7 @@ impl App {
         };
         let rest = paths_of(&|e| !settled(e));
         let paths = if rest.is_empty() {
-            paths_of(&|e| !e.hidden)
+            paths_of(&|e| !e.hidden && !self.refused_paths.contains(&self.files.cwd.join(&e.name)))
         } else {
             rest
         };
@@ -1949,6 +1995,8 @@ fn report(message: String) -> ActionReport {
         message,
         results: None,
         amend_message: None,
+        detail: None,
+        refused: Vec::new(),
     }
 }
 
@@ -2155,7 +2203,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                         messages.push(t.message)
                     }
                     Err(e) if crate::lock::is_busy(&e) => return Err(e),
-                    Err(e) => refused.push(format!("{e:#}")),
+                    Err(e) => refused.push((p.clone(), format!("{e:#}"))),
                 }
             }
             let items = |n: usize| if n == 1 { "item" } else { "items" };
@@ -2171,19 +2219,30 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 parts.push(format!("{untracks} {s} added"));
             }
             if !refused.is_empty() {
-                parts.push(format!("{} refused: {}", refused.len(), refused[0]));
+                parts.push(format!("{} refused", refused.len()));
             }
             let message = match (messages.len(), refused.len()) {
                 (1, 0) => messages.remove(0),
-                (0, _) => return Err(anyhow::anyhow!(refused.join("; "))),
+                (0, 1) => return Err(anyhow::anyhow!(refused.remove(0).1)),
                 _ if parts.is_empty() => "No pending changes".to_string(),
                 _ => parts.join(", "),
             };
+            let detail = (!refused.is_empty()).then(|| {
+                let mut d = format!("{}:", message);
+                for (p, why) in &refused {
+                    let rel = p.strip_prefix(&store.dirs.home).unwrap_or(p).display();
+                    d.push_str(&format!("\n~/{rel}: {why}"));
+                }
+                d
+            });
+            let refused: Vec<_> = refused.into_iter().map(|(p, _)| p).collect();
             Ok(ActionReport {
                 merge_conflicts: false,
                 message,
                 results: None,
                 amend_message: None,
+                detail,
+                refused,
             })
         }
         ActionReq::Hide(path, is_dir) => {
@@ -2194,6 +2253,8 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 message: t.message,
                 results: None,
                 amend_message: None,
+                detail: None,
+                refused: Vec::new(),
             })
         }
         ActionReq::Drop(id) => {
@@ -2204,6 +2265,8 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 message: format!("Dropped {}: {}", gone[0].label(), gone[0].summary),
                 results: None,
                 amend_message: None,
+                detail: None,
+                refused: Vec::new(),
             })
         }
         ActionReq::Stage(sel) => {
@@ -2394,6 +2457,8 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 message: format!("Applied {applied} of {} item(s)", results.len()),
                 results: Some(results),
                 amend_message: None,
+                detail: None,
+                refused: Vec::new(),
             })
         }
     }

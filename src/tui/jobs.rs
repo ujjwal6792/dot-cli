@@ -74,6 +74,10 @@ pub struct ActionReport {
     pub results: Option<Vec<ItemResult>>,
     /// The last commit message, to open the amend box with.
     pub amend_message: Option<String>,
+    /// The full text of refusals, one per line, for the details dialog.
+    pub detail: Option<String>,
+    /// Paths a toggle refused.
+    pub refused: Vec<std::path::PathBuf>,
 }
 
 /// Branches, stashes and remotes for the Git panel tabs.

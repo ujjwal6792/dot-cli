@@ -705,7 +705,7 @@ pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> R
         )));
     }
     let mut notes = Vec::new();
-    let (folder, record_folder, files, summary) = if is_dir {
+    let (folder, record_folder, mut files, mut summary) = if is_dir {
         let walk = walk_folder(&store.dirs.home, &hp.rel, &ctx.rules, None)?;
         let total = walk.files.len();
         let files: Vec<TrackFile> = walk
@@ -781,6 +781,35 @@ pub fn plan_track(store: &Store, ctx: &Ctx, hp: &HomePath, requester: &str) -> R
             hp.rel
         )));
     };
+    let rels: Vec<String> = files
+        .iter()
+        .filter(|f| !f.symlink)
+        .map(|f| f.path.clone())
+        .collect();
+    // Without a vault a folder is tracked without its flagged files; they show
+    // as New and wait for `dw vault init`. A single file is refused instead.
+    if folder && !crate::vault::exists(store) {
+        let found = crate::detect::found_in(store, &rels);
+        if !found.is_empty() {
+            files.retain(|f| !found.iter().any(|x| x.rel == f.path));
+            if files.is_empty() && !record_folder {
+                return Err(refuse(crate::detect::no_vault_message(&found)));
+            }
+            for f in &found {
+                notes.push(format!(
+                    "skipped: possible secret in ~/{} ({}); run `dw vault init` to track it",
+                    f.rel,
+                    f.where_text()
+                ));
+            }
+            summary = format!(
+                "Track folder ~/{} ({}, {} skipped: possible secret)",
+                hp.rel,
+                plural(files.len(), "file", "files"),
+                found.len()
+            );
+        }
+    }
     let rels: Vec<String> = files
         .iter()
         .filter(|f| !f.symlink)

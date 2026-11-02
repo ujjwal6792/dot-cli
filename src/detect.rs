@@ -52,7 +52,7 @@ fn assignment() -> &'static Regex {
     static R: OnceLock<Regex> = OnceLock::new();
     R.get_or_init(|| {
         Regex::new(
-            r#"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|credential|private[_-]?key)[a-z0-9_.-]*)\s*[=:]\s*["']?([^\s"'#]{8,})"#,
+            r#"(?i)\b([a-z0-9_.-]*(?:password|passwd|secret|token|api[_-]?key|credential|private[_-]?key)[a-z0-9_.-]*)\s*[=:]\s*(["']?)([^\s"'#]{8,})"#,
         )
         .expect("valid pattern")
     })
@@ -94,6 +94,91 @@ fn hint_from_key(key: &str) -> String {
     if h.is_empty() { "SECRET".into() } else { h }
 }
 
+fn is_identifier_path(v: &str) -> bool {
+    static R: OnceLock<Regex> = OnceLock::new();
+    let re = R.get_or_init(|| {
+        Regex::new(r"^[A-Za-z_$][A-Za-z0-9_$]*(\[\w+\])*(\.[A-Za-z_$][A-Za-z0-9_$]*(\[\w+\])*)*$")
+            .expect("valid")
+    });
+    !v.starts_with("eyJ") && (v.contains('.') || v.contains('[')) && re.is_match(v)
+}
+
+fn is_env_name(v: &str) -> bool {
+    v.starts_with(|c: char| c.is_ascii_uppercase())
+        && v.chars()
+            .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit() || c == '_')
+        && (v.contains('_') || !v.chars().any(|c| c.is_ascii_digit()))
+}
+
+fn is_placeholder(v: &str) -> bool {
+    let l = v.to_ascii_lowercase();
+    let run = v
+        .as_bytes()
+        .windows(8)
+        .any(|w| w.iter().all(|b| *b == w[0]));
+    run || (v.contains('<') && v.contains('>'))
+        || l.starts_with("your")
+        || l.starts_with("xxx")
+        || l.ends_with("here")
+        || l.contains("***")
+        || l.contains("changeme")
+        || l.contains("example")
+        || l.contains('…')
+        || l.contains("placeholder")
+}
+
+/// A filesystem path (a reference to a file, not a secret).
+fn is_path(v: &str) -> bool {
+    v.starts_with(['/', '~']) || v.starts_with("./") || v.starts_with("../")
+}
+
+/// A word or an identifier (kebab, snake, lower or camel case) without digits,
+/// or words joined by `-`/`_` that carry at most a short number (`my_test_key1`).
+fn is_plain_word(v: &str) -> bool {
+    let letters_only = v
+        .chars()
+        .all(|c| c.is_ascii_alphabetic() || c == '_' || c == '-')
+        && v.chars().filter(char::is_ascii_uppercase).count() <= 3;
+    let parts: Vec<&str> = v.split(['_', '-']).collect();
+    let words = (2..=3).contains(&parts.len())
+        && parts
+            .iter()
+            .filter(|p| p.chars().all(|c| c.is_ascii_lowercase()))
+            .count()
+            >= 1
+        && parts.iter().all(|p| {
+            let digits = p.trim_start_matches(|c: char| c.is_ascii_lowercase());
+            !p.is_empty() && digits.len() <= 6 && digits.chars().all(|c| c.is_ascii_digit())
+        });
+    letters_only || words
+}
+
+/// Whether the value of a secret-looking assignment is probably a real secret
+/// and not code, a placeholder or an ordinary word.
+fn looks_like_secret(value: &str, quoted: bool) -> bool {
+    if value.starts_with(['$', '{', '<', '[', '@', '%'])
+        || value.contains(['(', ')'])
+        || value.contains("${")
+        || value.contains("://")
+    {
+        return false;
+    }
+    let v = value.trim_matches(['`', ',', ';', '!']);
+    if is_identifier_path(v)
+        || is_env_name(v)
+        || is_placeholder(v)
+        || is_path(v)
+        || is_plain_word(v)
+    {
+        return false;
+    }
+    if quoted {
+        entropy(v) >= 3.0 || v.len() >= 16
+    } else {
+        mixed(v) || entropy(v) >= 4.0
+    }
+}
+
 /// True for a line that already uses references or looks like code, not data.
 fn skip_line(line: &str) -> bool {
     line.contains("includeTemplate") || line.len() > 2000
@@ -128,14 +213,10 @@ pub fn scan_text(text: &str) -> Vec<Hit> {
             continue;
         }
         if let Some(c) = assignment().captures(line) {
-            let (key, v) = (c.get(1).expect("group"), c.get(2).expect("group"));
+            let (key, v) = (c.get(1).expect("group"), c.get(3).expect("group"));
             let value = v.as_str();
-            let placeholder =
-                value.starts_with("$") || value.starts_with('{') || value.starts_with('<');
-            if !placeholder
-                && (entropy(value) >= 3.0 || value.len() >= 16)
-                && !value.contains("://")
-            {
+            let quoted = !c.get(2).expect("group").as_str().is_empty();
+            if looks_like_secret(value, quoted) {
                 hits.push(Hit {
                     line: i,
                     start: v.start(),
@@ -536,6 +617,23 @@ pub struct Found {
     pub rel: String,
     pub private_key: bool,
     pub values: Vec<(String, Option<String>, String)>,
+    /// Where the secrets are: (1-based line, hint). Never the value.
+    pub spots: Vec<(usize, String)>,
+}
+
+impl Found {
+    /// "line 3, API_KEY; line 9, TOKEN" (or "a private key").
+    pub fn where_text(&self) -> String {
+        let mut parts: Vec<String> = self
+            .spots
+            .iter()
+            .map(|(l, h)| format!("line {l}, {h}"))
+            .collect();
+        if self.private_key && parts.is_empty() {
+            parts.push("a private key".into());
+        }
+        parts.join("; ")
+    }
 }
 
 /// The files among `rels` that hold secrets. Without a vault (and without
@@ -550,12 +648,15 @@ pub fn inspect(store: &Store, rels: &[String]) -> Result<Vec<Found>> {
 }
 
 pub fn no_vault_message(out: &[Found]) -> String {
-    let names: Vec<String> = out.iter().map(|f| tilde(&f.rel)).collect();
+    let files: Vec<String> = out
+        .iter()
+        .map(|f| format!("{} ({})", tilde(&f.rel), f.where_text()))
+        .collect();
     format!(
-        "{} appear(s) to contain a secret, which must not be written to the repository: \
+        "possible secret in {}; it must not be written to the repository: \
          run `dw vault init`, then track again — the secret will be moved to the vault \
          (a human can pass --allow-plaintext to store the file as it is)",
-        names.join(", ")
+        files.join("; ")
     )
 }
 
@@ -575,9 +676,13 @@ pub fn found_in(store: &Store, rels: &[String]) -> Vec<Found> {
             continue;
         };
         let mut values: Vec<(String, Option<String>, String)> = Vec::new();
+        let mut spots: Vec<(usize, String)> = Vec::new();
         for (n, v) in &known {
             if v.chars().count() >= 3 && text.contains(v.as_str()) {
                 values.push((v.clone(), Some(n.clone()), n.clone()));
+                if let Some(l) = text.lines().position(|l| l.contains(v.as_str())) {
+                    spots.push((l + 1, n.clone()));
+                }
             }
         }
         for h in scan_text(&text).into_iter().filter(|h| !h.generic) {
@@ -585,14 +690,20 @@ pub fn found_in(store: &Store, rels: &[String]) -> Vec<Found> {
                 && !values.iter().any(|(x, _, _)| *x == v)
             {
                 values.push((v, None, h.hint.clone()));
+                spots.push((h.line + 1, h.hint.clone()));
             }
         }
+        spots.sort();
         let private_key = is_private_key(&text);
+        if private_key && let Some(l) = text.lines().position(|l| l.contains("-----BEGIN ")) {
+            spots.insert(0, (l + 1, "PRIVATE KEY".into()));
+        }
         if private_key || !values.is_empty() {
             out.push(Found {
                 rel: rel.clone(),
                 private_key,
                 values,
+                spots,
             });
         }
     }
@@ -736,4 +847,53 @@ pub fn set_last_written(store: &Store, rel: &str) -> Result<()> {
         format!("--value={value}"),
     ])?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn hits(line: &str) -> usize {
+        scan_text(line).len()
+    }
+
+    #[test]
+    fn real_looking_secrets_still_flag() {
+        for line in [
+            r#"token = "Zx9Qw3Er7Ty1Ui5Op2As8Df4Gh6Jk0Lz""#,
+            r#"password: "correct-horse-battery-staple-9""#,
+            "api_key=a8Fk3Lm9Qz2Xv7Bn",
+            "SECRET_KEY=9f8e7d6c5b4a39281706f5e4d3c2b1a0",
+            "key = AKIAABCDEFGHIJKLMNOP",
+            "auth: ghp_abcdefghijklmnopqrstuvwxyz0123456789",
+        ] {
+            assert_eq!(hits(line), 1, "must flag: {line}");
+        }
+        assert!(is_private_key(
+            "-----BEGIN OPENSSH PRIVATE KEY-----\nx\n-----END OPENSSH PRIVATE KEY-----"
+        ));
+    }
+
+    #[test]
+    fn code_and_placeholder_values_do_not_flag() {
+        for line in [
+            "secret: this.env.EMAIL_SECRET,",
+            "const token = process.env.API_TOKEN;",
+            "apiKey: env.OPENAI_API_KEY,",
+            "apiToken: config.apiToken,",
+            "token = getToken(request)",
+            "password = ${DB_PASSWORD}",
+            "API_TOKEN=CLOUDFLARE_API_TOKEN",
+            "api_key = \"your-api-key-here\"",
+            "token: <your token>",
+            "secret = xxxxxxxxxxxxxxxx",
+            "password = \"changeme\"",
+            "token = \"example-token-value\"",
+            "password: hunter-two-words",
+            "secret_key = my_secret_name",
+            "credentials-file: /home/user/.cloudflared/cert.json",
+        ] {
+            assert_eq!(hits(line), 0, "must not flag: {line}");
+        }
+    }
 }
