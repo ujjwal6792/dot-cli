@@ -52,22 +52,27 @@ pub fn list_dir(dir: &Path, rules: &HideRules, cancel: &CancelToken) -> Result<V
 }
 
 /// Text for the main view's preview of `path` (read off the event loop).
-pub fn preview(path: &Path, cancel: &CancelToken) -> Result<String, String> {
+/// A folder lists what the browser would list for it under `rules` and `show_hidden`.
+pub fn preview(
+    path: &Path,
+    rules: &HideRules,
+    show_hidden: bool,
+    cancel: &CancelToken,
+) -> Result<String, String> {
     const LIMIT: usize = 16 * 1024;
     let meta = fs::metadata(path).map_err(|e| e.to_string())?;
     if meta.is_dir() {
-        let mut names: Vec<String> = fs::read_dir(path)
-            .map_err(|e| e.to_string())?
-            .flatten()
+        let mut names: Vec<String> = list_dir(path, rules, cancel)?
+            .into_iter()
+            .filter(|e| show_hidden || !e.hidden)
             .map(|e| {
-                let mut n = e.file_name().to_string_lossy().into_owned();
-                if e.path().is_dir() {
-                    n.push('/');
+                if e.is_dir {
+                    format!("{}/", e.display())
+                } else {
+                    e.display()
                 }
-                n
             })
             .collect();
-        names.sort();
         let total = names.len();
         names.truncate(200);
         let mut s = format!("{total} item(s)\n\n");
@@ -297,20 +302,25 @@ mod tests {
     fn previews() {
         let d = tree();
         let c = CancelToken::new();
-        assert!(
-            preview(&d.path().join(".zshrc"), &c)
-                .unwrap()
-                .contains("export A=1")
-        );
-        assert!(
-            preview(&d.path().join("bin.dat"), &c)
-                .unwrap()
-                .contains("binary")
-        );
-        assert!(
-            preview(&d.path().join(".config"), &c)
-                .unwrap()
-                .contains("nvim/")
-        );
+        let r = HideRules::defaults(d.path()).unwrap();
+        let pv = |p: &str| preview(&d.path().join(p), &r, false, &c).unwrap();
+        assert!(pv(".zshrc").contains("export A=1"));
+        assert!(pv("bin.dat").contains("binary"));
+        assert!(pv(".config").contains("nvim/"));
+    }
+
+    #[test]
+    fn folder_preview_matches_the_browser_listing() {
+        let d = tempfile::tempdir().unwrap();
+        let dir = d.path().join("skills");
+        fs::create_dir_all(dir.join("one")).unwrap();
+        fs::write(dir.join(".DS_Store"), "x").unwrap();
+        fs::write(dir.join("notes.md"), "n").unwrap();
+        let r = HideRules::defaults(d.path()).unwrap();
+        let c = CancelToken::new();
+        let shown = preview(&dir, &r, false, &c).unwrap();
+        assert_eq!(shown, "2 item(s)\n\none/\nnotes.md");
+        let all = preview(&dir, &r, true, &c).unwrap();
+        assert_eq!(all, "3 item(s)\n\none/\n.DS_Store\nnotes.md");
     }
 }

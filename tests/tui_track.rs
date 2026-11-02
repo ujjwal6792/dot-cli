@@ -317,6 +317,72 @@ fn space_on_a_folder_without_tracked_files_tracks_it() {
 }
 
 #[test]
+fn a_tracks_the_rest_of_the_folder_and_a_second_a_untracks_or_drops_all() {
+    let t = initialised();
+    write(&t, "skills/one/SKILL.md", "1");
+    write(&t, "skills/two/SKILL.md", "2");
+    write(&t, "skills/notes.md", "n");
+    write(&t, "skills/.DS_Store", "x");
+    t.dw_ok(&["track", "skills/one", "--apply"]);
+    let mut tui = open(t);
+    tui.enter("skills");
+
+    tui.press('a');
+    let mut got = summaries(&tui.t);
+    got.sort();
+    assert_eq!(
+        got,
+        [
+            "Track folder ~/skills/two (1 file)",
+            "Track ~/skills/notes.md"
+        ],
+        "only the entries that were not tracked yet: {}",
+        tui.screen()
+    );
+
+    tui.press('a');
+    assert_eq!(
+        summaries(&tui.t),
+        ["Untrack ~/skills/one (1 file)"],
+        "the pending tracks are dropped, the tracked folder is untracked"
+    );
+}
+
+#[test]
+fn tracking_a_folder_never_picks_up_hidden_files() {
+    let t = initialised();
+    write(&t, "skills/notes.md", "n");
+    write(&t, "skills/one/SKILL.md", "1");
+    write(&t, "skills/.DS_Store", "x");
+    let mut tui = open(t);
+    tui.select("skills");
+    tui.press(' ');
+    assert_eq!(summaries(&tui.t), ["Track folder ~/skills (2 files)"]);
+}
+
+#[test]
+fn a_folder_preview_lists_what_the_browser_would_list() {
+    let t = initialised();
+    write(&t, "skills/notes.md", "n");
+    write(&t, "skills/one/SKILL.md", "1");
+    write(&t, "skills/.DS_Store", "x");
+    let mut tui = open(t);
+    tui.select("skills");
+    tui.press('l');
+    tui.press('h');
+    let screen = tui.screen();
+    assert!(screen.contains("2 item(s)") && screen.contains("notes.md"));
+    assert!(!screen.contains(".DS_Store"), "{screen}");
+
+    tui.press('.');
+    let screen = tui.screen();
+    assert!(
+        screen.contains("3 item(s)") && screen.contains(".DS_Store"),
+        "{screen}"
+    );
+}
+
+#[test]
 fn hidden_entries_are_refused_with_the_reason_in_the_footer() {
     let t = initialised();
     write(&t, ".cache/x", "c");

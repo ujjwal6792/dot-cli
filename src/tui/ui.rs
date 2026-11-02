@@ -19,7 +19,7 @@ pub fn is_single_panel(area: Rect) -> bool {
     area.width < NARROW_WIDTH || area.height < SHORT_HEIGHT
 }
 
-const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · m assign · t variant · V values · r refresh / Git revert";
+const FOOTER: &str = " q quit · ? help · 1-5 · 0 pending · Space track · a all · m assign · t variant · V values · r refresh / Git revert";
 
 const HELP: &[(&str, &str)] = &[
     ("?", "toggle this help"),
@@ -29,8 +29,8 @@ const HELP: &[(&str, &str)] = &[
     ("0", "focus the Pending pane (also Tab after Machines)"),
     ("j / k, ↓ / ↑", "move selection"),
     (
-        "Space",
-        "Files: track / untrack (adds or drops a pending item)",
+        "Space / a (Files)",
+        "track / untrack (pending item); a = all in this folder",
     ),
     ("v", "Files: start / end a range selection, then Space"),
     ("m / t", "Files/Changes: assign (m), add a variant ◆ (t)"),

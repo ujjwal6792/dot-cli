@@ -649,8 +649,10 @@ impl App {
             return;
         };
         self.preview = Load::Loading;
+        let rules = Arc::clone(&self.rules);
+        let show_hidden = self.files.show_hidden;
         self.jobs.spawn(KEY_PREVIEW, move |cancel| {
-            let text = files::preview(&path, cancel);
+            let text = files::preview(&path, &rules, show_hidden, cancel);
             Payload::Preview { path, text }
         });
     }
@@ -1823,10 +1825,45 @@ impl App {
         }
     }
 
+    /// `a` in Files: track everything visible in the folder that is neither
+    /// tracked nor pending; when all of it already is, untrack or drop it all.
+    fn toggle_all(&mut self) {
+        let marks = self.pending_marks();
+        let settled = |e: &files::Entry| {
+            let rel = self.files.rel_of(e);
+            marks.contains_key(&rel)
+                || !matches!(
+                    self.tracked.state_of(&rel, e.is_dir),
+                    crate::source::TrackState::New | crate::source::TrackState::Untracked
+                )
+        };
+        let visible = self.files.visible();
+        let paths_of = |keep: &dyn Fn(&files::Entry) -> bool| -> Vec<_> {
+            visible
+                .iter()
+                .filter(|e| keep(e))
+                .map(|e| self.files.cwd.join(&e.name))
+                .collect()
+        };
+        let rest = paths_of(&|e| !settled(e));
+        let paths = if rest.is_empty() {
+            paths_of(&|e| !e.hidden)
+        } else {
+            rest
+        };
+        self.range_anchor = None;
+        if paths.is_empty() {
+            self.message = Some("nothing to track here".into());
+        } else {
+            self.request_action(ActionReq::Toggle(paths));
+        }
+    }
+
     fn files_key(&mut self, key: KeyEvent) {
         let before = self.files.selected_path();
         match key.code {
             KeyCode::Char(' ') => return self.toggle_selection(),
+            KeyCode::Char('a') => return self.toggle_all(),
             KeyCode::Char('H') => {
                 if let Some(p) = before {
                     self.open_history(p.to_string_lossy().into_owned());
@@ -1881,7 +1918,10 @@ impl App {
             // lazygit's top/bottom keys; `G` is reserved for the lazygit handoff.
             KeyCode::Char('<') | KeyCode::Home => self.files.select_first(),
             KeyCode::Char('>') | KeyCode::End => self.files.select_last(),
-            KeyCode::Char('.') => self.files.toggle_hidden(),
+            KeyCode::Char('.') => {
+                self.files.toggle_hidden();
+                return self.request_preview();
+            }
             KeyCode::Char('l') | KeyCode::Right | KeyCode::Enter => {
                 if self.files.enter() {
                     self.range_anchor = None;
