@@ -2,8 +2,8 @@
 //! touches the disk or runs a tool is a job whose result arrives as an event.
 
 use std::collections::{BTreeMap, BTreeSet, VecDeque};
-use std::sync::Arc;
 use std::sync::mpsc::Sender;
+use std::sync::{Arc, Mutex};
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 
@@ -82,12 +82,28 @@ impl Panel {
     }
 }
 
+/// A visible entry of the folder a bulk selection acts on.
+#[derive(Debug, Clone)]
+pub struct BulkEntry {
+    pub path: std::path::PathBuf,
+    pub rel: String,
+    pub is_dir: bool,
+}
+
 /// A mutation waiting for its turn on the action queue.
 #[derive(Debug, Clone)]
 pub enum ActionReq {
     Git(GitOp, String),
     /// Space: flip the tracked state of these HOME paths (absolute).
     Toggle(Vec<std::path::PathBuf>),
+    /// `a` / `A` in Files. Decided when it runs, from the pending list and the
+    /// tracked set as they are then, so presses queued back to back each see
+    /// the result of the one before.
+    Bulk {
+        entries: Vec<BulkEntry>,
+        drop_only: bool,
+        refused: Arc<Mutex<BTreeSet<std::path::PathBuf>>>,
+    },
     /// `i`: hide (or un-hide) this absolute path, through a pending hide item.
     Hide(std::path::PathBuf, bool),
     Drop(u64),
@@ -450,7 +466,7 @@ pub struct App {
     pub dialog: Option<Dialog>,
     /// Paths in the current folder that a toggle refused in this session; `a`
     /// does not wait for them. Cleared whenever the listing reloads.
-    refused_paths: BTreeSet<std::path::PathBuf>,
+    refused_paths: Arc<Mutex<BTreeSet<std::path::PathBuf>>>,
     /// Active tab of the Changes panel (index into [`TABS`]) and the row in it.
     pub changes_tab: usize,
     pub changes_selected: usize,
@@ -514,7 +530,7 @@ impl App {
             machine_preview: None,
             hide_stamp: None,
             actions: VecDeque::new(),
-            refused_paths: BTreeSet::new(),
+            refused_paths: Arc::default(),
             action_running: false,
             last_fetch: None,
         }
@@ -642,7 +658,7 @@ impl App {
     }
 
     fn reload_listing(&mut self, reselect: Option<std::ffi::OsString>) {
-        self.refused_paths.clear();
+        self.refused_paths.lock().expect("refused set").clear();
         self.files.begin_load(reselect);
         self.preview = Load::Ready(String::new());
         let dir = self.files.cwd.clone();
@@ -819,7 +835,10 @@ impl App {
                             self.changes_selected = 0;
                         }
                         self.message = Some(report.message);
-                        self.refused_paths.extend(report.refused);
+                        self.refused_paths
+                            .lock()
+                            .expect("refused set")
+                            .extend(report.refused);
                         if let Some(detail) = report.detail {
                             self.show_details(detail);
                         }
@@ -1869,66 +1888,37 @@ impl App {
         }
     }
 
-    /// `a` in Files: track everything visible in the folder that is neither
-    /// tracked nor pending; when all of it already is, untrack or drop it all.
-    fn toggle_all(&mut self) {
-        let marks = self.pending_marks();
-        let settled = |e: &files::Entry| {
-            let rel = self.files.rel_of(e);
-            e.hidden
-                || self.refused_paths.contains(&self.files.cwd.join(&e.name))
-                || marks.contains_key(&rel)
-                || !matches!(
-                    self.tracked.state_of(&rel, e.is_dir),
-                    crate::source::TrackState::New | crate::source::TrackState::Untracked
-                )
-        };
-        let visible = self.files.visible();
-        let paths_of = |keep: &dyn Fn(&files::Entry) -> bool| -> Vec<_> {
-            visible
-                .iter()
-                .filter(|e| keep(e))
-                .map(|e| self.files.cwd.join(&e.name))
-                .collect()
-        };
-        let rest = paths_of(&|e| !settled(e));
-        let paths = if rest.is_empty() {
-            paths_of(&|e| !e.hidden && !self.refused_paths.contains(&self.files.cwd.join(&e.name)))
-        } else {
-            rest
-        };
-        self.range_anchor = None;
-        if paths.is_empty() {
-            self.message = Some("nothing to track here".into());
-        } else {
-            self.request_action(ActionReq::Toggle(paths));
-        }
-    }
-
-    /// `A` in Files: drop every pending item of the visible entries; adds nothing.
-    fn drop_all_pending(&mut self) {
-        let marks = self.pending_marks();
-        let paths: Vec<_> = self
+    /// `a` (track the rest, or deselect all when nothing is left to track) and
+    /// `A` (drop every pending item) in Files. Both are queued as one action and
+    /// decided when it runs; see [`ActionReq::Bulk`].
+    fn bulk_selection(&mut self, drop_only: bool) {
+        let entries = self
             .files
             .visible()
             .iter()
-            .filter(|e| marks.contains_key(&self.files.rel_of(e)))
-            .map(|e| self.files.cwd.join(&e.name))
+            .map(|e| BulkEntry {
+                path: self.files.cwd.join(&e.name),
+                rel: self.files.rel_of(e),
+                is_dir: e.is_dir,
+            })
+            .zip(self.files.visible().iter().map(|e| e.hidden))
+            .filter(|(_, hidden)| !hidden || drop_only)
+            .map(|(b, _)| b)
             .collect();
         self.range_anchor = None;
-        if paths.is_empty() {
-            self.message = Some("nothing pending in this folder".into());
-        } else {
-            self.request_action(ActionReq::Toggle(paths));
-        }
+        self.request_action(ActionReq::Bulk {
+            entries,
+            drop_only,
+            refused: Arc::clone(&self.refused_paths),
+        });
     }
 
     fn files_key(&mut self, key: KeyEvent) {
         let before = self.files.selected_path();
         match key.code {
             KeyCode::Char(' ') => return self.toggle_selection(),
-            KeyCode::Char('a') => return self.toggle_all(),
-            KeyCode::Char('A') => return self.drop_all_pending(),
+            KeyCode::Char('a') => return self.bulk_selection(false),
+            KeyCode::Char('A') => return self.bulk_selection(true),
             KeyCode::Char('H') => {
                 if let Some(p) = before {
                     self.open_history(p.to_string_lossy().into_owned());
@@ -2199,6 +2189,61 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
         ActionReq::AbortPull => {
             crate::remote::pull_abort(store)?;
             Ok(report("Merge aborted".into()))
+        }
+        ActionReq::Bulk {
+            entries,
+            drop_only,
+            refused,
+        } => {
+            let marks = pending::marks(&pending::load(store)?);
+            let tracked = source::load(&store.repo())?;
+            let skip = refused.lock().expect("refused set").clone();
+            let settled = |e: &BulkEntry| {
+                skip.contains(&e.path)
+                    || marks.contains_key(&e.rel)
+                    || !matches!(
+                        tracked.state_of(&e.rel, e.is_dir),
+                        source::TrackState::New | source::TrackState::Untracked
+                    )
+            };
+            let pick = |keep: &dyn Fn(&BulkEntry) -> bool| -> Vec<std::path::PathBuf> {
+                entries
+                    .iter()
+                    .filter(|e| keep(e))
+                    .map(|e| e.path.clone())
+                    .collect()
+            };
+            let (paths, none) = if drop_only {
+                (
+                    pick(&|e| marks.contains_key(&e.rel)),
+                    "nothing pending in this folder",
+                )
+            } else {
+                let rest = pick(&|e| !settled(e));
+                let all = if rest.is_empty() {
+                    pick(&|e| !skip.contains(&e.path))
+                } else {
+                    rest
+                };
+                (all, "nothing to track here")
+            };
+            if paths.is_empty() {
+                return Ok(report(none.into()));
+            }
+            let one = (paths.len() == 1).then(|| paths[0].clone());
+            let mut r = match run_action(store, ActionReq::Toggle(paths)) {
+                Err(e) if !crate::lock::is_busy(&e) => {
+                    refused.lock().expect("refused set").extend(one);
+                    return Err(e);
+                }
+                other => other?,
+            };
+            refused
+                .lock()
+                .expect("refused set")
+                .extend(r.refused.iter().cloned());
+            r.refused.clear();
+            Ok(r)
         }
         ActionReq::Toggle(paths) => {
             let requester = "human";

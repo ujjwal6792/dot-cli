@@ -474,6 +474,51 @@ fn shift_a_drops_all_pending_in_the_folder_and_keeps_tracked_entries() {
 }
 
 #[test]
+fn a_and_shift_a_keep_working_in_any_order() {
+    let t = initialised();
+    write(&t, "d/one", "1");
+    write(&t, "d/two", "2");
+    write(&t, "d/kept", "3");
+    t.dw_ok(&["track", "d/kept", "--apply"]);
+    let mut tui = open(t);
+    tui.enter("d");
+    // (key, pending count after the press)
+    for (k, n) in [
+        ('a', 2),
+        ('A', 0),
+        ('a', 2),
+        ('a', 1),
+        ('A', 0),
+        ('A', 0),
+        ('a', 2),
+    ] {
+        tui.press(k);
+        assert_eq!(pending(&tui.t).len(), n, "after {k}: {}", tui.screen());
+        let screen = tui.screen();
+        assert_eq!(screen.contains("+ one"), n == 2, "{k}: {screen}");
+        assert!(screen.contains("✓"), "{k}: {screen}");
+    }
+}
+
+#[test]
+fn a_and_shift_a_pressed_back_to_back_each_see_the_result_of_the_one_before() {
+    let t = initialised();
+    write(&t, "d/one", "1");
+    write(&t, "d/two", "2");
+    write(&t, "d/kept", "3");
+    t.dw_ok(&["track", "d/kept", "--apply"]);
+    let mut tui = open(t);
+    tui.enter("d");
+    // No waiting in between: later presses arrive while earlier actions run.
+    for k in ['a', 'A', 'a', 'a', 'A', 'A', 'a'] {
+        tui.app.handle_event(ch(k));
+    }
+    tui.settle();
+    assert_eq!(summaries(&tui.t).len(), 2, "{}", tui.screen());
+    assert!(tui.screen().contains("+ one"), "{}", tui.screen());
+}
+
+#[test]
 fn a_folder_with_a_flagged_file_is_tracked_without_it() {
     let t = initialised();
     write(&t, "proj/ok.md", "fine");
