@@ -243,6 +243,12 @@ pub enum Command {
         /// default refuses, or moves the secret to the vault).
         #[arg(long)]
         allow_plaintext: bool,
+        /// Stage only this hunk of the one file (see `dw diff --hunks`); repeatable.
+        #[arg(long = "hunk", value_name = "N", conflicts_with = "all")]
+        hunk: Vec<usize>,
+        /// Stage only this changed line of the one file (numbers from `dw diff --hunks`); repeatable.
+        #[arg(long = "line", value_name = "N", conflicts_with = "all")]
+        line: Vec<usize>,
         /// Show what would be staged without changing anything.
         #[arg(long)]
         dry_run: bool,
@@ -257,6 +263,12 @@ pub enum Command {
         /// Unstage everything.
         #[arg(long, conflicts_with = "paths")]
         all: bool,
+        /// Unstage only this hunk of the one file (see `dw diff --hunks --staged`); repeatable.
+        #[arg(long = "hunk", value_name = "N", conflicts_with = "all")]
+        hunk: Vec<usize>,
+        /// Unstage only this changed line of the one file; repeatable.
+        #[arg(long = "line", value_name = "N", conflicts_with = "all")]
+        line: Vec<usize>,
         /// Show what would be unstaged without changing anything.
         #[arg(long)]
         dry_run: bool,
@@ -286,6 +298,13 @@ pub enum Command {
         /// Print plain unified diff even in a terminal.
         #[arg(long)]
         no_pager: bool,
+        /// List the hunks of one file with numbered changed lines, for
+        /// `dw stage --hunk/--line`. Masked files are listed read-only.
+        #[arg(long, requires = "path")]
+        hunks: bool,
+        /// With --hunks: the staged side (for `dw unstage --hunk/--line`).
+        #[arg(long, requires = "hunks")]
+        staged: bool,
     },
     /// Discard local changes: write the committed version back to HOME.
     ///
@@ -1185,22 +1204,44 @@ fn run(cli: Cli) -> Result<ExitCode> {
             paths,
             all,
             allow_plaintext,
+            hunk,
+            line,
             dry_run,
         } => {
             cmds::allow_plaintext(&store, allow_plaintext)?;
-            return cmds::stage_cmd(&store, true, &paths, all, dry_run, json);
+            let by = crate::hunks::Selection {
+                hunks: hunk,
+                lines: line,
+            };
+            return cmds::stage_cmd(&store, true, &paths, all, &by, dry_run, json);
         }
         Command::Unstage {
             paths,
             all,
+            hunk,
+            line,
             dry_run,
-        } => return cmds::stage_cmd(&store, false, &paths, all, dry_run, json),
+        } => {
+            let by = crate::hunks::Selection {
+                hunks: hunk,
+                lines: line,
+            };
+            return cmds::stage_cmd(&store, false, &paths, all, &by, dry_run, json);
+        }
         Command::Commit {
             messages,
             amend,
             dry_run,
         } => return cmds::commit_cmd(&store, messages, amend, dry_run, json),
-        Command::Diff { path, no_pager } => {
+        Command::Diff {
+            path,
+            no_pager,
+            hunks,
+            staged,
+        } => {
+            if hunks {
+                return cmds::hunks_cmd(&store, path.as_deref().unwrap_or_default(), staged, json);
+            }
             return cmds::diff_cmd(&store, path.as_deref(), no_pager, json);
         }
         Command::Discard {

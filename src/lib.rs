@@ -15,6 +15,7 @@ pub mod fsutil;
 pub mod git_state;
 pub mod hide;
 pub mod history;
+pub mod hunks;
 pub mod lock;
 pub mod machine;
 pub mod machines;
