@@ -33,6 +33,7 @@ pub const KEY_REGISTRY: &str = "registry";
 pub const KEY_MACHINE: &str = "machine";
 pub const KEY_VALUES: &str = "values";
 pub const KEY_CONFLICT: &str = "conflict";
+pub const KEY_STAGING: &str = "staging";
 
 /// The Values screen's data, read off the event loop.
 #[derive(Debug, Default)]
@@ -120,6 +121,11 @@ pub enum Payload {
     Conflict {
         path: String,
         data: Result<Box<ConflictData>, String>,
+    },
+    /// The hunks of the file open in the staging screen.
+    Staging {
+        path: String,
+        view: Result<Box<crate::hunks::View>, String>,
     },
     /// What a registry machine would receive.
     MachinePreview {

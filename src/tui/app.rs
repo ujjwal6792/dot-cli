@@ -13,8 +13,8 @@ use super::event::Event;
 use super::files::{self, FilesState};
 use super::jobs::{
     ActionReport, Done, Jobs, KEY_ACTION, KEY_CONFLICT, KEY_DIFF, KEY_FETCH, KEY_HIDE, KEY_LISTING,
-    KEY_MACHINE, KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STATUS, KEY_TRACKED, KEY_VALUES,
-    Payload, RegistryView, ShownHunk, ValuesView,
+    KEY_MACHINE, KEY_PENDING, KEY_PREVIEW, KEY_REGISTRY, KEY_STAGING, KEY_STATUS, KEY_TRACKED,
+    KEY_VALUES, Payload, RegistryView, ShownHunk, ValuesView,
 };
 use crate::assign::{self, Side, TargetRow, Tri};
 use crate::changes::{self, Change, CommitOpts, State};
@@ -114,6 +114,13 @@ pub enum ActionReq {
     /// HOME; `None` is every change that can be.
     Stage(Option<Vec<String>>),
     Unstage(Option<Vec<String>>),
+    /// Stage or unstage selected hunks and lines of one file, as shown.
+    Hunks {
+        path: String,
+        side: crate::hunks::Side,
+        sel: crate::hunks::Selection,
+        expect: String,
+    },
     /// Commit with this message; `amend` replaces the last commit.
     Commit {
         message: String,
@@ -326,6 +333,32 @@ pub struct ConflictScreen {
     pub confirm: Option<Secret>,
 }
 
+/// The staging screen (Enter on a Local or Staged change): the hunks of one file.
+#[derive(Debug)]
+pub struct StagingScreen {
+    pub path: String,
+    pub side: crate::hunks::Side,
+    pub view: Load<Box<crate::hunks::View>>,
+    /// Index into [`staging_rows`].
+    pub cursor: usize,
+}
+
+/// One row of the staging screen: a hunk header or a line of a hunk.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StagingRow {
+    Header(usize),
+    Line(usize, usize),
+}
+
+pub fn staging_rows(view: &crate::hunks::View) -> Vec<StagingRow> {
+    let mut rows = Vec::new();
+    for (h, hunk) in view.hunks.iter().enumerate() {
+        rows.push(StagingRow::Header(h));
+        rows.extend((0..hunk.lines.len()).map(|l| StagingRow::Line(h, l)));
+    }
+    rows
+}
+
 /// The editor waiting to be run with the terminal handed over (see `tui::run_loop`).
 pub struct Handoff {
     pub command: std::process::Command,
@@ -488,6 +521,7 @@ pub struct App {
     pub values: Option<ValuesScreen>,
     /// The Conflicts screen, open while `Some`.
     pub conflict: Option<ConflictScreen>,
+    pub staging: Option<StagingScreen>,
     handoff: Option<Handoff>,
     /// The preview of the machine last opened with Enter in the Machines panel.
     pub machine_preview: Option<(String, Load<String>)>,
@@ -538,6 +572,7 @@ impl App {
             registry: None,
             values: None,
             conflict: None,
+            staging: None,
             handoff: None,
             machines_selected: 0,
             machine_preview: None,
@@ -833,6 +868,25 @@ impl App {
                     }
                 }
             }
+            Payload::Staging { path, view } => {
+                if let Some(sc) = self.staging.as_mut().filter(|c| c.path == path) {
+                    match view {
+                        Ok(v) if v.hunks.is_empty() => {
+                            self.staging = None;
+                            self.message = Some("nothing left to stage by hunk".into());
+                        }
+                        Ok(v) => {
+                            let last = staging_rows(&v).len().saturating_sub(1);
+                            sc.cursor = sc.cursor.min(last);
+                            sc.view = Load::Ready(v);
+                        }
+                        Err(e) => {
+                            self.staging = None;
+                            self.message = Some(e);
+                        }
+                    }
+                }
+            }
             Payload::Registry(r) => {
                 if let Ok(v) = r {
                     self.registry = Some(Arc::new(*v));
@@ -892,6 +946,7 @@ impl App {
                         }
                     }
                 }
+                self.reload_staging();
                 self.reload_values();
                 self.refresh_commits();
                 self.refresh_tracking();
@@ -1301,7 +1356,13 @@ impl App {
                     }
                 }
             }
-            KeyCode::Enter => self.request_diff(),
+            KeyCode::Enter => match selected {
+                Some(c) if c.kind == "repo" => {
+                    self.message = Some("repository files are staged and unstaged whole".into())
+                }
+                Some(c) => self.open_staging(c.path, tab == 1),
+                None => {}
+            },
             KeyCode::Char(' ') => match (tab, selected) {
                 (0, Some(c)) => self.request_action(ActionReq::Stage(Some(vec![c.path]))),
                 (1, Some(c)) if c.kind == "repo" => {
@@ -1380,6 +1441,12 @@ impl App {
             return match key.code {
                 KeyCode::Char('c') if ctrl => self.quit = true,
                 _ => self.conflict_key(key),
+            };
+        }
+        if self.staging.is_some() {
+            return match key.code {
+                KeyCode::Char('c') if ctrl => self.quit = true,
+                _ => self.staging_key(key),
             };
         }
         if self.values.is_some() {
@@ -1726,6 +1793,101 @@ impl App {
                 Ok(text) => c.confirm = Some(Secret(text)),
                 Err(e) => self.message = Some(format!("{e:#}")),
             },
+        }
+    }
+
+    fn open_staging(&mut self, path: String, staged: bool) {
+        self.staging = Some(StagingScreen {
+            path,
+            side: if staged {
+                crate::hunks::Side::Unstage
+            } else {
+                crate::hunks::Side::Stage
+            },
+            view: Load::Loading,
+            cursor: 0,
+        });
+        self.reload_staging();
+    }
+
+    /// Re-read the hunks of the open staging screen (after every action).
+    fn reload_staging(&mut self) {
+        let Some(sc) = &self.staging else { return };
+        let (path, side) = (sc.path.clone(), sc.side);
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn(KEY_STAGING, move |_| {
+            let view = crate::hunks::open(&store, &path, side)
+                .map(Box::new)
+                .map_err(|e| format!("{e:#}"));
+            Payload::Staging { path, view }
+        });
+    }
+
+    fn staging_key(&mut self, key: KeyEvent) {
+        let Some(sc) = &mut self.staging else { return };
+        let Load::Ready(view) = &sc.view else {
+            if key.code == KeyCode::Esc {
+                self.staging = None;
+            }
+            return;
+        };
+        let rows = staging_rows(view);
+        let at = rows.get(sc.cursor).copied();
+        let hunk_of = |r: StagingRow| match r {
+            StagingRow::Header(h) | StagingRow::Line(h, _) => h,
+        };
+        match key.code {
+            KeyCode::Esc | KeyCode::Char('q') => self.staging = None,
+            KeyCode::Char('j') | KeyCode::Down => {
+                sc.cursor = (sc.cursor + 1).min(rows.len().saturating_sub(1))
+            }
+            KeyCode::Char('k') | KeyCode::Up => sc.cursor = sc.cursor.saturating_sub(1),
+            KeyCode::Char(']') | KeyCode::Tab => {
+                let h = at.map_or(0, hunk_of);
+                if let Some(i) = rows.iter().position(|r| *r == StagingRow::Header(h + 1)) {
+                    sc.cursor = i;
+                }
+            }
+            KeyCode::Char('[') | KeyCode::BackTab => {
+                let h = at.map_or(0, hunk_of);
+                let to = match at {
+                    Some(StagingRow::Line(..)) => h,
+                    _ => h.saturating_sub(1),
+                };
+                if let Some(i) = rows.iter().position(|r| *r == StagingRow::Header(to)) {
+                    sc.cursor = i;
+                }
+            }
+            KeyCode::Char(' ') | KeyCode::Enter | KeyCode::Char('a') => {
+                if let Some(why) = &view.readonly {
+                    self.message = Some(format!("read-only: {why}"));
+                    return;
+                }
+                let mut sel = crate::hunks::Selection::default();
+                match at {
+                    Some(StagingRow::Line(h, _)) if key.code == KeyCode::Char('a') => {
+                        sel.hunks.push(view.hunks[h].number)
+                    }
+                    Some(StagingRow::Line(h, l)) => match view.hunks[h].lines[l].id {
+                        Some(id) => sel.lines.push(id),
+                        None => {
+                            self.message =
+                                Some("that line is context; move to a + or - line".into());
+                            return;
+                        }
+                    },
+                    Some(StagingRow::Header(h)) => sel.hunks.push(view.hunks[h].number),
+                    None => return,
+                }
+                let req = ActionReq::Hunks {
+                    path: sc.path.clone(),
+                    side: sc.side,
+                    sel,
+                    expect: view.fingerprint.clone(),
+                };
+                self.request_action(req);
+            }
+            _ => {}
         }
     }
 
@@ -2470,6 +2632,24 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
         ActionReq::Unstage(sel) => {
             let d = changes::unstage(store, sel.as_deref(), false)?;
             Ok(report(done_message("Unstaged", &d)))
+        }
+        ActionReq::Hunks {
+            path,
+            side,
+            sel,
+            expect,
+        } => {
+            let d = crate::hunks::apply(store, &path, side, &sel, Some(&expect), false)?;
+            Ok(report(format!(
+                "{} {} changed line(s) of {}",
+                if side == crate::hunks::Side::Stage {
+                    "Staged"
+                } else {
+                    "Unstaged"
+                },
+                d.lines,
+                d.path
+            )))
         }
         ActionReq::Commit { message, amend } => {
             let c = changes::commit(

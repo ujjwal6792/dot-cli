@@ -495,3 +495,65 @@ fn p_f_and_push_work_from_the_keyboard_and_push_asks_first() {
     tui.press('p');
     assert!(tui.app.message.as_deref().unwrap().contains("Up to date"));
 }
+
+const TWO_HUNKS_BASE: &str = "l1\nl2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nl11\nl12\n";
+
+#[test]
+fn enter_opens_the_staging_view_and_space_stages_one_line_a_stages_a_hunk() {
+    let t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "testbox"]);
+    write(&t, ".a", TWO_HUNKS_BASE);
+    t.dw_ok(&["track", ".a", "--apply"]);
+    t.dw_ok(&["commit", "-m", "base"]);
+    let edit = "l1\nL2\nl3\nl4\nl5\nl6\nl7\nl8\nl9\nl10\nL11\nl12\n";
+    write(&t, ".a", edit);
+    let mut tui = open(t);
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    let screen = tui.screen();
+    assert!(
+        screen.contains("-l2") && screen.contains("+L11"),
+        "{screen}"
+    );
+    // Header, -l2: Space stages only the removal of l2.
+    tui.press('j');
+    tui.press('j');
+    tui.press(' ');
+    let repo_file = tui.t.dirs().repo().join("home/dot_a");
+    let src = fs::read_to_string(&repo_file).unwrap();
+    assert!(!src.contains("\nl2\n"), "{src}");
+    assert!(src.contains("l11\n") && !src.contains("L2"), "{src}");
+    assert!(
+        tui.app.staging.is_some(),
+        "the view stays open for the rest"
+    );
+    // Next hunk, then `a` stages all of it.
+    tui.press(']');
+    tui.press('a');
+    let src = fs::read_to_string(&repo_file).unwrap();
+    assert!(src.contains("L11") && !src.contains("\nl11\n"), "{src}");
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), edit);
+    tui.send(KeyCode::Esc, KeyModifiers::NONE);
+    assert!(tui.app.staging.is_none());
+}
+
+#[test]
+fn staging_view_of_a_secret_file_is_read_only_and_masked() {
+    let t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "testbox"]);
+    write(&t, ".env", "host = h\n");
+    t.dw_ok(&["track", ".env", "--apply"]);
+    t.dw_ok(&["commit", "-m", "env"]);
+    let secret = "Zq8x7Lm2Pq9wRt5vYb3nKd6HfJs1AaGc";
+    write(&t, ".env", &format!("host = h\napi_token = {secret}\n"));
+    let mut tui = open(t);
+    tui.send(KeyCode::Enter, KeyModifiers::NONE);
+    tui.press('j');
+    tui.press('j');
+    tui.press(' ');
+    let screen = tui.screen();
+    assert!(
+        screen.contains("read-only") && !screen.contains(secret),
+        "{screen}"
+    );
+    assert!(tui.changes().contains(&".env:local".to_string()));
+}

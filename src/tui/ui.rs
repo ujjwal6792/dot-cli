@@ -291,12 +291,69 @@ fn draw_conflict(f: &mut Frame, app: &App, area: Rect) {
     }
 }
 
+fn draw_staging(f: &mut Frame, app: &App, area: Rect) {
+    use super::app::{StagingRow, staging_rows};
+    let Some(sc) = &app.staging else { return };
+    let verb = match sc.side {
+        crate::hunks::Side::Stage => "stage",
+        crate::hunks::Side::Unstage => "unstage",
+    };
+    let title = format!(
+        " ~/{} · j/k line · [ ] hunk · Space {verb} line · a {verb} hunk · Esc back ",
+        sc.path
+    );
+    let block = Block::default().borders(Borders::ALL).title(title);
+    let Load::Ready(view) = &sc.view else {
+        let text = match &sc.view {
+            Load::Failed(e) => e.clone(),
+            _ => "loading…".to_string(),
+        };
+        return f.render_widget(Paragraph::new(text).block(block), area);
+    };
+    let mut lines = Vec::new();
+    if let Some(why) = &view.readonly {
+        lines.push(Line::styled(
+            format!("read-only (masked): {why}"),
+            Style::default().fg(Color::Yellow),
+        ));
+    }
+    let skip = lines.len();
+    for (i, row) in staging_rows(view).into_iter().enumerate() {
+        let (text, color) = match row {
+            StagingRow::Header(h) => (view.hunks[h].header.clone(), Color::Cyan),
+            StagingRow::Line(h, l) => {
+                let line = &view.hunks[h].lines[l];
+                let color = match line.tag {
+                    '+' => Color::Green,
+                    '-' => Color::Red,
+                    _ => Color::Reset,
+                };
+                (format!("{}{}", line.tag, line.text), color)
+            }
+        };
+        let mut style = Style::default().fg(color);
+        if i == sc.cursor {
+            style = style.add_modifier(Modifier::REVERSED);
+        }
+        lines.push(Line::styled(text, style));
+    }
+    let inner_h = area.height.saturating_sub(2) as usize;
+    let at = sc.cursor + skip;
+    let top = at.saturating_sub(inner_h.saturating_sub(1) / 2);
+    f.render_widget(
+        Paragraph::new(lines).scroll((top as u16, 0)).block(block),
+        area,
+    );
+}
+
 pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.size = (area.width, area.height);
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
 
-    if app.conflict.is_some() {
+    if app.staging.is_some() {
+        draw_staging(f, app, body);
+    } else if app.conflict.is_some() {
         draw_conflict(f, app, body);
     } else if app.values.is_some() {
         draw_values(f, app, body);
