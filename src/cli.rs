@@ -346,6 +346,21 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Take back the last local action (what `z` does in the TUI).
+    ///
+    /// Undoes stage, unstage, track, untrack, assign and other applied items,
+    /// a discard (from its snapshot) or the last commit while it is unpushed.
+    /// Refused when the repository changed since the action. Never touches a remote.
+    Undo {
+        /// Show what would be undone without changing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Export or import an encrypted archive of the repository (offline backup).
+    Archive {
+        #[command(subcommand)]
+        action: ArchiveCmd,
+    },
     /// List or restore snapshots of HOME files taken before they were overwritten.
     Snapshot {
         #[command(subcommand)]
@@ -867,6 +882,31 @@ pub enum StashCmd {
         /// Confirm as a human (agents queue a pending item).
         #[arg(long, short = 'y')]
         yes: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum ArchiveCmd {
+    /// Write a git bundle of the repository and this machine's registry name,
+    /// encrypted with the vault passphrase (asked on the terminal).
+    Export {
+        /// File to write, for example `dotwarden.archive`.
+        file: std::path::PathBuf,
+        /// Replace the file when it exists.
+        #[arg(long)]
+        force: bool,
+        /// Show what would be archived without writing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Restore a fresh machine from an archive, offline. Run on a computer
+    /// without a dotwarden repository, then `dw apply --all`.
+    Import {
+        /// Archive written by `dw archive export`.
+        file: std::path::PathBuf,
+        /// Decrypt and describe the archive without restoring it.
+        #[arg(long)]
+        dry_run: bool,
     },
 }
 
@@ -1440,6 +1480,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
             yes,
             dry_run,
         } => return cmds::push_cmd(&store, remote.as_deref(), all, yes, dry_run, json),
+        Command::Undo { dry_run } => return cmds::undo_cmd(&store, dry_run, json),
+        Command::Archive { action } => {
+            return match action {
+                ArchiveCmd::Export {
+                    file,
+                    force,
+                    dry_run,
+                } => cmds::archive_export(&store, &file, force, dry_run, json),
+                ArchiveCmd::Import { file, dry_run } => {
+                    cmds::archive_import(&store, &file, dry_run, json)
+                }
+            };
+        }
         Command::Snapshot { action } => {
             return match action {
                 SnapshotCmd::List { path } => cmds::snapshot_list(&store, path.as_deref(), json),

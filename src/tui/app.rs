@@ -132,6 +132,8 @@ pub enum ActionReq {
     /// Write incoming files to HOME: these paths, or all when `None`.
     ApplyIncoming(Option<Vec<String>>),
     Fetch,
+    /// `z`: take back the last local action.
+    Undo,
     Pull,
     MergePull,
     ContinuePull,
@@ -1473,6 +1475,7 @@ impl App {
                 return self.reload_values();
             }
             KeyCode::Char('f') => return self.request_action(ActionReq::Fetch),
+            KeyCode::Char('z') => return self.request_action(ActionReq::Undo),
             KeyCode::Char('p') => return self.request_action(ActionReq::Pull),
             KeyCode::Char('P') => return self.dialog = Some(Dialog::ConfirmPush),
             KeyCode::Char('r') if self.focus != Panel::Git => {
@@ -2719,6 +2722,10 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 "human",
             )?;
             Ok(report(format!("Resolved {}; staged", r.path)))
+        }
+        ActionReq::Undo => {
+            let done = crate::undo::undo(store, false)?;
+            Ok(report(format!("Undid: {}", done.summary)))
         }
         ActionReq::Fetch => {
             let f = crate::remote::fetch(store, true, None)?;

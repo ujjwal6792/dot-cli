@@ -123,13 +123,13 @@ fn work_factor(store: &Store) -> u8 {
     WORK_FACTOR
 }
 
-fn wrap(store: &Store, pass: &str, plain: &[u8]) -> Result<Vec<u8>> {
+pub(crate) fn wrap(store: &Store, pass: &str, plain: &[u8]) -> Result<Vec<u8>> {
     let mut r = age::scrypt::Recipient::new(SecretString::from(pass.to_string()));
     r.set_work_factor(work_factor(store));
     age::encrypt(&r, plain).map_err(|e| anyhow!("encrypting: {e}"))
 }
 
-fn unwrap(pass: &str, bytes: &[u8], what: &str) -> Result<Vec<u8>> {
+pub(crate) fn unwrap(pass: &str, bytes: &[u8], what: &str) -> Result<Vec<u8>> {
     let mut id = age::scrypt::Identity::new(SecretString::from(pass.to_string()));
     id.set_max_work_factor(24);
     age::decrypt(&id, bytes).map_err(|_| refuse(format!("wrong {what}")))
@@ -211,7 +211,7 @@ pub fn write_staged(store: &Store, files: &[(String, Vec<u8>)], remove: &[String
     crate::track::stage(store, &all)
 }
 
-fn read_wrapped(store: &Store, file: &str) -> Result<Vec<u8>> {
+pub(crate) fn read_wrapped(store: &Store, file: &str) -> Result<Vec<u8>> {
     std::fs::read(store.repo().join(rel(file)))
         .map_err(|_| refuse("there is no vault yet; run `dw vault init`".into()))
 }

@@ -660,8 +660,15 @@ from preferences.
 
 - Snapshots before any overwrite of HOME; retained 30 days with at least the 5 most
   recent per file (preferences).
-- `z` undoes the last local action: stage/unstage, track/untrack, assign, discard
-  (from snapshot), last unpushed commit. Never a push.
+- `z` (TUI) / `dw undo [--dry-run]` undoes the last local action: stage/unstage
+  (also of hunks and lines), track/untrack, assign and every other applied pending
+  item, discard (from its snapshot) and the last commit while it is on no remote
+  branch (HEAD moves back, the changes stay staged). Never a push. The journal
+  (`undo.json`, 20 actions, in the state directory) stores HEAD and the index tree
+  before and after each action plus chezmoi's state; the repository equals its
+  index, so that describes it completely. An entry is undone only while the
+  repository still is in its recorded "after" state; otherwise exit 7 (stale)
+  and nothing changes. Pull, revert, branch and stash operations are not journalled.
 - Point-in-time restore of one file or all files from any commit (through Incoming
   so it is reviewed).
   `restore --at REV PATH…|--all` saves only commit IDs and guards locally. It
@@ -674,8 +681,16 @@ from preferences.
   unrelated forward Incoming changes. Regular UTF-8 files and Dotwarden-owned
   templates are supported; locked secrets require unlock. Stage/commit the
   result normally to make the restore part of shared history.
-- Archive: git bundle of the repository + registry, encrypted with the vault
-  passphrase; `archive import` restores a machine offline.
+- Archive: `dw archive export FILE [--force] [--dry-run]` writes a git bundle of
+  every ref of the repository (registry and vault included) with this machine's
+  registry name and its `remote.*`/`branch.*` settings, sealed with age passphrase
+  encryption under the vault passphrase (asked on the terminal; it must be the
+  vault's). Staged but uncommitted changes are not included (a warning says so).
+  `dw archive import FILE [--dry-run]` on a computer without a repository decrypts
+  it, rebuilds the repository with all branches and remotes, and registers the
+  computer under its old name; `dw apply --all` then writes its files. No network
+  is used, and a failed import leaves nothing behind. Privacy confirmations are not
+  carried over.
 
 ## 12. Settings
 

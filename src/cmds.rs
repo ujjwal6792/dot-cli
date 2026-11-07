@@ -861,6 +861,88 @@ fn confirm(items: &[&&Item]) -> Result<bool> {
     Ok(matches!(line.trim(), "y" | "Y" | "yes"))
 }
 
+pub fn undo_cmd(store: &Store, dry_run: bool, json: bool) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let done = crate::undo::undo(store, dry_run)?;
+    if json {
+        print_json(&done)?;
+    } else {
+        let verb = if dry_run { "would undo" } else { "undid" };
+        println!("{verb}: {}", done.summary);
+        for e in &done.effects {
+            println!("  {e}");
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn archive_export(
+    store: &Store,
+    file: &std::path::Path,
+    force: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let pass =
+        crate::vault::read_secret(store, crate::vault::Prompt::Passphrase, "Vault passphrase")?;
+    let file = cwd()?.join(file);
+    let out = crate::archive::export(store, &pass, &file, force, dry_run)?;
+    if json {
+        print_json(&out)?;
+    } else {
+        let verb = if dry_run { "would write" } else { "wrote" };
+        println!(
+            "{verb} {} (branch {}, registry: {})",
+            out.file,
+            out.branch,
+            out.registry.join(", ")
+        );
+        if out.uncommitted > 0 {
+            println!(
+                "warning: {} staged change(s) are not in the archive; commit them first",
+                out.uncommitted
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn archive_import(
+    store: &Store,
+    file: &std::path::Path,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let pass = crate::vault::read_secret(
+        store,
+        crate::vault::Prompt::Passphrase,
+        "Archive (vault) passphrase",
+    )?;
+    let file = cwd()?.join(file);
+    let out = crate::archive::import(store, &pass, &file, dry_run)?;
+    if json {
+        print_json(&out)?;
+    } else {
+        let verb = if dry_run { "would restore" } else { "restored" };
+        println!(
+            "{verb} branch {} at {}",
+            out.branch,
+            &out.head[..out.head.len().min(8)]
+        );
+        match (&out.machine, out.registered) {
+            (Some(m), true) => {
+                println!("this computer is machine {m}; run `dw apply --all` to write its files")
+            }
+            (Some(m), false) if !dry_run => println!(
+                "machine {m} is not in the restored registry; register this computer with `dw machine add`"
+            ),
+            _ => {}
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
 pub fn snapshot_list(store: &Store, path: Option<&str>, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
     let snaps = match path {

@@ -2057,6 +2057,35 @@ fn apply_review(
     items: &[Item],
     out: &mut Vec<ItemResult>,
 ) -> Result<()> {
+    let first = out.len();
+    let mark = crate::undo::mark(store);
+    let outcome = apply_review_items(store, lock, items, out);
+    let applied: Vec<&ItemResult> = out[first..]
+        .iter()
+        .filter(|r| r.status == Outcome::Applied)
+        .collect();
+    if let Some(head) = applied.first() {
+        let (kind, summary) = if applied.len() == 1 {
+            (head.kind, head.summary.clone())
+        } else if applied.iter().all(|r| r.kind == head.kind) {
+            (head.kind, format!("{} {} items", applied.len(), head.kind))
+        } else {
+            ("pending", format!("{} pending items", applied.len()))
+        };
+        let actor = items
+            .first()
+            .map_or_else(|| crate::undo::actor(store), |i| i.requester.clone());
+        crate::undo::record(store, mark, kind, summary, &actor);
+    }
+    outcome
+}
+
+fn apply_review_items(
+    store: &Store,
+    lock: &Lock,
+    items: &[Item],
+    out: &mut Vec<ItemResult>,
+) -> Result<()> {
     let mut i = 0;
     while i < items.len() {
         let len = items[i..].iter().take_while(|it| batchable(it)).count();
@@ -2102,6 +2131,7 @@ pub fn apply_items(store: &Store, lock: &Lock, items: &[Item]) -> Result<Vec<Ite
         let outcome = match &item.action {
             Action::Discard { files, .. } => {
                 crate::changes::discard_files(store, files, &item.requester).map(|snap| {
+                    crate::undo::record_discard(store, snap.clone(), files, &item.requester);
                     let note = match snap {
                         Some(id) => format!("snapshot {id} taken first"),
                         None => "nothing to snapshot (file was deleted)".to_string(),

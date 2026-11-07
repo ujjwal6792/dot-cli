@@ -105,7 +105,10 @@ pub fn commit_all(store: &Store, message: &str) -> Result<()> {
 
 /// Run `body`; on failure remove the half-created repository so the command
 /// can simply be retried.
-fn cleaning_up_on_error<T>(store: &Store, body: impl FnOnce() -> Result<T>) -> Result<T> {
+pub(crate) fn cleaning_up_on_error<T>(
+    store: &Store,
+    body: impl FnOnce() -> Result<T>,
+) -> Result<T> {
     let result = body();
     if result.is_err() {
         let _ = fs::remove_dir_all(store.repo());
@@ -128,6 +131,21 @@ pub fn init(store: &Store, branch: &str) -> Result<()> {
     })
 }
 
+/// Check that the repository in the store is a Dotwarden repository of a format this version reads.
+pub(crate) fn check_repository(store: &Store, label: &str) -> Result<()> {
+    if !store.is_initialised() {
+        bail!("{label} is not a Dotwarden repository (missing .chezmoiroot or dotwarden.toml)");
+    }
+    let text = fs::read_to_string(store.repo().join("dotwarden.toml"))?;
+    let t: toml::Table = toml::from_str(&text).context("parsing dotwarden.toml")?;
+    match t.get("format").and_then(toml::Value::as_integer) {
+        Some(f) if f == i64::from(FORMAT_VERSION) => Ok(()),
+        other => bail!(
+            "unsupported repository format {other:?} (this dotwarden understands {FORMAT_VERSION})"
+        ),
+    }
+}
+
 /// `dw clone`: clone `url` into the store and check it is a Dotwarden
 /// repository. No machine is registered yet.
 pub fn clone(store: &Store, url: &str) -> Result<()> {
@@ -139,17 +157,7 @@ pub fn clone(store: &Store, url: &str) -> Result<()> {
         let mut cmd = store.git_command(&store.dirs.data_dir());
         cmd.args(["clone", "--quiet", "--"]).arg(url).arg(&repo);
         crate::exec::run_ok(cmd, None)?;
-        if !store.is_initialised() {
-            bail!("{url} is not a Dotwarden repository (missing .chezmoiroot or dotwarden.toml)");
-        }
-        let text = fs::read_to_string(repo.join("dotwarden.toml"))?;
-        let t: toml::Table = toml::from_str(&text).context("parsing dotwarden.toml")?;
-        match t.get("format").and_then(toml::Value::as_integer) {
-            Some(f) if f == i64::from(FORMAT_VERSION) => Ok(()),
-            other => bail!(
-                "unsupported repository format {other:?} (this dotwarden understands {FORMAT_VERSION})"
-            ),
-        }
+        check_repository(store, url)
     })
 }
 

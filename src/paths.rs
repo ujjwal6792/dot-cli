@@ -96,6 +96,10 @@ impl Dirs {
     pub fn activity_file(&self) -> PathBuf {
         self.state_dir().join("activity.jsonl")
     }
+    /// The undo journal: what `z` can take back (spec §11).
+    pub fn undo_file(&self) -> PathBuf {
+        self.state_dir().join("undo.json")
+    }
     /// This machine's registry name and local confirmations.
     pub fn machine_toml(&self) -> PathBuf {
         self.state_dir().join("machine.toml")

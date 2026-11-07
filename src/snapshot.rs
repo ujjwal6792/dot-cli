@@ -72,6 +72,12 @@ pub fn now_unix() -> u64 {
         .map_or(0, |d| d.as_secs())
 }
 
+pub fn now_unix_nanos() -> u128 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |d| d.as_nanos())
+}
+
 fn private_dir(path: &Path) -> Result<()> {
     if !path.is_dir() {
         if let Some(parent) = path.parent() {
