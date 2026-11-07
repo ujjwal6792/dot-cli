@@ -1141,13 +1141,7 @@ pub struct Committed {
 }
 
 pub fn agent(store: &Store) -> Option<String> {
-    store
-        .env()
-        .get(OsStr::new("DOTWARDEN_AGENT"))
-        .and_then(|v| v.to_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .map(str::to_string)
+    crate::agent::name(store.env())
 }
 
 fn edit_message(store: &Store, initial: &str) -> Result<String> {

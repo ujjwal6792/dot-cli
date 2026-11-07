@@ -658,7 +658,7 @@ pub fn finish(store: &Store, action: &Action) -> Result<()> {
 
 /// `dw machine use`: point this computer at an existing registry entry whose
 /// platform and distribution match it (after the machine was renamed elsewhere).
-pub fn use_machine(store: &Store, name: &str) -> Result<Machine> {
+pub fn use_machine(store: &Store, name: &str, dry_run: bool) -> Result<Machine> {
     let registry = repo::read_registry(&store.repo())?;
     let Some(m) = registry.into_iter().find(|m| m.name == name) else {
         return Err(refuse(format!(
@@ -676,6 +676,9 @@ pub fn use_machine(store: &Store, name: &str) -> Result<Machine> {
             "{name:?} is registered as {}/{} but this computer is {}/{}",
             m.platform, m.distribution, here.platform, here.distribution
         )));
+    }
+    if dry_run {
+        return Ok(m);
     }
     let _lock = store.lock()?;
     store.write_local_machine(name)?;

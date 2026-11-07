@@ -247,6 +247,21 @@ pub fn commit_info(store: &Store, commit: &str) -> Result<Commit> {
     })
 }
 
+/// The commit a revert would undo and the repository files it would change.
+/// Nothing is written.
+pub fn plan_revert(store: &Store, commit: &str) -> Result<(Commit, Vec<String>)> {
+    let hash = resolve(store, commit)?;
+    let info = commit_info(store, &hash)?;
+    let parent = if info.merge { "^1" } else { "^" };
+    let out = store.git(&["diff", "--name-only", &format!("{hash}{parent}"), &hash])?;
+    let files = out
+        .stdout
+        .lines()
+        .map(|f| crate::conflicts::masked(store, f))
+        .collect();
+    Ok((info, files))
+}
+
 /// Create a revert commit for `commit`. A conflicting revert is abandoned and
 /// leaves the repository as it was.
 pub fn revert(store: &Store, commit: &str, agent: Option<&str>) -> Result<Commit> {
