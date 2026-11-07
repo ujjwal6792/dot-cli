@@ -400,6 +400,21 @@ fn d_asks_before_discarding_and_a_snapshot_keeps_the_edit() {
 }
 
 #[test]
+fn z_undoes_the_last_local_action() {
+    let mut tui = open(edited());
+    let before = tui.changes();
+    tui.press(' ');
+    assert_ne!(tui.changes(), before);
+    tui.press('z');
+    assert_eq!(tui.changes(), before);
+    tui.press('d');
+    tui.press('y');
+    assert!(tui.changes().is_empty());
+    tui.press('z');
+    assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "two\n");
+}
+
+#[test]
 fn the_main_view_shows_the_selected_diff_styled_by_delta() {
     let mut tui = open(edited());
     let Load::Ready(text) = &tui.app.diff else {

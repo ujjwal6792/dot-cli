@@ -1,6 +1,7 @@
 //! Dotwarden: dotfiles, secrets and variables in sync across machines.
 
 pub mod agent;
+pub mod archive;
 pub mod assign;
 pub mod branches;
 pub mod changes;
@@ -37,6 +38,7 @@ pub mod templates;
 pub mod toolchain;
 pub mod track;
 pub mod tui;
+pub mod undo;
 pub mod values;
 pub mod variants;
 pub mod vault;

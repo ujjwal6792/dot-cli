@@ -416,6 +416,7 @@ pub fn apply(
     track::ensure_repo_clean(store)?;
     let tree = track::index_tree(store)?;
     let backup = track::state_backup(store)?;
+    let mark = crate::undo::mark(store);
     let run = || -> Result<()> {
         fs::write(store.repo().join(&source), text)?;
         // The committed text moved, so what chezmoi last wrote must move with it.
@@ -428,5 +429,11 @@ pub fn apply(
         track::state_restore(store, backup)?;
         return Err(e.context("staging failed; the repository was left as before"));
     }
+    let (kind, verb) = match side {
+        Side::Stage => ("stage", "stage lines of"),
+        Side::Unstage => ("unstage", "unstage lines of"),
+    };
+    let summary = crate::undo::describe(verb, &[rel.to_string()]);
+    crate::undo::record(store, mark, kind, summary, &crate::undo::actor(store));
     Ok(out)
 }

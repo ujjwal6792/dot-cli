@@ -376,7 +376,14 @@ pub struct Done {
 /// can be staged). Explicitly named changes that cannot be staged are refused;
 /// with `None`, or inside a named folder, they are skipped and reported.
 pub fn stage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Done> {
-    stage_with(store, sel, dry_run, None)
+    let lock = if dry_run { None } else { Some(store.lock()?) };
+    let mark = lock.as_ref().and_then(|_| crate::undo::mark(store));
+    let done = stage_with(store, sel, dry_run, lock.as_ref())?;
+    if !dry_run {
+        let summary = crate::undo::describe("stage", &done.paths);
+        crate::undo::record(store, mark, "stage", summary, &crate::undo::actor(store));
+    }
+    Ok(done)
 }
 
 /// [`stage`] for a caller that already holds the mutation lock (`held`).
@@ -757,6 +764,16 @@ fn prune_empty_dirs(repo: &Path, file: &Path) {
 /// HOME files (such as a staged untrack's data changes).
 pub fn unstage(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Done> {
     let _lock = if dry_run { None } else { Some(store.lock()?) };
+    let mark = (!dry_run).then(|| crate::undo::mark(store)).flatten();
+    let done = unstage_locked(store, sel, dry_run)?;
+    if !dry_run {
+        let summary = crate::undo::describe("unstage", &done.paths);
+        crate::undo::record(store, mark, "unstage", summary, &crate::undo::actor(store));
+    }
+    Ok(done)
+}
+
+fn unstage_locked(store: &Store, sel: Option<&[String]>, dry_run: bool) -> Result<Done> {
     let repo = store.repo();
     let ctx = Ctx::load(store)?;
     let vars = crate::variants::Variants::read(&repo)?;
@@ -1217,6 +1234,7 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
     } else {
         Some(store.lock()?)
     };
+    let mark = (!opts.dry_run).then(|| crate::undo::mark(store)).flatten();
     crate::repo::require_git_identity(store)?;
     let staged = staged_paths(store)?;
     if staged.is_empty() && !opts.amend {
@@ -1302,6 +1320,9 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
             .trim()
             .to_string(),
     );
+    let verb = if opts.amend { "amend" } else { "commit" };
+    let summary = format!("{verb} \"{}\"", done.subject);
+    crate::undo::record(store, mark, "commit", summary, &crate::undo::actor(store));
     Ok(done)
 }
 

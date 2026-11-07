@@ -47,7 +47,10 @@ const HELP: &[(&str, &str)] = &[
         "c A d (Changes)",
         "commit, amend (Ctrl+J: new line), discard; Enter diff",
     ),
-    ("f p P", "fetch, pull (rebase if diverged), push (y/n)"),
+    (
+        "f p P z",
+        "fetch, pull, push (y/n); z undoes the last local action",
+    ),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
     ("Enter (Pending)", "review and apply all checked items"),
