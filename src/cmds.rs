@@ -1023,8 +1023,17 @@ pub fn remote_list(store: &Store, json: bool) -> Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn fetch_cmd(store: &Store, all: bool, json: bool) -> Result<ExitCode> {
+pub fn fetch_cmd(store: &Store, all: bool, dry_run: bool, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
+    if dry_run {
+        let remotes = remote::plan_fetch(store, all)?;
+        if json {
+            print_json(&json!({"dry_run": true, "would_fetch": remotes}))?;
+        } else {
+            println!("Would fetch {}.", remotes.join(", "));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let f = remote::fetch(store, all, None)?;
     if json {
         print_json(&f)?;
@@ -1043,9 +1052,24 @@ pub fn pull_cmd(
     from: Option<&str>,
     mode: remote::PullMode,
     action: Option<&str>,
+    dry_run: bool,
     json: bool,
 ) -> Result<ExitCode> {
     require_initialised(store)?;
+    if dry_run {
+        let plan = remote::plan_pull(store, from, mode)?;
+        if json {
+            print_json(&json!({"dry_run": true, "plan": plan}))?;
+        } else if let Some(why) = &plan.why {
+            println!("Would refuse to pull {}: {why}.", plan.remote);
+        } else {
+            println!(
+                "Would pull from {}: {} ({} behind, {} ahead, {} file(s) changed).",
+                plan.remote, plan.how, plan.behind, plan.ahead, plan.files
+            );
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let p = match action {
         Some("continue") => remote::pull_continue(store)?,
         Some(_) => {
@@ -1366,8 +1390,20 @@ pub fn show_cmd(store: &Store, commit: &str, path: Option<&str>, json: bool) -> 
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn revert_cmd(store: &Store, commit: &str, json: bool) -> Result<ExitCode> {
+pub fn revert_cmd(store: &Store, commit: &str, dry_run: bool, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
+    if dry_run {
+        let (c, files) = crate::history::plan_revert(store, commit)?;
+        if json {
+            print_json(&json!({"dry_run": true, "commit": c, "files": files}))?;
+        } else {
+            println!("Would revert {} {}:", c.short, c.subject);
+            for f in &files {
+                println!("  {f}");
+            }
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
     let c = crate::history::revert(store, commit, changes::agent(store).as_deref())?;
     if json {
         print_json(&c)?;
@@ -1800,7 +1836,7 @@ pub fn machine_preview(store: &Store, name: &str, diff: bool, json: bool) -> Res
     Ok(ExitCode::SUCCESS)
 }
 
-pub fn machine_use(store: &Store, name: &str, json: bool) -> Result<ExitCode> {
+pub fn machine_use(store: &Store, name: &str, dry_run: bool, json: bool) -> Result<ExitCode> {
     require_initialised(store)?;
     if changes::agent(store).is_some() {
         return Err(DwError::new(
@@ -1809,14 +1845,82 @@ pub fn machine_use(store: &Store, name: &str, json: bool) -> Result<ExitCode> {
         )
         .into());
     }
-    let m = crate::machines::use_machine(store, name)?;
+    let m = crate::machines::use_machine(store, name, dry_run)?;
     if json {
-        print_json(&json!({"machine": m}))?;
+        print_json(&json!({"machine": m, "dry_run": dry_run}))?;
     } else {
+        let now = if dry_run { "would become" } else { "is now" };
         println!(
-            "This computer is now {name} ({}/{})",
+            "This computer {now} {name} ({}/{})",
             m.platform, m.distribution
         );
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn activity_cmd(
+    store: &Store,
+    count: usize,
+    actor: Option<&str>,
+    json: bool,
+) -> Result<ExitCode> {
+    let entries = crate::agent::read(&store.dirs, count, actor)?;
+    if json {
+        print_json(&entries)?;
+    } else if entries.is_empty() {
+        println!("No activity recorded.");
+    } else {
+        for e in &entries {
+            println!(
+                "{}  {:<12} {}  (exit {})",
+                e.time, e.actor, e.command, e.exit
+            );
+        }
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+pub fn man_cmd(dir: Option<&std::path::Path>) -> Result<ExitCode> {
+    use clap::CommandFactory;
+    let cmd = crate::cli::Cli::command().name("dw");
+    match dir {
+        Some(d) => {
+            std::fs::create_dir_all(d)?;
+            clap_mangen::generate_to(cmd, d)?;
+            println!("Wrote man pages to {}", d.display());
+        }
+        None => clap_mangen::Man::new(cmd).render(&mut std::io::stdout())?,
+    }
+    Ok(ExitCode::SUCCESS)
+}
+
+/// The agent skill shipped inside the binary.
+pub const SKILL: &str = include_str!("../skills/dotwarden/SKILL.md");
+
+pub fn skill_cmd(install: Option<&std::path::Path>, force: bool, json: bool) -> Result<ExitCode> {
+    let Some(dir) = install else {
+        if json {
+            print_json(&json!({"name": "dotwarden", "content": SKILL}))?;
+        } else {
+            print!("{SKILL}");
+        }
+        return Ok(ExitCode::SUCCESS);
+    };
+    let file = dir.join("dotwarden").join("SKILL.md");
+    if let Ok(existing) = std::fs::read_to_string(&file)
+        && existing != SKILL
+        && !force
+    {
+        return Err(anyhow::anyhow!(
+            "{} exists and differs; use --force to replace it",
+            file.display()
+        ));
+    }
+    crate::fsutil::write_atomic(&file, SKILL)?;
+    if json {
+        print_json(&json!({"installed": file}))?;
+    } else {
+        println!("Installed {}", file.display());
     }
     Ok(ExitCode::SUCCESS)
 }

@@ -603,6 +603,19 @@ pub fn fetch(store: &Store, all: bool, cancel: Option<&CancelToken>) -> Result<F
     })
 }
 
+/// The remotes `fetch` would contact. Nothing is contacted or changed.
+pub fn plan_fetch(store: &Store, all: bool) -> Result<Vec<String>> {
+    let remotes = if all {
+        names(store)?
+    } else {
+        vec![default_remote(store)?]
+    };
+    if remotes.is_empty() {
+        bail!("no remotes; add one with `dw remote add NAME URL`");
+    }
+    Ok(remotes)
+}
+
 // ---- pull ----------------------------------------------------------------
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -623,6 +636,70 @@ pub struct Pulled {
     pub how: &'static str,
     /// Stored files (repository paths) a merge in progress left conflicting.
     pub conflicts: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+pub struct PullPlan {
+    pub remote: String,
+    pub ahead: u32,
+    pub behind: u32,
+    /// `up-to-date`, `fast-forward`, `rebase`, `merge` or `refused` (see `why`).
+    pub how: &'static str,
+    pub files: usize,
+    pub why: Option<String>,
+}
+
+/// What `pull` would do with what was last fetched. No network, no lock, no writes.
+pub fn plan_pull(store: &Store, remote: Option<&str>, mode: PullMode) -> Result<PullPlan> {
+    if merge_in_progress(store) {
+        bail!(
+            "a merge is in progress: resolve the conflicts, then `dw pull --continue` (or `--abort`)"
+        );
+    }
+    let remote = match remote {
+        Some(r) => r.to_string(),
+        None => default_remote(store)?,
+    };
+    let branch = current_branch(store)?;
+    let reference = format!("{remote}/{branch}");
+    if store
+        .git(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/remotes/{reference}"),
+        ])
+        .is_err()
+    {
+        bail!("{reference} has not been fetched; `dw fetch` first");
+    }
+    let (ahead, behind) = counts(store, &reference)?;
+    let base = text(store, &["merge-base", "HEAD", &reference]).unwrap_or_default();
+    let files = store
+        .git(&["diff", "--name-only", &format!("{base}..{reference}")])
+        .map(|o| o.stdout.lines().count())
+        .unwrap_or(0);
+    let mut why = None;
+    let how = if behind == 0 {
+        "up-to-date"
+    } else if ahead == 0 {
+        "fast-forward"
+    } else if store.git(&["diff", "--cached", "--quiet"]).is_err() {
+        why = Some("history has diverged and staged changes are waiting".to_string());
+        "refused"
+    } else if mode == PullMode::Merge {
+        "merge"
+    } else {
+        "rebase"
+    };
+    Ok(PullPlan {
+        remote,
+        ahead,
+        behind,
+        how,
+        files: if behind == 0 { 0 } else { files },
+        why,
+    })
 }
 
 fn git_dir_has(store: &Store, name: &str) -> bool {

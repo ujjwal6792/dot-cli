@@ -606,7 +606,11 @@ one-time human confirmation that the remote is private, stored per remote in
 - This is a guard against agent mistakes, not a security boundary against a
   hostile process running as the same user.
 - Agent identity: `DOTWARDEN_AGENT=<name>` (and known agent environments) label the
-  activity log and commit trailers.
+  activity log and commit trailers. `AI_AGENT`, `CLAUDECODE`, `OPENCODE`,
+  `CODEX_SANDBOX`, `CURSOR_AGENT` and `GEMINI_CLI` are recognised, but only when
+  stdin/stdout is not a terminal, so a person in an agent's terminal still acts as
+  themselves. `dw activity [-n N] [--actor A]` shows the log; records hold the
+  command name, actor and exit code only. Reads and dry-runs are not logged.
 
 ## 9. CLI contract
 
@@ -623,8 +627,11 @@ one-time human confirmation that the remote is private, stored per remote in
   `assign`, `variant`, `machine (list|add|rename|retire|preview)`,
   `values (list|set-variable|add-secret|wire)`, `vault (init|unlock|lock|passwd|recover)`,
   `pending (list|drop|approve)`, `snapshot (list|restore)`, `archive (export|import)`,
-  `hide`, `settings`, `doctor`, `self-update`.
+  `hide`, `settings`, `doctor`, `self-update`; also `approve`, `activity`,
+  `completions`, `man [--dir]` and `skill [--install DIR]` (the bundled agent skill).
 - Every mutation supports `--dry-run`, returning exactly what would change.
+  Exception: `vault init|unlock|lock|passwd|recover` (interactive passphrase flows).
+  `pull --dry-run` uses what was last fetched and never touches the network.
 
 ## 10. TUI
 

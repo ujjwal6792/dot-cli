@@ -349,16 +349,9 @@ impl List {
     }
 }
 
-/// Who is asking: the agent named by `DOTWARDEN_AGENT`, else `human`.
+/// Who is asking: the acting agent, else `human`.
 pub fn requester(store: &Store) -> String {
-    store
-        .env()
-        .get(std::ffi::OsStr::new("DOTWARDEN_AGENT"))
-        .and_then(|v| v.to_str())
-        .map(str::trim)
-        .filter(|v| !v.is_empty())
-        .unwrap_or("human")
-        .to_string()
+    crate::agent::name(store.env()).unwrap_or_else(|| "human".into())
 }
 
 /// Read the pending list; a missing file is an empty list. Needs no lock.

@@ -366,6 +366,9 @@ pub enum Command {
         /// Fetch every remote instead of only the default one.
         #[arg(long)]
         all: bool,
+        /// Name the remotes that would be fetched without contacting them.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Bring the branch up to the remote's; HOME is never touched.
     ///
@@ -386,6 +389,9 @@ pub enum Command {
         /// Abandon a merge in progress.
         #[arg(long)]
         abort: bool,
+        /// Show what pulling would do, from what was last fetched; no network, nothing changes.
+        #[arg(long, conflicts_with_all = ["continue_merge", "abort"])]
+        dry_run: bool,
     },
     /// List, create, switch or delete local branches; never writes HOME.
     Branch {
@@ -433,6 +439,9 @@ pub enum Command {
     Revert {
         /// Commit hash or revision to undo; merge commits use their first parent.
         commit: String,
+        /// Show the files the revert would change without creating it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Write Incoming files to HOME (a snapshot of them is taken first).
     ///
@@ -468,6 +477,52 @@ pub enum Command {
         /// Show what would be pushed without changing anything.
         #[arg(long)]
         dry_run: bool,
+    },
+    /// Approve pending items that need a human (interactive terminal only).
+    ///
+    /// Shows each item and asks. Same as `dw pending apply ID...`; agents are
+    /// refused and the request stays in the pending list.
+    Approve {
+        /// Item numbers (see `dw pending`).
+        #[arg(required = true, num_args = 1..)]
+        ids: Vec<u64>,
+        /// Show what would be applied without asking or applying.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show the local activity log: which command ran, who ran it, how it ended.
+    ///
+    /// Records hold command names only, never arguments, paths or values.
+    Activity {
+        /// How many of the newest records to show.
+        #[arg(short = 'n', long, default_value_t = 20)]
+        count: usize,
+        /// Only records of this actor (`human` or an agent name).
+        #[arg(long)]
+        actor: Option<String>,
+    },
+    /// Print a shell completion script.
+    Completions {
+        /// Shell to generate for.
+        shell: clap_complete::Shell,
+    },
+    /// Generate man pages: dw(1) on stdout, or every page into a directory.
+    Man {
+        /// Write dw.1 and one page per command into this directory.
+        #[arg(long)]
+        dir: Option<std::path::PathBuf>,
+    },
+    /// Print the bundled agent skill, or install it for an agent.
+    ///
+    /// The skill tells an agent how to use dw safely: what it may do, what needs
+    /// a human, and how to read the exit codes.
+    Skill {
+        /// Write <DIR>/dotwarden/SKILL.md (for example ~/.claude/skills).
+        #[arg(long, value_name = "DIR")]
+        install: Option<std::path::PathBuf>,
+        /// Replace an installed skill that differs.
+        #[arg(long, requires = "install")]
+        force: bool,
     },
     /// Open the terminal UI (the default when no command is given).
     Tui,
@@ -692,6 +747,9 @@ pub enum MachineCmd {
     Use {
         /// Registry machine this computer is.
         name: String,
+        /// Check that this computer could be that machine without changing it.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// List the tracked files a machine would receive.
     ///
@@ -919,6 +977,7 @@ pub fn main(bin_name: &'static str) -> ExitCode {
         Err(e) => e.exit(),
     };
     let json = cli.json;
+    let command = command_path(&matches);
     let code = match run(cli) {
         Ok(code) => code,
         Err(e) => {
@@ -927,7 +986,66 @@ pub fn main(bin_name: &'static str) -> ExitCode {
         }
     };
     crate::render::forget();
+    log_activity(&command, &code);
     code
+}
+
+/// The subcommand chain, e.g. `pending apply`; `tui` when none was given.
+fn command_path(matches: &clap::ArgMatches) -> String {
+    let mut names = Vec::new();
+    let mut m = matches;
+    while let Some((name, sub)) = m.subcommand() {
+        names.push(name);
+        m = sub;
+    }
+    if names.is_empty() {
+        "tui".into()
+    } else {
+        names.join(" ")
+    }
+}
+
+/// Record the command in the activity log, once the repository exists. Reads
+/// and dry-runs are not logged (they write nothing, spec §9), nor are chezmoi's helper calls.
+fn log_activity(command: &str, code: &ExitCode) {
+    if is_read_only(command) || std::env::args_os().any(|a| a == "--dry-run") {
+        return;
+    }
+    let env = crate::paths::process_env();
+    let Ok(dirs) = crate::paths::Dirs::from_env(&env) else {
+        return;
+    };
+    if !dirs.state_dir().is_dir() {
+        return;
+    }
+    crate::agent::record(&dirs, &env, command, exit_number(*code));
+}
+
+fn is_read_only(command: &str) -> bool {
+    let last = command.rsplit(' ').next().unwrap_or_default();
+    matches!(last, "list" | "show" | "status" | "preview")
+        || matches!(
+            command,
+            "status"
+                | "doctor"
+                | "ls"
+                | "diff"
+                | "log"
+                | "pending"
+                | "hide"
+                | "tui"
+                | "activity"
+                | "helper-secret"
+                | "helper-file"
+                | "completions"
+                | "man"
+                | "skill"
+        )
+}
+
+/// ExitCode has no accessor; every code dotwarden returns is 0..=7 (spec §9).
+fn exit_number(code: ExitCode) -> u8 {
+    (0..=7).find(|n| code == ExitCode::from(*n)).unwrap_or(1)
 }
 
 /// Rust ignores SIGPIPE, so printing into a closed pipe (`dw status | head`)
@@ -1164,7 +1282,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 MachineCmd::Retire { name, yes, dry_run } => {
                     cmds::machine_retire(&store, &name, yes, dry_run, json)
                 }
-                MachineCmd::Use { name } => cmds::machine_use(&store, &name, json),
+                MachineCmd::Use { name, dry_run } => {
+                    cmds::machine_use(&store, &name, dry_run, json)
+                }
                 MachineCmd::Preview { name, diff } => {
                     cmds::machine_preview(&store, &name, diff, json)
                 }
@@ -1269,12 +1389,13 @@ fn run(cli: Cli) -> Result<ExitCode> {
                 RemoteCmd::List => cmds::remote_list(&store, json),
             };
         }
-        Command::Fetch { all } => return cmds::fetch_cmd(&store, all, json),
+        Command::Fetch { all, dry_run } => return cmds::fetch_cmd(&store, all, dry_run, json),
         Command::Pull {
             remote,
             merge,
             continue_merge,
             abort,
+            dry_run,
         } => {
             let mode = if merge {
                 crate::remote::PullMode::Merge
@@ -1288,7 +1409,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             } else {
                 None
             };
-            return cmds::pull_cmd(&store, remote.as_deref(), mode, action, json);
+            return cmds::pull_cmd(&store, remote.as_deref(), mode, action, dry_run, json);
         }
         Command::Branch { action } => return cmds::branch_cmd(&store, action, json),
         Command::Stash { action } => return cmds::stash_cmd(&store, action, json),
@@ -1305,7 +1426,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
         Command::Show { commit, path } => {
             return cmds::show_cmd(&store, &commit, path.as_deref(), json);
         }
-        Command::Revert { commit } => return cmds::revert_cmd(&store, &commit, json),
+        Command::Revert { commit, dry_run } => {
+            return cmds::revert_cmd(&store, &commit, dry_run, json);
+        }
         Command::Apply {
             paths,
             all,
@@ -1326,6 +1449,21 @@ fn run(cli: Cli) -> Result<ExitCode> {
             };
         }
         Command::Ls { path, all } => return cmds::ls_cmd(&store, path.as_deref(), all, json),
+        Command::Approve { ids, dry_run } => {
+            return cmds::pending_apply(&store, &ids, false, dry_run, false, json);
+        }
+        Command::Activity { count, actor } => {
+            return cmds::activity_cmd(&store, count, actor.as_deref(), json);
+        }
+        Command::Completions { shell } => {
+            let mut cmd = Cli::command().name("dw");
+            clap_complete::generate(shell, &mut cmd, "dw", &mut std::io::stdout());
+            return Ok(ExitCode::SUCCESS);
+        }
+        Command::Man { dir } => return cmds::man_cmd(dir.as_deref()),
+        Command::Skill { install, force } => {
+            return cmds::skill_cmd(install.as_deref(), force, json);
+        }
         Command::Tui => {
             if !store.is_initialised() {
                 return Err(DwError::usage(

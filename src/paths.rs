@@ -92,6 +92,10 @@ impl Dirs {
     pub fn pending_file(&self) -> PathBuf {
         self.state_dir().join("pending.json")
     }
+    /// The local activity log: one JSON record per command, never values.
+    pub fn activity_file(&self) -> PathBuf {
+        self.state_dir().join("activity.jsonl")
+    }
     /// This machine's registry name and local confirmations.
     pub fn machine_toml(&self) -> PathBuf {
         self.state_dir().join("machine.toml")
