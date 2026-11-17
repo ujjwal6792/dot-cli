@@ -580,7 +580,9 @@ first step that needs a decision:
    (`-e`), or the generated message `sync from <machine>: N changed, M new
    (<first few paths>)`. Nothing staged means no commit.
 5. Push to the upstream remote (or `--remote`), with the privacy check; push only
-   when HEAD is ahead.
+   when HEAD is ahead. A repository with no remote at all skips steps 1 and 5:
+   sync commits locally, says how to add a remote (`dw remote add origin URL`)
+   and exits 0; `dw status` keeps reporting the commits as unbacked.
 
 In a terminal, sync first prints the plan (files applied, staged, skipped, the
 message, the push target) and asks `Proceed? [Y/n]`; `--yes` skips the question.
