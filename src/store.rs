@@ -102,7 +102,7 @@ impl Store {
                 cmd.env(k, v);
             }
         }
-        self.apply_git_env(&mut cmd);
+        self.apply_git_env(&mut cmd, true);
         cmd.env(crate::render::MASK_ENV, "1");
         let mut path = vec![self.tools.git_root().join("bin")];
         if let Some(existing) = self.env.get(OsStr::new("PATH")) {
@@ -226,7 +226,10 @@ impl Store {
         for entry in out.stdout.split('\0').filter(|e| !e.is_empty()) {
             let (key, value) = entry.split_once('\n').unwrap_or((entry, ""));
             if toolchain::is_forwarded_git_key(key) {
-                found.retain(|(k, _)| k != key);
+                // Credential helpers are lists: every entry counts, in order.
+                if !toolchain::is_credential_key(key) {
+                    found.retain(|(k, _)| k != key);
+                }
                 found.push((key.to_string(), value.to_string()));
             }
         }
@@ -236,15 +239,19 @@ impl Store {
     /// Environment that isolates git: no system or global configuration, the
     /// portable git's own paths, and the forwarded identity as `GIT_CONFIG_*`
     /// pairs (which also reach git processes started by chezmoi).
-    fn apply_git_env(&self, cmd: &mut Command) {
+    fn apply_git_env(&self, cmd: &mut Command, credentials: bool) {
         cmd.env("GIT_CONFIG_NOSYSTEM", "1");
         cmd.env("GIT_CONFIG_GLOBAL", "/dev/null");
         for (k, v) in self.tools.git_env() {
             cmd.env(k, v);
         }
-        let identity = self.git_identity();
+        let identity: Vec<&(String, String)> = self
+            .git_identity()
+            .iter()
+            .filter(|(k, _)| credentials || !toolchain::is_credential_key(k))
+            .collect();
         cmd.env("GIT_CONFIG_COUNT", identity.len().to_string());
-        for (i, (k, v)) in identity.iter().enumerate() {
+        for (i, (k, v)) in identity.into_iter().enumerate() {
             cmd.env(format!("GIT_CONFIG_KEY_{i}"), k);
             cmd.env(format!("GIT_CONFIG_VALUE_{i}"), v);
         }
@@ -254,6 +261,26 @@ impl Store {
     /// redirect git are removed; `GIT_SSH_COMMAND`, `SSH_AUTH_SOCK` and the like
     /// pass through so SSH remotes keep working.
     pub fn git_command(&self, cwd: &Path) -> Command {
+        self.git_command_with(cwd, true)
+    }
+
+    /// Like [`Store::git_command`] but without the user's credential helper
+    /// settings, for requests that must stay anonymous.
+    pub fn git_command_anonymous(&self, cwd: &Path) -> Command {
+        self.git_command_with(cwd, false)
+    }
+
+    /// The credential settings (`credential.*` helper, url and username keys)
+    /// from the user's global git config, in order, empty values included.
+    pub fn git_credential_entries(&self) -> Vec<(String, String)> {
+        self.git_identity()
+            .iter()
+            .filter(|(k, _)| toolchain::is_credential_key(k))
+            .cloned()
+            .collect()
+    }
+
+    fn git_command_with(&self, cwd: &Path, credentials: bool) -> Command {
         let mut cmd = Command::new(self.tools.git_bin());
         cmd.env_clear();
         for (k, v) in &self.env {
@@ -261,7 +288,7 @@ impl Store {
                 cmd.env(k, v);
             }
         }
-        self.apply_git_env(&mut cmd);
+        self.apply_git_env(&mut cmd, credentials);
         cmd.current_dir(cwd);
         cmd
     }

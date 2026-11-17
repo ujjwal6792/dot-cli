@@ -121,16 +121,31 @@ pub fn is_scrubbed_for_git(key: &str) -> bool {
 
 /// Whether a key of the user's global git configuration (as printed by
 /// `git config --null --get-regexp`: lowercase section and variable) is
-/// forwarded to dotwarden's git: identity and signing settings only.
+/// forwarded to dotwarden's git: identity, signing and credential settings only.
 pub fn is_forwarded_git_key(key: &str) -> bool {
-    match key {
-        "user.name" | "user.email" | "user.signingkey" | "commit.gpgsign" | "gpg.format"
-        | "gpg.program" => true,
-        _ => matches!(
-            key.strip_prefix("gpg.")
-                .and_then(|r| r.strip_suffix(".program")),
-            Some("openpgp" | "x509" | "ssh")
-        ),
+    is_credential_key(key)
+        || match key {
+            "user.name" | "user.email" | "user.signingkey" | "commit.gpgsign" | "gpg.format"
+            | "gpg.program" => true,
+            _ => matches!(
+                key.strip_prefix("gpg.")
+                    .and_then(|r| r.strip_suffix(".program")),
+                Some("openpgp" | "x509" | "ssh")
+            ),
+        }
+}
+
+/// Whether `key` configures credential helpers: `credential.<var>` or
+/// `credential.<url>.<var>` for `helper`, `usehttppath` and (url-scoped) `username`.
+pub fn is_credential_key(key: &str) -> bool {
+    let Some(rest) = key.strip_prefix("credential.") else {
+        return false;
+    };
+    match rest {
+        "helper" | "usehttppath" => true,
+        _ => ["helper", "usehttppath", "username"]
+            .iter()
+            .any(|v| rest.len() > v.len() + 1 && rest.ends_with(&format!(".{v}"))),
     }
 }
 
@@ -192,6 +207,11 @@ mod tests {
             "gpg.ssh.program",
             "gpg.openpgp.program",
             "gpg.x509.program",
+            "credential.helper",
+            "credential.usehttppath",
+            "credential.https://github.com.helper",
+            "credential.https://github.com/org.usehttppath",
+            "credential.https://github.com.username",
         ] {
             assert!(is_forwarded_git_key(k), "{k}");
         }
@@ -205,6 +225,10 @@ mod tests {
             "gpg.evil.program",
             "user.useconfigonly",
             "include.path",
+            "credential.username",
+            "credential.https://github.com.cache",
+            "credential.https://github.com.helperx",
+            "credential..helper",
         ] {
             assert!(!is_forwarded_git_key(k), "{k}");
         }

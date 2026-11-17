@@ -172,6 +172,39 @@ fn a_public_remote_is_refused_and_the_probe_gets_the_https_url() {
 }
 
 #[test]
+fn an_https_remote_warns_only_when_no_credential_helper_applies() {
+    let mut t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "alpha"]);
+    fake_probe(&mut t, 1);
+    let url = "https://github.com/me/dots.git";
+    let out = t.dw_ok(&["remote", "add", "origin", url, "--yes"]);
+    assert!(out.contains("no git credential helper"), "{out}");
+    assert!(
+        t.dw_ok(&["doctor"])
+            .contains("no credential helper applies")
+    );
+
+    let cfg = t.home.join(".gitconfig");
+    let mut text = fs::read_to_string(&cfg).unwrap_or_default();
+    text.push_str(
+        "[credential \"https://github.com\"]\n\thelper =\n\thelper = !gh auth git-credential\n",
+    );
+    fs::write(&cfg, text).unwrap();
+    let out = t.dw_ok(&[
+        "remote",
+        "add",
+        "two",
+        "https://github.com/me/other.git",
+        "--yes",
+    ]);
+    assert!(!out.contains("credential helper"), "{out}");
+    assert!(
+        t.dw_ok(&["doctor"])
+            .contains("a credential helper from the global git config applies")
+    );
+}
+
+#[test]
 fn a_private_known_host_is_added_and_an_unreachable_one_only_warns() {
     let mut t = TestEnv::new();
     t.dw_ok(&["init", "--name", "alpha"]);

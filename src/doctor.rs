@@ -105,6 +105,28 @@ pub fn run(store: &Store) -> Report {
         },
     ));
 
+    if d.repo().exists()
+        && let Ok(name) = crate::remote::default_remote(store)
+        && let Ok(Some(url)) = crate::remote::remote_url(store, &name)
+        && url.starts_with("https://")
+    {
+        let helper =
+            crate::remote::credential_helper_applies(&store.git_credential_entries(), &url);
+        // Informational: SSH remotes need no helper, and a missing one only breaks HTTPS.
+        checks.push(check(
+            "https credentials",
+            true,
+            if helper {
+                format!("{name} is HTTPS; a credential helper from the global git config applies")
+            } else {
+                format!(
+                    "{name} is HTTPS and no credential helper applies; \
+                     run `gh auth setup-git` or use an SSH URL"
+                )
+            },
+        ));
+    }
+
     for (label, path) in [
         ("repository", d.repo()),
         ("chezmoi config", d.chezmoi_config()),

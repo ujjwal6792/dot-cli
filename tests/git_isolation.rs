@@ -232,3 +232,129 @@ fn chezmoi_runs_with_the_bundled_git_and_the_same_isolation() {
     // chezmoi's git sees the forwarded identity and not the rest of ~/.gitconfig.
     assert_eq!(cat(".gcfg"), "test@example.com\nno-hooks");
 }
+
+/// A credential helper script that records each call and answers with fixed credentials.
+fn helper_config(t: &TestEnv) -> PathBuf {
+    let dir = t.root.path().canonicalize().unwrap();
+    let helper = dir.join("cred-helper.sh");
+    script(
+        &helper,
+        &format!(
+            "echo \"$1\" >> '{}/helper-calls'; cat > /dev/null; printf 'username=x\\npassword=y\\n'",
+            dir.display()
+        ),
+    );
+    let cfg = t.home.join(".gitconfig");
+    let mut text = fs::read_to_string(&cfg).unwrap_or_default();
+    text.push_str(&format!(
+        "[credential]\n\thelper = !{}\n[alias]\n\tzz = status\n",
+        helper.display()
+    ));
+    fs::write(&cfg, text).unwrap();
+    dir.join("helper-calls")
+}
+
+fn credential_fill(mut c: std::process::Command) -> (String, bool) {
+    use std::io::Write;
+    c.args(["credential", "fill"])
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped());
+    let mut child = c.spawn().unwrap();
+    child
+        .stdin
+        .take()
+        .unwrap()
+        .write_all(b"protocol=https\nhost=example.invalid\n\n")
+        .unwrap();
+    let o = child.wait_with_output().unwrap();
+    (
+        String::from_utf8_lossy(&o.stdout).into_owned(),
+        o.status.success(),
+    )
+}
+
+#[test]
+fn the_users_credential_helper_serves_dotwardens_git_but_not_the_anonymous_probe() {
+    let t = TestEnv::new();
+    let calls = helper_config(&t);
+    let store = t.store();
+
+    let (out, ok) = credential_fill(store.git_command(&t.home));
+    assert!(
+        ok && out.contains("username=x") && out.contains("password=y"),
+        "{out}"
+    );
+    assert_eq!(fs::read_to_string(&calls).unwrap().trim(), "get");
+
+    // Other global keys stay blocked.
+    let mut c = store.git_command(&t.home);
+    c.args(["config", "--get", "alias.zz"]);
+    assert!(!c.output().unwrap().status.success());
+
+    // The anonymous command carries no helper, so nothing is called or answered.
+    fs::remove_file(&calls).unwrap();
+    let mut anon = store.git_command_anonymous(&t.home);
+    anon.env("GIT_TERMINAL_PROMPT", "0")
+        .env("GIT_ASKPASS", "/bin/false");
+    let (out, ok) = credential_fill(anon);
+    assert!(!ok && !out.contains("password=y"), "{out}");
+    assert!(!calls.exists(), "the helper ran for an anonymous command");
+}
+
+#[test]
+fn credential_entries_keep_order_and_empty_resets_and_skip_unrelated_keys() {
+    let t = TestEnv::new();
+    fs::write(
+        t.home.join(".gitconfig"),
+        "[user]\n\tname = A\n\temail = a@example.com\n\
+         [credential]\n\thelper = first\n\tuseHttpPath = true\n\
+         [credential \"https://github.com\"]\n\thelper =\n\thelper = !gh auth git-credential\n\
+         \tusername = me\n\tcache = nope\n\
+         [credential]\n\thelper = last\n\
+         [alias]\n\tzz = status\n[url \"ssh://x/\"]\n\tinsteadOf = https://y/\n\
+         [core]\n\thooksPath = /evil\n",
+    )
+    .unwrap();
+    let got = t.store().git_credential_entries();
+    let got: Vec<(&str, &str)> = got.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    assert_eq!(
+        got,
+        [
+            ("credential.helper", "first"),
+            ("credential.usehttppath", "true"),
+            ("credential.https://github.com.helper", ""),
+            (
+                "credential.https://github.com.helper",
+                "!gh auth git-credential"
+            ),
+            ("credential.https://github.com.username", "me"),
+            ("credential.helper", "last"),
+        ]
+    );
+}
+
+#[test]
+fn the_public_remote_probe_carries_no_credential_helper() {
+    let t = TestEnv::new();
+    let calls = helper_config(&t);
+    let store = t.store();
+    let cmd = dotwarden::remote::probe_command(&store, "https://example.invalid/me/d.git");
+    let env: Vec<(String, String)> = cmd
+        .get_envs()
+        .filter_map(|(k, v)| Some((k.to_str()?.to_string(), v?.to_str()?.to_string())))
+        .collect();
+    let keys: Vec<&str> = env
+        .iter()
+        .filter(|(k, _)| k.starts_with("GIT_CONFIG_KEY_"))
+        .map(|(_, v)| v.as_str())
+        .collect();
+    assert!(keys.contains(&"user.name"), "{keys:?}");
+    assert!(
+        keys.iter().all(|k| !k.starts_with("credential.")),
+        "{keys:?}"
+    );
+    assert!(cmd.get_args().any(|a| a == "credential.helper="));
+    assert!(env.contains(&("GIT_TERMINAL_PROMPT".into(), "0".into())));
+    assert!(!calls.exists());
+}
