@@ -22,9 +22,12 @@ Goals:
   Agents can operate dotwarden without ever reading secret values from it.
 - Install with one `curl` command; no system chezmoi, git or delta required.
 
-Non-goals: Windows; importing existing dotfile setups through the UI (agents do
-that with ordinary CLI commands); background sync daemons; machine status
-reporting; raw chezmoi passthrough; hosted services.
+- Backing up is one habit-sized step (`dw sync`, TUI `S`) and an overdue backup is
+  visible; moving from a bare git repository in HOME is one command (`dw import`).
+
+Non-goals: Windows; carrying over the history of an existing dotfile setup
+(import tracks current files only, ADR 0008); background sync daemons; machine
+status reporting; raw chezmoi passthrough; hosted services.
 
 ## 2. Distribution and runtime (ADR 0002)
 
@@ -32,17 +35,29 @@ reporting; raw chezmoi passthrough; hosted services.
   `bin/dotwarden`, `bin/dw` (symlink), `libexec/chezmoi` (v2.73.3 at time of
   writing), `libexec/git/` (portable git from desktop/dugite-native, v2.56.0-2 at
   time of writing), `libexec/delta` (0.20.1), licenses (git is GPLv2: include its
-  license and a source offer/link), and a SHA256 manifest. Pins are recorded in one
-  file in the repo and verified at build time.
+  license and a source offer/link), man pages and shell completions
+  (`share/man/man1`, `share/completions`), and a SHA256 manifest. Pins are
+  recorded in one file in the repo and verified at build time.
+- Release rollout: Dotwarden versions start at 1.0.0 (the `v0.x` tags belong to
+  dot v1). v1.0 publishes macOS arm64 only. Linux x86-64 is built and tested by
+  CI from the start and attached to prerelease (`-rc`) tags only, until the owner
+  verifies it on a real machine; it becomes a stable target in v1.1. Linux arm64
+  stays pinned but unpublished. Intel Macs are unsupported (stated in the README).
+- Releases are built by GitHub Actions on a `v*` tag (macOS and Ubuntu runners):
+  format, clippy and tests, then bundles, the SHA256 manifest and a GitHub Release
+  on the public `dot-cli` repository, with `install.sh` as a release asset.
 - `curl -fsSL <url>/install.sh | sh`: detects OS/arch, downloads and verifies the
   bundle, installs to `~/.local/share/dotwarden/releases/<version>/`, points
   `~/.local/share/dotwarden/current` at it, and links `dotwarden` and `dw` into
-  `~/.local/bin`. No sudo. Prints PATH advice if needed.
-- `dw self-update` verifies checksums and switches `current`; keeps the previous
-  version for `dw self-update --rollback`. Disabled (with a message) when installed
-  by a package manager.
-- Packages: `.deb` (Ubuntu), AUR `dotwarden-bin`, Homebrew tap. Packages install
-  the same bundle layout under the package manager's prefix.
+  `~/.local/bin`. No sudo. Prints PATH advice if needed. Re-running it upgrades.
+  On a stable release it refuses targets that are not published yet (Linux until
+  v1.1) with a message naming the prerelease to use instead.
+- `dw self-update [--check] [--dry-run]` reads the latest GitHub release, verifies
+  checksums and switches `current`; keeps the previous version for
+  `dw self-update --rollback`. Prereleases only with `--pre`. Disabled (with a
+  message) when installed by a package manager or run from a source build.
+- Packages (after v1.x): `.deb` (Ubuntu), AUR `dotwarden-bin`, Homebrew tap.
+  Packages install the same bundle layout under the package manager's prefix.
 - Linux git from dugite-native is built on Ubuntu (glibc). Verify it runs on Arch
   and CachyOS; document the minimum glibc.
 
@@ -431,7 +446,11 @@ Actions:
 - **Commit** (`c`), **amend** (`A`), multi-line messages. Commits by agents get an
   `Agent: <name>` trailer.
 - **Discard** (`d`): snapshot HOME, then write the committed version to HOME.
-- **Apply** incoming changes: per file or all; snapshot before overwriting.
+- **Apply** incoming changes: per file or all; snapshot before overwriting. When
+  the HOME file being replaced was never written by dotwarden on this machine
+  (typically the first apply after `clone`), apply still overwrites it, and the
+  output (and `--dry-run` up front) lists every such file under "replaced
+  existing files" with the snapshot id and `dw snapshot restore` to undo.
 - **Conflicts**: 3-way view (last applied / HOME / incoming) with per-hunk
   local/incoming choice; `e` opens `$EDITOR` (nvim diff mode when the editor is
   nvim) on a merge file. Result is staged.
@@ -439,10 +458,33 @@ Actions:
   place; other machines show "no longer tracked" once.
 - **Tracked folder**: tracking a folder tracks its current files and records the
   folder; new files inside appear as New. Nothing is added automatically.
+- **Several paths at once**: `track` adds items for every valid path and lists
+  each refused one with its reason (hidden, possible secret, missing, not under
+  HOME) under "skipped"; it exits 1 only when nothing was added. The same rule
+  holds for `import` (§5a) and for staging in `sync` (§6a).
 - Symlinks are tracked as symlinks.
 - **Hide rules** (`hide`, shared, gitignore syntax) remove noise from the browser
   and refuse tracking. Sensible defaults (caches, histories, `node_modules`,
   `Library` except explicitly un-hidden paths, …) are written at repo creation.
+  A running TUI reloads them when `hide` changes (from `i` or `dw hide`).
+
+### 5a. Import (ADR 0008)
+
+`dw import --bare DIR | --from-file LIST | --from-file -` turns an existing
+setup's file list into track pending items for the files as they are in HOME now.
+`--bare` reads `git --git-dir=DIR --work-tree=$HOME ls-files` with the bundled git
+(read-only; the old repository is never written). Paths are HOME-relative; paths
+that do not exist in HOME are skipped. A folder is tracked as a tracked folder
+when every non-hidden file currently in it was in the list (deepest such folder
+wins, never HOME itself); otherwise its files are tracked one by one. The
+result follows the several-paths rule (§5): valid paths become items, hidden,
+flagged-secret (without a vault) and missing paths are listed under "skipped"
+with reasons; with a vault, secrets are moved to it as in `track`. `--dry-run`
+shows the grouping, the items and the skips; `--apply` applies the items. The
+items record the source (`DIR` and its HEAD short hash); while staged changes
+come from them, the message `sync` generates and the TUI commit box's prefill
+start with `Import from <DIR> at <hash>`. Agents may import (it only adds
+pending items).
 
 ## 6. Git
 
@@ -480,6 +522,56 @@ remote is added and before every push; push is blocked if any target remote is
 public; offline skips the check with a warning. Unverifiable hosts require a
 one-time human confirmation that the remote is private, stored per remote in
 `machine.toml`; agents cannot give it.
+
+**Clone pushes the registration.** `dw clone` by a human pushes the "Register
+machine" commit to the cloned remote right away (metadata only; the privacy check
+runs first), so two new machines never diverge on their registrations. Offline,
+on a refused or failed push, or for an agent, the commit stays local and clone
+prints `run dw push to share this machine with the others` (exit 0).
+
+**Pending pushes are satisfied by a push.** A successful push removes the pending
+push items it satisfied (same branch, the remote it pushed to, or all remotes when
+the item named none) and says so.
+
+**HTTPS remotes** get no credentials (git config is isolated). When an HTTPS fetch
+or push fails with an authentication error, the message names the SSH form of the
+URL (`git@github.com:owner/repo.git` for known hosts) and `dw remote add` warns on
+HTTPS URLs to known hosts.
+
+**Backup state.** `dw status` (and `--json`, the TUI Status panel and banner)
+reports the last successful push from this machine (recorded in the state
+directory) and the number of unbacked changes: Local and New files, staged
+paths, and commits not on the upstream. When unbacked changes exist and the
+oldest is older than the `backup_warn_days` preference (default 7), it is a
+warning: `last pushed 9 days ago · 4 unbacked — run dw sync`. Nothing is shown
+when everything is pushed.
+
+### 6a. Sync (ADR 0009)
+
+`dw sync [-m MSG | -e] [--yes] [--dry-run] [--remote NAME]` runs, stopping at the
+first step that needs a decision:
+
+1. Fetch and pull (fast-forward only; a divergence stops with the `pull` hint).
+2. Apply Incoming files that have no Local edit, with snapshots; Conflicts and
+   files that need an unlocked vault stop sync before anything is staged (exit 5
+   or 4) and name `dw resolve` / `dw vault unlock`.
+3. Stage every Local file and every New file in a tracked folder (the several-paths
+   rule, §5: flagged secrets without a vault, clashed variants and refused
+   templates are skipped and listed). Pending items are never applied.
+4. Commit everything staged (also changes staged earlier) with `-m`, an editor
+   (`-e`), or the generated message `sync from <machine>: N changed, M new
+   (<first few paths>)`. Nothing staged means no commit.
+5. Push to the upstream remote (or `--remote`), with the privacy check; push only
+   when HEAD is ahead.
+
+In a terminal, sync first prints the plan (files applied, staged, skipped, the
+message, the push target) and asks `Proceed? [Y/n]`; `--yes` skips the question.
+Without a terminal and without `--yes`, and for agents, steps 1–4 run (they need
+no approval) and the push becomes a pending item (exit 3). `--dry-run` prints the
+plan using the last fetch, without network. Staging and the commit are journalled
+like their own commands (§11), so `dw undo` reverts the commit while it is on no
+remote; pulls are not journalled and applied files are recovered from snapshots.
+The exit code is the first stopping step's (§9), else 0.
 
 ## 7. Values and vault (ADR 0004)
 
@@ -596,8 +688,9 @@ one-time human confirmation that the remote is private, stored per remote in
   individually. Items can be dropped. Stage/unstage/commit are immediate
   (lazygit behaviour); `z` undoes.
 - Agents (CLI without an interactive human approval) may: inspect anything except
-  secret values; track, untrack, stage, unstage, assign, commit; add secret
-  placeholders and wire references; add pending items.
+  secret values; track, untrack, import, stage, unstage, assign, commit, sync (its
+  push becomes a pending item); add secret placeholders and wire references; add
+  pending items.
 - Requires human approval: push, discard, apply over local changes, history
   rewrite (amend of pushed commits, rebase), branch delete, machine retire, remote
   add/remove, privacy confirmation. From an agent these become pending items
@@ -621,13 +714,13 @@ one-time human confirmation that the remote is private, stored per remote in
 - Exit codes: 0 ok, 1 error, 2 usage, 3 needs approval (added to pending),
   4 vault locked, 5 conflict, 6 refused public remote, 7 stale (state changed).
 - Mutations take a short lock and wait up to 10 s rather than failing instantly.
-- Commands (indicative): `init`, `clone`, `status`, `ls`, `diff`, `track`,
-  `untrack`, `stage`, `unstage`, `commit`, `discard`, `apply`, `pull`, `push`,
+- Commands (indicative): `init`, `clone`, `import`, `sync`, `status`, `ls`, `diff`,
+  `track`, `untrack`, `stage`, `unstage`, `commit`, `discard`, `apply`, `pull`, `push`,
   `fetch`, `branch`, `remote`, `log`, `show`, `stash`, `revert`, `restore --at`,
   `assign`, `variant`, `machine (list|add|rename|retire|preview)`,
   `values (list|set-variable|add-secret|wire)`, `vault (init|unlock|lock|passwd|recover)`,
   `pending (list|drop|approve)`, `snapshot (list|restore)`, `archive (export|import)`,
-  `hide`, `settings`, `doctor`, `self-update`; also `approve`, `activity`,
+  `hide`, `settings (list|get|set|unset)`, `doctor`, `self-update`; also `approve`, `activity`,
   `completions`, `man [--dir]` and `skill [--install DIR]` (the bundled agent skill).
 - Every mutation supports `--dry-run`, returning exactly what would change.
   Exception: `vault init|unlock|lock|passwd|recover` (interactive passphrase flows).
@@ -649,7 +742,43 @@ tabs, `h`/`l` panels, `1`–`5` panels, `x` menu, `z` undo, `?` help, `@` comman
 `+`/`_` screen mode, `y` copy path, `m` assign, `t` add a variant, `E` encrypt, `.` show hidden,
 `V` values, `G` open lazygit on the repository (suspends dotwarden), `H` history
 of the selected file (Files, Changes) on the Commits tab, `Enter` drill
-in / staging view, `Esc` back, `q` quit.
+in / staging view, `Esc` back, `q` quit, `S` sync (plan dialog, then y/n; §6a),
+`,` settings.
+
+**Onboarding.** Without a repository the TUI opens an onboarding screen instead
+of the panels, with three paths, each previewing and running the same code as the
+CLI:
+
+- *New*: machine name (suggested from the hostname), then "Set a vault passphrase
+  now? [Y/n]" (vault init; the recovery code is shown once and must be confirmed
+  with "I saved it"), then the remote: when `gh` is on `PATH` and authenticated,
+  offer `gh repo create <name> --private` (default `dotfiles`) and use its SSH
+  URL; else ask for an SSH URL with an example. Then a first `track` suggestion
+  list (common dotfiles that exist in HOME, none preselected).
+- *Clone*: URL and machine name, then the vault unlock if the repository has one,
+  then the Incoming tab with the "replaced existing files" summary (§5).
+- *Import*: the bare repository path (default `~/.dotfiles`, `~/.cfg` if present),
+  the import preview (§5a), then the New path's vault and remote steps.
+
+`dw init` in a terminal asks the same vault and remote questions after creating
+the repository (`--no-vault`, `--no-remote` skip them; agents never get them).
+
+**Backup banner.** The Status panel shows the backup state (§6); when it is a
+warning, a one-line banner above the panels repeats it with `S sync`.
+
+**Discoverability and navigation.** Each panel's footer shows its most useful
+keys for the current selection (fitting 80 columns; `?` lists all). The main view
+scrolls (`Ctrl-d`/`Ctrl-u`, `PgDn`/`PgUp`, `Home`/`End`, mouse wheel; `J`/`K`
+by line) for diffs, previews and logs. Mouse: click focuses a panel and selects a
+row; double-click is `Enter`. `v` range-selects in Files and Changes; Space then
+acts on the range.
+
+**Flows that were CLI-only.** Variants: `t` adds, `D` on a listed variant removes.
+Values screen: `w` wires the selected variable into a file (path picker), `-`
+unsets the selected override or (when unreferenced) the variable. `@` opens a
+log with two tabs: *Commands* (the bundled tool commands dotwarden ran this
+session; arguments only, values masked) and *Activity* (the records of
+`dw activity`, filterable by actor).
 
 Requirements: the event loop never blocks on I/O; background jobs (preview,
 refresh, fetch) never block user actions and are cancelled when superseded; an
@@ -694,10 +823,40 @@ from preferences.
 
 ## 12. Settings
 
-A Settings screen and `dw settings` cover: git identity/signing per repository,
+A Settings screen (`,`) and `dw settings` cover: git identity/signing per repository,
 remotes, default branch, fetch interval, diff/merge tool, chezmoi options exposed
-by dotwarden (e.g. umask, editor), unlock timeout, snapshot retention, theme and
-keymap. Changes to repository-wide settings go through the pending list.
+by dotwarden (e.g. umask, editor), unlock timeout, snapshot retention,
+`backup_warn_days`, theme and keymap. Changes to repository-wide settings go
+through the pending list.
+
+- **Two kinds.** Preferences are this person's and machine's: they live in
+  `~/.config/dotwarden/config.toml` (an ordinary, trackable dotfile) and take
+  effect immediately (the TUI reloads the file when it changes). Repository-wide
+  settings (default branch, per-repository git identity and signing, chezmoi
+  options) live in the repository and change through pending items with a
+  preview. Remotes keep their own commands (§6).
+- **Preferences file.** Unknown keys and invalid values are reported by
+  `dw doctor` and the Settings screen and fall back to their defaults; the file
+  is never rewritten except for the keys the user changes (`toml_edit`, comments
+  kept). Keys: `fetch_interval_minutes` (default 10, 0 = off),
+  `unlock_timeout_minutes` (15), `snapshot_retention_days` (30),
+  `snapshot_keep_per_file` (5), `backup_warn_days` (7), `diff_tool`,
+  `merge_tool`, `editor` (default `$VISUAL`/`$EDITOR`), `theme`, `[theme.colors]`,
+  `[keys]`.
+- **Keymap.** `[keys]` maps action names to keys, lazygit-like:
+  `stage = "space"`, `commit = "c"`, `sync = "S"`; one key or a list. Action names
+  are listed by `dw settings keys` and in `?`. Two actions bound to the same key in
+  one panel, unknown actions and unparsable keys are reported and those bindings
+  fall back to their defaults.
+- **Themes.** `theme = "dark" | "light" | "terminal"` (`terminal` uses only the
+  16 ANSI colours, so the terminal's palette decides); `[theme.colors]` overrides
+  roles (`accent`, `border`, `selected`, `added`, `removed`, `warning`, `error`,
+  `muted`) with `#rrggbb` or ANSI names. delta follows the theme's light/dark.
+- **CLI.** `dw settings list` (every key, value, default and source),
+  `get KEY`, `set KEY VALUE [--dry-run]`, `unset KEY`, `keys`. Repository-wide keys
+  add a pending item; agents may change preferences but not identity or signing
+  (those need approval).
+- **Screen modes.** `+`/`_` cycle normal → half → full-screen main view.
 
 ## 13. Verification
 
@@ -705,7 +864,12 @@ keymap. Changes to repository-wide settings go through the pending list.
   on macOS only. Implementations do not run Linux, Docker or emulated tests; the
   owner verifies Linux behaviour on real Linux machines after development, and
   Linux fixes follow from that. Linux-specific code must still compile and carry
-  unit tests that do not need a Linux host.
+  unit tests that do not need a Linux host. The release workflow's Ubuntu runner
+  (§2) builds the Linux bundle and runs the test suite there; its result informs
+  the owner's verification but does not replace it.
+- Release gate for v1.0: the owner backs up their own dotfiles with dotwarden
+  (imported from their bare repository, `dw sync` daily) for one to two weeks on
+  a release candidate; problems found become tickets before the tag.
 - A multi-machine scenario on macOS: several isolated HOME/state directories
   registered as different machines (with overridden platform/distribution data)
   share a local bare remote and exercise assignments, variants, values, vault
