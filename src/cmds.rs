@@ -112,6 +112,29 @@ pub(crate) fn submit_skipping(
     dry_run: bool,
     json: bool,
 ) -> Result<ExitCode> {
+    submit_with(store, items, skipped, None, apply, dry_run, json)
+}
+
+/// Add the fields of `extra` (an object) to a JSON result.
+fn print_json_with(v: serde_json::Value, extra: Option<&serde_json::Value>) -> Result<()> {
+    let mut v = v;
+    if let (Some(serde_json::Value::Object(e)), serde_json::Value::Object(m)) = (extra, &mut v) {
+        m.extend(e.clone());
+    }
+    print_json(&v)
+}
+
+/// `submit_skipping` whose JSON output also carries `extra`'s fields.
+fn submit_with(
+    store: &Store,
+    items: Vec<Item>,
+    skipped: &[track::Skipped],
+    extra: Option<&serde_json::Value>,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    let print_json = |v: serde_json::Value| print_json_with(v, extra);
     if dry_run {
         let list = pending::load(store)?;
         let marked: Vec<_> = items
@@ -120,7 +143,7 @@ pub(crate) fn submit_skipping(
             .collect();
         if json {
             print_json(
-                &json!({"dry_run": true, "apply": apply, "items": marked, "skipped": skipped}),
+                json!({"dry_run": true, "apply": apply, "items": marked, "skipped": skipped}),
             )?;
         } else {
             println!(
@@ -142,7 +165,7 @@ pub(crate) fn submit_skipping(
     if apply {
         let results = track::apply_now(store, &items)?;
         if json {
-            print_json(&json!({"dry_run": false, "applied": results, "skipped": skipped}))?;
+            print_json(json!({"dry_run": false, "applied": results, "skipped": skipped}))?;
         } else {
             print_results(&results);
             print_skipped(skipped);
@@ -156,7 +179,7 @@ pub(crate) fn submit_skipping(
     let stale = track::stale_checker(store, &ctx);
     let added = pending::add(store, &lock, items, &stale)?;
     if json {
-        print_json(&json!({"dry_run": false, "added": added, "skipped": skipped}))?;
+        print_json(json!({"dry_run": false, "added": added, "skipped": skipped}))?;
     } else {
         for a in &added {
             println!(
@@ -195,6 +218,67 @@ pub fn track_cmd(
     let requester = pending::requester(store);
     let planned = track::plan_paths(store, plan, paths, &cwd()?, &requester)?;
     submit_skipping(store, planned.items, &planned.skipped, apply, dry_run, json)
+}
+
+pub fn import_cmd(
+    store: &Store,
+    from: &crate::import::From,
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    require_initialised(store)?;
+    let requester = pending::requester(store);
+    let p = crate::import::plan(store, from, &cwd()?, &requester)?;
+    let label = p.source.label();
+    let extra =
+        json!({"source": p.source, "label": label, "listed": p.listed, "grouping": p.grouping});
+    if p.planned.items.is_empty() {
+        if json {
+            print_json_with(
+                json!({"dry_run": dry_run, "items": [], "skipped": p.planned.skipped}),
+                Some(&extra),
+            )?;
+        } else {
+            println!("{label}: nothing to import ({} listed path(s)).", p.listed);
+            print_skipped(&p.planned.skipped);
+        }
+        return Ok(ExitCode::from(Kind::Error.code()));
+    }
+    if !json {
+        let g = &p.grouping;
+        println!(
+            "{label}: {} listed path(s) → {} tracked folder(s), {} single file(s), {} skipped",
+            p.listed,
+            g.folders.len(),
+            g.files.len(),
+            p.planned.skipped.len()
+        );
+        if dry_run {
+            if !g.folders.is_empty() {
+                println!("Tracked folders:");
+                for f in &g.folders {
+                    println!("  {} ({} file(s))", f.path, f.files);
+                }
+            }
+            if !g.files.is_empty() {
+                println!("Single files:");
+                for f in &g.files {
+                    println!("  {f}");
+                }
+            }
+            println!();
+        }
+    }
+    submit_with(
+        store,
+        p.planned.items,
+        &p.planned.skipped,
+        Some(&extra),
+        apply,
+        dry_run,
+        json,
+    )
 }
 
 pub fn hide_cmd(

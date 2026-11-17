@@ -108,6 +108,10 @@ impl Dirs {
     pub fn last_push_file(&self) -> PathBuf {
         self.state_dir().join("last-push.json")
     }
+    /// Which staged paths an applied import added, until the next commit.
+    pub fn import_file(&self) -> PathBuf {
+        self.state_dir().join("import.json")
+    }
     /// Preferences (an ordinary dotfile).
     pub fn preferences(&self) -> PathBuf {
         self.config.join("dotwarden").join("config.toml")

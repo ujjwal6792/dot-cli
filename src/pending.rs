@@ -322,6 +322,9 @@ pub struct Item {
     pub summary: String,
     pub preview: Preview,
     pub guard: Guard,
+    /// The setup an `import` item came from (spec §5a).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub import: Option<crate::import::Source>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -500,6 +503,9 @@ impl Item {
         if let Some(a) = &self.preview.applies_to {
             s.push_str(&format!("applies to: {a}\n"));
         }
+        if let Some(src) = &self.import {
+            s.push_str(&format!("source: {}\n", src.label()));
+        }
         let section = |s: &mut String, title: &str, lines: Vec<String>| {
             if !lines.is_empty() {
                 s.push_str(&format!("{title}:\n"));
@@ -602,12 +608,41 @@ mod tests {
             summary: "s".into(),
             preview: Preview::default(),
             guard: Guard::default(),
+            import: None,
         };
         let v = serde_json::to_value(&item).unwrap();
         assert_eq!(v["kind"], "hide_add");
         assert_eq!(v["pattern"], "x/");
         let back: Item = serde_json::from_value(v).unwrap();
         assert_eq!(back, item);
+    }
+
+    #[test]
+    fn an_import_source_survives_next_to_an_action_source_and_is_optional() {
+        let item = Item {
+            id: Some(1),
+            action: Action::VariantRemove {
+                path: ".a".into(),
+                target: "t".into(),
+                file: "f".into(),
+                last: true,
+                source: "home/dot_a".into(),
+            },
+            requester: "human".into(),
+            created: rfc3339(0),
+            summary: "s".into(),
+            preview: Preview::default(),
+            guard: Guard::default(),
+            import: Some(crate::import::Source {
+                from: "~/.cfg".into(),
+                head: Some("abc1234".into()),
+            }),
+        };
+        let mut v = serde_json::to_value(&item).unwrap();
+        assert_eq!(serde_json::from_value::<Item>(v.clone()).unwrap(), item);
+        v.as_object_mut().unwrap().remove("import");
+        let old: Item = serde_json::from_value(v).unwrap();
+        assert_eq!(old.import, None, "pending.json from before T18 loads");
     }
 
     #[test]

@@ -66,8 +66,9 @@ pub struct Plan {
     pub dry_run: bool,
     pub machine: String,
     pub branch: String,
-    /// The remote pulled from and pushed to.
-    pub remote: String,
+    /// The remote pulled from and pushed to; `None` when the repository has no
+    /// remote yet (sync then commits locally and says how to add one).
+    pub remote: Option<String>,
     /// What the pull did (in a dry run: would do, from the last fetch).
     pub pull: String,
     /// Incoming files written to HOME (a snapshot is taken first).
@@ -97,7 +98,8 @@ pub struct Plan {
 impl Plan {
     /// Nothing to apply, stage, commit or push, and nothing in the way.
     pub fn is_empty(&self) -> bool {
-        self.apply.is_empty()
+        self.remote.is_some()
+            && self.apply.is_empty()
             && self.message.is_none()
             && self.push_commits == 0
             && self.stop.is_none()
@@ -107,7 +109,9 @@ impl Plan {
     pub fn lines(&self) -> Vec<String> {
         let mut l = vec![format!(
             "Sync {} ({} with {}):",
-            self.machine, self.branch, self.remote
+            self.machine,
+            self.branch,
+            self.remote.as_deref().unwrap_or("no remote")
         )];
         l.push(format!("  pull    {}", self.pull));
         for f in &self.apply {
@@ -150,12 +154,14 @@ impl Plan {
                 format!("  commit  {first}")
             });
         }
-        if self.push_commits > 0 {
+        if self.remote.is_none() {
+            l.push(format!("  push    {NO_REMOTE}"));
+        } else if self.push_commits > 0 {
             l.push(format!(
                 "  push    {} commit(s) of {} to {}{}",
                 self.push_commits,
                 self.branch,
-                self.remote,
+                self.remote.as_deref().unwrap_or_default(),
                 if self.push_pending {
                     " (becomes a pending item: needs a human)"
                 } else {
@@ -237,21 +243,28 @@ impl Done {
     }
 }
 
-fn target(store: &Store, opts: &Opts) -> Result<String> {
+const NO_REMOTE: &str =
+    "no remote yet: commits stay on this machine; add one with `dw remote add origin URL`";
+
+/// The remote to pull from and push to; `None` when there is no remote at all.
+fn target(store: &Store, opts: &Opts) -> Result<Option<String>> {
     match &opts.remote {
         Some(r) => {
             if !remote::names(store)?.contains(r) {
                 return Err(DwError::usage(format!("no remote named {r}")).into());
             }
-            Ok(r.clone())
+            Ok(Some(r.clone()))
         }
-        None => remote::default_remote(store),
+        None if remote::names(store)?.is_empty() => Ok(None),
+        None => remote::default_remote(store).map(Some),
     }
 }
 
 /// Step 1: fetch and fast-forward. Diverged history is an error naming `dw pull`.
 pub fn pull(store: &Store, opts: &Opts) -> Result<String> {
-    let remote = target(store, opts)?;
+    let Some(remote) = target(store, opts)? else {
+        return Ok("no remote yet: nothing to pull".into());
+    };
     let p = remote::pull(store, Some(&remote), PullMode::FastForward)?;
     Ok(if p.how == "up-to-date" {
         format!("{remote} has nothing new")
@@ -318,6 +331,16 @@ pub fn generated_message(machine: &str, entries: &[(String, bool)]) -> String {
     )
 }
 
+/// The generated message, led by `Import from …` while staged changes come
+/// from applied import items (spec §5a).
+fn message(store: &Store, machine: &str, entries: &[(String, bool)]) -> String {
+    let generated = generated_message(machine, entries);
+    match crate::import::prefix(store, entries.iter().map(|(p, _)| p.as_str())) {
+        Some(label) => format!("{label}\n\n{generated}"),
+        None => generated,
+    }
+}
+
 fn machine_name(store: &Store) -> Result<String> {
     Ok(store
         .local_machine_name()?
@@ -354,7 +377,8 @@ pub fn plan(store: &Store, opts: &Opts, pulled: Option<String>, push: PushMode) 
     };
     plan.pull = match pulled {
         Some(p) => p,
-        None => match plan_pull(store, &remote) {
+        None if remote.is_none() => "no remote yet: nothing to pull".into(),
+        None => match plan_pull(store, remote.as_deref().unwrap_or_default()) {
             Ok(p) => p,
             Err(e) => {
                 plan.pull = "stops here".into();
@@ -428,13 +452,15 @@ pub fn plan(store: &Store, opts: &Opts, pulled: Option<String>, push: PushMode) 
         .collect();
     if !entries.is_empty() {
         plan.message = Some(if opts.messages.is_empty() {
-            generated_message(&plan.machine, &entries)
+            message(store, &plan.machine, &entries)
         } else {
             opts.messages.join("\n\n")
         });
     }
-    plan.push_commits =
-        remote::unpushed(store, &remote).unwrap_or(0) + usize::from(plan.message.is_some());
+    if let Some(remote) = &remote {
+        plan.push_commits =
+            remote::unpushed(store, remote).unwrap_or(0) + usize::from(plan.message.is_some());
+    }
     Ok(plan)
 }
 
@@ -539,7 +565,7 @@ fn steps(
         .map(|c| (shown(c), c.kind == "new"))
         .collect();
     if !staged.is_empty() {
-        let generated = generated_message(&plan.machine, &staged);
+        let generated = message(store, &plan.machine, &staged);
         let (messages, template) = if opts.edit {
             (Vec::new(), Some(generated))
         } else if opts.messages.is_empty() {
@@ -562,12 +588,16 @@ fn steps(
         done.agent = c.agent;
     }
     // 5. Push when HEAD is ahead of the remote.
-    if remote::unpushed(store, &plan.remote).unwrap_or(0) == 0 {
+    let Some(target) = &plan.remote else {
+        done.warnings.push(NO_REMOTE.into());
+        return Ok(());
+    };
+    if remote::unpushed(store, target).unwrap_or(0) == 0 {
         return Ok(());
     }
     match push {
         PushMode::Run => {
-            let pushed = remote::push(store, std::slice::from_ref(&plan.remote))?;
+            let pushed = remote::push(store, std::slice::from_ref(target))?;
             done.pending_removed = remote::forget_satisfied(store, &pushed);
             for p in &pushed {
                 done.pushed = Some(format!("{} to {}", p.branch, p.remote));
@@ -578,7 +608,7 @@ fn steps(
         PushMode::Pending => {
             let item = remote::plan_push_item(
                 store,
-                std::slice::from_ref(&plan.remote),
+                std::slice::from_ref(target),
                 &crate::pending::requester(store),
             )?;
             let lock = store.lock()?;

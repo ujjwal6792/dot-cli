@@ -130,6 +130,21 @@ fn two_machines_receive_each_others_edits() {
 }
 
 #[test]
+fn without_a_remote_sync_commits_locally_and_names_remote_add() {
+    let t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "alpha"]);
+    write(&t, ".zshrc", "z1\n");
+    t.dw_ok(&["track", ".zshrc", "--apply"]);
+    let before = head(&t);
+
+    let r = dw(&t, &["sync", "--yes"]);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert_ne!(head(&t), before, "the staged track was committed");
+    assert!(nothing_staged(&t));
+    assert!(r.out.contains("dw remote add origin URL"), "{}", r.out);
+}
+
+#[test]
 fn a_conflict_stops_sync_before_anything_is_staged() {
     let (a, remote) = machine_a();
     let b = machine_b(&remote);

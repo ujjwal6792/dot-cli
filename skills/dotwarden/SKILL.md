@@ -1,6 +1,6 @@
 ---
 name: dotwarden
-description: Manage dotfiles, variables and secrets across machines with the dotwarden CLI (`dw`). Use when asked to track, assign, commit or sync dotfiles, or when `dw` reports it needs approval.
+description: Manage dotfiles, variables and secrets across machines with the dotwarden CLI (`dw`). Use when asked to track, import, assign, commit or sync dotfiles, or when `dw` reports it needs approval.
 ---
 
 # Using dotwarden (`dw`)
@@ -22,6 +22,13 @@ so commits and the activity log name you. Preview any change with `--dry-run` fi
   (vault locked) means it stopped before staging; exit 1 on diverged history means
   `dw pull` first. Preview with `dw sync --dry-run --json`. `dw status --json` reports
   `backup` (last push, unbacked changes, `warning`).
+- Import an existing setup: `dw import --bare ~/.cfg --dry-run --json` (or
+  `--from-file LIST`, `-` for stdin) shows `grouping` (tracked folders, single files),
+  the items and `skipped` (hidden, missing, outside HOME, possible secret). Show the
+  user the skips, then run it without `--dry-run`: it only adds pending items (exit 1 when
+  nothing could be added). Review with `dw pending list --json`, apply with
+  `dw pending apply --all`, then `dw sync --json`; its commit starts with
+  `Import from <DIR> at <hash>`. The old repository is only read; leave it alone.
 - Add secret placeholders and wire references (`dw values add-secret NAME --placeholder`,
   `dw values wire`). A human sets the value.
 - Paths are HOME paths (`~/.zshrc`); never touch the repository directly.

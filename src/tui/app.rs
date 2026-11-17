@@ -1305,6 +1305,20 @@ impl App {
     }
 
     /// Number of changes per tab.
+    /// `Import from …` while staged changes come from applied import items.
+    fn import_prefill(&self) -> String {
+        let Load::Ready(s) = &self.status else {
+            return String::new();
+        };
+        let staged: Vec<String> = s
+            .changes
+            .iter()
+            .filter(|c| c.state == State::Staged)
+            .map(|c| crate::track::tilde(&c.path))
+            .collect();
+        crate::import::prefix(&self.store, staged.iter().map(String::as_str)).unwrap_or_default()
+    }
+
     pub fn change_counts(&self) -> [usize; 4] {
         let mut n = [0; 4];
         if let Load::Ready(s) = &self.status {
@@ -1401,7 +1415,7 @@ impl App {
                     self.message = Some("nothing is staged".into());
                 } else {
                     self.dialog = Some(Dialog::Commit(CommitBox {
-                        text: String::new(),
+                        text: self.import_prefill(),
                         amend: false,
                     }));
                 }
