@@ -104,6 +104,10 @@ impl Dirs {
     pub fn machine_toml(&self) -> PathBuf {
         self.state_dir().join("machine.toml")
     }
+    /// When this machine last pushed successfully (machine-local, never committed).
+    pub fn last_push_file(&self) -> PathBuf {
+        self.state_dir().join("last-push.json")
+    }
     /// Preferences (an ordinary dotfile).
     pub fn preferences(&self) -> PathBuf {
         self.config.join("dotwarden").join("config.toml")

@@ -493,6 +493,33 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Back up in one step: pull, apply, stage, commit and push (spec §6a).
+    ///
+    /// Fast-forward pulls only (diverged history stops with the `pull` hint);
+    /// Incoming files without a Local edit are applied (snapshot first);
+    /// conflicts (exit 5) and a locked vault (exit 4) stop before staging. Every
+    /// Local and New file is staged (secrets without a vault, clashed variants
+    /// and refused templates are skipped and listed) and everything staged is
+    /// committed. In a terminal the plan is shown and confirmed first. Agents,
+    /// and runs without a terminal and without --yes, commit locally and the
+    /// push becomes a pending item (exit 3).
+    Sync {
+        /// Commit message; repeat for further paragraphs (default: generated).
+        #[arg(short, long = "message", conflicts_with = "edit")]
+        messages: Vec<String>,
+        /// Write the commit message in $VISUAL or $EDITOR.
+        #[arg(short, long)]
+        edit: bool,
+        /// Do not ask for confirmation (ignored for agents).
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Remote to pull from and push to (default: the branch's, else origin).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Show the plan from the last fetch; no network, nothing changes.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Approve pending items that need a human (interactive terminal only).
     ///
     /// Shows each item and asks. Same as `dw pending apply ID...`; agents are
@@ -1480,6 +1507,20 @@ fn run(cli: Cli) -> Result<ExitCode> {
             yes,
             dry_run,
         } => return cmds::push_cmd(&store, remote.as_deref(), all, yes, dry_run, json),
+        Command::Sync {
+            messages,
+            edit,
+            yes,
+            remote,
+            dry_run,
+        } => {
+            let opts = crate::sync::Opts {
+                messages,
+                edit,
+                remote,
+            };
+            return cmds::sync_cmd(&store, opts, yes, dry_run, json);
+        }
         Command::Undo { dry_run } => return cmds::undo_cmd(&store, dry_run, json),
         Command::Archive { action } => {
             return match action {

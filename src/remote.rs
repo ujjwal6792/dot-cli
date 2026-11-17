@@ -688,6 +688,21 @@ pub enum PullMode {
     Rebase,
     /// Fast-forward, else create a merge commit.
     Merge,
+    /// Fast-forward only (sync): diverged history stops with the `pull` hint,
+    /// and a remote without the branch yet is nothing to pull.
+    FastForward,
+}
+
+/// Why sync does not pull diverged history itself.
+pub fn diverged_error(reference: &str, ahead: u32, behind: u32) -> anyhow::Error {
+    DwError::new(
+        Kind::Error,
+        format!(
+            "history has diverged from {reference} ({ahead} local commit(s), {behind} remote commit(s)); \
+             run `dw pull` (it replays your unpushed commits), then `dw sync` again"
+        ),
+    )
+    .into()
 }
 
 #[derive(Debug, Serialize)]
@@ -822,6 +837,15 @@ pub fn pull(store: &Store, remote: Option<&str>, mode: PullMode) -> Result<Pulle
         ])
         .is_err()
     {
+        if mode == PullMode::FastForward {
+            return Ok(Pulled {
+                remote,
+                commits: 0,
+                files: 0,
+                how: "up-to-date",
+                conflicts: Vec::new(),
+            });
+        }
         bail!("{remote} has no branch {branch}; nothing to pull");
     }
     crate::track::ensure_repo_clean(store)?;
@@ -842,6 +866,8 @@ pub fn pull(store: &Store, remote: Option<&str>, mode: PullMode) -> Result<Pulle
     let how = if ahead == 0 {
         store.git(&["merge", "--ff-only", "--quiet", &reference])?;
         "fast-forward"
+    } else if mode == PullMode::FastForward {
+        return Err(diverged_error(&reference, ahead, behind));
     } else {
         if store.git(&["diff", "--cached", "--quiet"]).is_err() {
             bail!(
@@ -853,6 +879,7 @@ pub fn pull(store: &Store, remote: Option<&str>, mode: PullMode) -> Result<Pulle
                 rebase_unpushed(store, &reference, ahead)?;
                 "rebased"
             }
+            PullMode::FastForward => unreachable!("diverged history stops above"),
             PullMode::Merge => {
                 let mut cmd = store.git_command(&store.repo());
                 cmd.args(["merge", "--no-ff", "--no-edit", "--quiet", &reference]);
@@ -1016,6 +1043,7 @@ pub fn push(store: &Store, targets: &[String]) -> Result<Vec<Pushed>> {
         net_run(store, r, &args, None).with_context(|| {
             format!("pushing {branch} to {r} (if it was rejected, `dw pull` first)")
         })?;
+        crate::backup::record_push(store, r, &branch);
         out.push(Pushed {
             remote: r.clone(),
             branch: branch.clone(),
