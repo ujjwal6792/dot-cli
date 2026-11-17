@@ -522,18 +522,26 @@ fn paths_outside_home_own_directories_and_unrepresentable_names_are_refused() {
 }
 
 #[test]
-fn one_refused_path_means_nothing_is_added() {
+fn refused_paths_are_skipped_with_their_reasons_and_nothing_valid_means_exit_1() {
     let t = setup();
     write(&t, ".ok", "ok");
     write(&t, ".zsh_history", "h");
     let r = dw(&t, &["track", ".ok", ".zsh_history", "nope"]);
-    assert_ne!(r.code, 0);
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    assert!(
+        r.out.contains(".zsh_history") && r.out.contains("nope"),
+        "all reasons: {}",
+        r.out
+    );
+    assert_eq!(pending_ids(&t).len(), 1);
+    let r = dw(&t, &["track", ".zsh_history", "nope"]);
+    assert_eq!(r.code, 1);
     assert!(
         r.err.contains(".zsh_history") && r.err.contains("nope"),
-        "all reasons: {}",
+        "{}",
         r.err
     );
-    assert!(pending_ids(&t).is_empty());
+    assert_eq!(pending_ids(&t).len(), 1);
 }
 
 #[test]
@@ -1034,7 +1042,8 @@ fn rollback_restores_the_repository_exactly_even_after_files_and_data_were_writt
         &t.home,
         "human",
     )
-    .unwrap();
+    .unwrap()
+    .items;
     // The preview promises a different file than chezmoi will write, so the
     // check after writing fails.
     items[0].preview.files[0].source = "home/bogus".into();
@@ -1065,7 +1074,8 @@ fn rollback_restores_the_repository_exactly_even_after_files_and_data_were_writt
         &t.home,
         "human",
     )
-    .unwrap();
+    .unwrap()
+    .items;
     let results = dotwarden::track::apply_now(&store, &items).unwrap();
     assert_eq!(results[0].status, dotwarden::track::Outcome::Applied);
 }
@@ -1441,7 +1451,8 @@ fn a_rolled_back_track_restores_chezmoi_state() {
         &t.home,
         "human",
     )
-    .unwrap();
+    .unwrap()
+    .items;
     items[0].preview.files[0].source = "home/bogus".into();
     let before = entry_keys(&t);
     assert!(before.contains(&key(&t, ".kept")));

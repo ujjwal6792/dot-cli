@@ -90,6 +90,9 @@ pub enum Action {
     /// Push the branch to these remotes (every remote when empty).
     Push {
         remotes: Vec<String>,
+        /// The branch the push was planned for (empty in items from before it was recorded).
+        #[serde(default)]
+        branch: String,
     },
     /// Set the assignments of tracked paths (spec §4). Each change holds the
     /// final lists; empty lists remove the assignment.
@@ -252,7 +255,7 @@ impl Action {
             | Action::Resolve { path, .. } => path,
             Action::HideAdd { pattern } | Action::HideRemove { pattern } => pattern,
             Action::RemoteAdd { name, .. } | Action::RemoteRemove { name } => name,
-            Action::Push { remotes } => remotes.first().map_or("", String::as_str),
+            Action::Push { remotes, .. } => remotes.first().map_or("", String::as_str),
             Action::Assign { key, .. } => key,
             Action::MachineAdd { machine } => &machine.name,
             Action::MachineRename { old, .. } => old,

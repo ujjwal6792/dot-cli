@@ -13,7 +13,7 @@ use crate::machine;
 use crate::repo::{self, DEFAULT_BRANCH};
 use crate::store::Store;
 use crate::track::Plan;
-use crate::{cmds, doctor, status, tui, vault_cmds};
+use crate::{cmds, doctor, remote, status, tui, vault_cmds};
 
 /// Dotfiles, secrets and variables in sync across your machines.
 ///
@@ -1601,16 +1601,22 @@ fn report_registration(
     reg: &repo::Registration,
     verb: &str,
     json: bool,
+    shared: Option<&std::result::Result<(), String>>,
 ) -> Result<()> {
     if json {
-        println!(
-            "{}",
-            serde_json::to_string_pretty(&json!({
-                "repository": store.repo(),
-                "machine": reg.machine,
-                "registered": reg.created,
-            }))?
-        );
+        let mut out = json!({
+            "repository": store.repo(),
+            "machine": reg.machine,
+            "registered": reg.created,
+        });
+        if let Some(shared) = shared {
+            out["pushed"] = json!(shared.is_ok());
+            if let Err(why) = shared {
+                out["push_note"] = json!(why);
+                out["hint"] = json!("run dw push to share this machine with the others");
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&out)?);
     } else {
         println!("{verb} repository at {}", store.repo().display());
         println!(
@@ -1618,8 +1624,34 @@ fn report_registration(
             if reg.created { "Registered" } else { "Adopted" },
             describe_machine(&reg.machine)
         );
+        match shared {
+            Some(Ok(())) => println!("Pushed the machine registration to origin"),
+            Some(Err(why)) => {
+                println!("Registration not pushed ({why})");
+                println!("run dw push to share this machine with the others");
+            }
+            None => {}
+        }
     }
     Ok(())
+}
+
+/// Push the "Register machine" commit to the remote the repository was cloned
+/// from, after the privacy check. Only a human does this; a host that cannot be
+/// verified is asked about on the terminal like `dw remote add` does (local
+/// paths are never public). `Err` carries why the commit stayed local.
+fn share_registration(store: &Store) -> std::result::Result<(), String> {
+    if crate::agent::name(store.env()).is_some() {
+        return Err("run by an agent".into());
+    }
+    let share = || -> Result<()> {
+        let url = remote::remote_url(store, "origin")?
+            .ok_or_else(|| anyhow::anyhow!("the clone has no origin remote"))?;
+        remote::ensure_not_public(store, &url, Some(&remote::ask_tty))?;
+        remote::push(store, &["origin".to_string()])?;
+        Ok(())
+    };
+    share().map_err(|e| format!("{e:#}").replace('\n', " "))
 }
 
 fn print_plan(plan: &serde_json::Value, human: &[String], json: bool) -> Result<()> {
@@ -1678,7 +1710,7 @@ fn cmd_init(
     let _lock = store.lock()?;
     repo::init(store, branch)?;
     match repo::register_machine(store, &name, false) {
-        Ok(reg) => report_registration(store, &reg, "Initialised", json),
+        Ok(reg) => report_registration(store, &reg, "Initialised", json, None),
         Err(e) => {
             let _ = std::fs::remove_dir_all(store.repo());
             Err(e)
@@ -1755,7 +1787,11 @@ fn cmd_clone(
         repo::register_machine(store, &name, adopt)
     })();
     match result {
-        Ok(reg) => report_registration(store, &reg, "Cloned", json),
+        Ok(reg) => {
+            let shared = share_registration(store);
+            report_registration(store, &reg, "Cloned", json, Some(&shared))?;
+            Ok(())
+        }
         Err(e) => {
             let _ = std::fs::remove_dir_all(store.repo());
             Err(e)

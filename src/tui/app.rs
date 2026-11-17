@@ -2712,7 +2712,23 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             let snap = a
                 .snapshot
                 .map_or(String::new(), |id| format!(", snapshot {id}"));
-            Ok(report(format!("Applied {} file(s){snap}", a.applied.len())))
+            let replaced = if a.replaced_existing.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    "; replaced {} existing file(s) ({}): undo with `dw snapshot restore`",
+                    a.replaced_existing.len(),
+                    a.replaced_existing
+                        .iter()
+                        .map(|f| track::tilde(f))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                )
+            };
+            Ok(report(format!(
+                "Applied {} file(s){snap}{replaced}",
+                a.applied.len()
+            )))
         }
         ActionReq::Resolve(path, text) => {
             let r = crate::conflicts::resolve(
@@ -2749,10 +2765,15 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
         }
         ActionReq::Push => {
             let done = crate::remote::push(store, &[crate::remote::default_remote(store)?])?;
-            Ok(report(format!(
-                "Pushed {} to {}",
-                done[0].branch, done[0].remote
-            )))
+            let mut msg = format!("Pushed {} to {}", done[0].branch, done[0].remote);
+            let satisfied = crate::remote::forget_satisfied(store, &done);
+            if !satisfied.is_empty() {
+                msg.push_str(&format!(
+                    "; removed {} satisfied pending push(es)",
+                    satisfied.len()
+                ));
+            }
+            Ok(report(msg))
         }
         ActionReq::Assign(paths, edits) => {
             let mut homes = Vec::new();

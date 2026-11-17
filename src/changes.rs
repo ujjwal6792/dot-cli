@@ -1029,6 +1029,9 @@ pub struct Applied {
     pub failed: Vec<String>,
     /// Files that need the vault, skipped because it is locked.
     pub vault_locked: Vec<String>,
+    /// Applied files that already existed in HOME with other content and were never
+    /// written by dotwarden on this machine (typically the first apply after clone).
+    pub replaced_existing: Vec<String>,
     pub snapshot: Option<String>,
     pub error: Option<String>,
 }
@@ -1099,9 +1102,22 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
         conflicts,
         failed: Vec::new(),
         vault_locked,
+        replaced_existing: Vec::new(),
         snapshot: None,
         error: None,
     };
+    if !files.is_empty() {
+        let last = last_written(store)?;
+        out.replaced_existing = files
+            .iter()
+            .filter(|f| {
+                let abs = store.dirs.home.join(f);
+                fs::symlink_metadata(&abs).is_ok()
+                    && !last.contains_key(&abs.to_string_lossy().into_owned())
+            })
+            .cloned()
+            .collect();
+    }
     if dry_run || files.is_empty() {
         return Ok(out);
     }
@@ -1131,6 +1147,7 @@ pub fn apply_incoming(store: &Store, paths: Option<&[String]>, dry_run: bool) ->
         .cloned()
         .collect();
     out.applied.retain(|f| !still.contains(f));
+    out.replaced_existing.retain(|f| !still.contains(f));
     if !out.failed.is_empty() {
         out.error = Some(errors.join("; "));
     }

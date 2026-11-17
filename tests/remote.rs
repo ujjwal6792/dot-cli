@@ -547,11 +547,12 @@ fn clean_merge_has_two_parents_and_incoming_files() {
 }
 
 #[test]
-fn a_cloned_machine_pulls_and_pushes_after_another_pushed_and_both_are_registered() {
+fn a_cloned_machine_pulls_after_another_pushed_and_both_are_registered() {
     let (a, remote) = machine_a();
     let b = TestEnv::new();
     b.dw_ok(&["clone", remote.to_str().unwrap(), "--name", "beta"]);
-    // A pushes new work while B's registration is still only local.
+    // B's registration is already on the remote: A pulls it, then pushes new work.
+    a.dw_ok(&["pull"]);
     write(&a, ".c", "see\n");
     a.dw_ok(&["track", ".c", "--apply"]);
     a.dw_ok(&["commit", "-m", "add c"]);
@@ -559,8 +560,6 @@ fn a_cloned_machine_pulls_and_pushes_after_another_pushed_and_both_are_registere
 
     let p = b.dw_ok(&["pull"]);
     assert!(p.contains("1 commit"), "{p}");
-    b.dw_ok(&["push", "--yes"]);
-    a.dw_ok(&["pull"]);
     let names: Vec<String> = dotwarden::repo::read_registry(&repo(&a))
         .unwrap()
         .into_iter()

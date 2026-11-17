@@ -90,6 +90,28 @@ pub(crate) fn submit(
     dry_run: bool,
     json: bool,
 ) -> Result<ExitCode> {
+    submit_skipping(store, items, &[], apply, dry_run, json)
+}
+
+fn print_skipped(skipped: &[track::Skipped]) {
+    if skipped.is_empty() {
+        return;
+    }
+    println!("\nSkipped:");
+    for s in skipped {
+        println!("  {}: {}", s.path, s.reason.replace('\n', " "));
+    }
+}
+
+/// `submit` for several paths: `skipped` lists the refused ones.
+pub(crate) fn submit_skipping(
+    store: &Store,
+    items: Vec<Item>,
+    skipped: &[track::Skipped],
+    apply: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
     if dry_run {
         let list = pending::load(store)?;
         let marked: Vec<_> = items
@@ -97,7 +119,9 @@ pub(crate) fn submit(
             .map(|i| json!({"item": i, "already_pending": list.find_same(&i.action).is_some()}))
             .collect();
         if json {
-            print_json(&json!({"dry_run": true, "apply": apply, "items": marked}))?;
+            print_json(
+                &json!({"dry_run": true, "apply": apply, "items": marked, "skipped": skipped}),
+            )?;
         } else {
             println!(
                 "Dry run: nothing was changed. Would {}:",
@@ -111,15 +135,17 @@ pub(crate) fn submit(
                 println!();
                 print!("{}", i.render());
             }
+            print_skipped(skipped);
         }
         return Ok(ExitCode::SUCCESS);
     }
     if apply {
         let results = track::apply_now(store, &items)?;
         if json {
-            print_json(&json!({"dry_run": false, "applied": results}))?;
+            print_json(&json!({"dry_run": false, "applied": results, "skipped": skipped}))?;
         } else {
             print_results(&results);
+            print_skipped(skipped);
         }
         return Ok(results_exit(&results));
     }
@@ -130,7 +156,7 @@ pub(crate) fn submit(
     let stale = track::stale_checker(store, &ctx);
     let added = pending::add(store, &lock, items, &stale)?;
     if json {
-        print_json(&json!({"dry_run": false, "added": added}))?;
+        print_json(&json!({"dry_run": false, "added": added, "skipped": skipped}))?;
     } else {
         for a in &added {
             println!(
@@ -151,6 +177,7 @@ pub(crate) fn submit(
                     .map_or(String::new(), |t| format!(" (applies to: {t})"))
             );
         }
+        print_skipped(skipped);
         println!("Review with `dw pending show <id>`, apply with `dw pending apply --all`.");
     }
     Ok(ExitCode::SUCCESS)
@@ -166,8 +193,8 @@ pub fn track_cmd(
 ) -> Result<ExitCode> {
     require_initialised(store)?;
     let requester = pending::requester(store);
-    let items = track::plan_paths(store, plan, paths, &cwd()?, &requester)?;
-    submit(store, items, apply, dry_run, json)
+    let planned = track::plan_paths(store, plan, paths, &cwd()?, &requester)?;
+    submit_skipping(store, planned.items, &planned.skipped, apply, dry_run, json)
 }
 
 pub fn hide_cmd(
@@ -1511,6 +1538,9 @@ pub fn apply_cmd(
         print_json(&a)?;
     } else {
         let verb = if dry_run { "would apply" } else { "applied" };
+        if dry_run && !a.replaced_existing.is_empty() {
+            print_replaced(&a.replaced_existing, None);
+        }
         for f in &a.applied {
             println!("{verb} ~/{f}");
         }
@@ -1526,6 +1556,9 @@ pub fn apply_cmd(
         if let Some(id) = &a.snapshot {
             println!("snapshot {id} taken first");
         }
+        if !dry_run && !a.replaced_existing.is_empty() {
+            print_replaced(&a.replaced_existing, a.snapshot.as_deref());
+        }
         if a.applied.is_empty() && a.failed.is_empty() && a.vault_locked.is_empty() {
             println!("Nothing incoming to apply.");
         }
@@ -1538,6 +1571,20 @@ pub fn apply_cmd(
     } else {
         ExitCode::SUCCESS
     })
+}
+
+/// The files apply overwrites that dotwarden never wrote here, with the way back.
+fn print_replaced(files: &[String], snapshot: Option<&str>) {
+    println!("replaced existing files (they were not written by dotwarden on this machine):");
+    for f in files {
+        println!("  ~/{f}");
+    }
+    match snapshot {
+        Some(id) => println!(
+            "snapshot {id} holds the previous content; undo with `dw snapshot restore {id}`"
+        ),
+        None => println!("a snapshot is taken first; undo with `dw snapshot restore`"),
+    }
 }
 
 pub fn push_cmd(
@@ -1557,14 +1604,18 @@ pub fn push_cmd(
     let item = remote::plan_push_item(store, &targets, &pending::requester(store))?;
     gated(store, item, yes, dry_run, json, || {
         let done = remote::push(store, &targets)?;
+        let satisfied = remote::forget_satisfied(store, &done);
         if json {
-            print_json(&json!({"pushed": done}))?;
+            print_json(&json!({"pushed": done, "pending_removed": satisfied}))?;
         } else {
             for p in &done {
                 println!("Pushed {} to {}", p.branch, p.remote);
                 if let Some(w) = &p.warning {
                     println!("warning: {w}");
                 }
+            }
+            for line in &satisfied {
+                println!("{line}");
             }
         }
         Ok(ExitCode::SUCCESS)
