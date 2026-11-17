@@ -16,15 +16,15 @@
   (`cmds::submit_with` = `submit_skipping` plus extra JSON fields `source`, `label`, `listed`,
   `grouping`). Without a vault, flagged files inside a collapsed folder (which `track` leaves
   out) are also listed under skipped. Nothing added → exit 1 (also `--dry-run`, `--json`).
-- Human output: `Import from ~/.cfg at b507421: 9 listed path(s) → 3 tracked folder(s), 2 single
-  file(s), 3 skipped`; `--dry-run` adds "Tracked folders:" (with file counts) and "Single files:".
+- Human output: `Import from ~/.cfg at <hash>: N listed path(s) → …`; `--dry-run` adds
+  "Tracked folders:" (with file counts) and "Single files:".
 - Items carry `import: {from, head}` (`#[serde(default)]`; old pending.json loads); `pending show`
   prints `source: Import from …`.
 - Commit prefix: applying items with a source (`track::apply_review`) records label + target
   paths in `import.json` (state dir); `changes::commit` deletes it. Sync's generated message
   (plan and run) and the TUI `c` prefill use the label while one recorded path is staged.
   Message: `Import from ~/.cfg at <hash>`, blank line, the usual `sync from …` line.
-- Skill: import workflow (dry-run, show skips, import, review pending, apply, sync).
+- Skill: import workflow (dry-run, skips, import, review, apply, sync).
 
 ## Decisions
 - Folder collapsing (§5a "deepest such folder wins, never HOME"): taken literally, every
@@ -38,8 +38,7 @@
 - The source is shown as `~/…` below HOME (no user name in commit messages); stdin is `stdin`.
 - The JSON field is `import`, not `source`: Item flattens Action, and variant actions already
   have a `source` field (caught by the full suite; unit test added).
-- One marker at a time: a later import with another label replaces it. `dw undo` of the import
-  commit does not bring the prefix back.
+- One marker at a time (another import's label replaces it); undoing the commit drops the prefix.
 
 ## Tests
 - `tests/import.rs` (4, real git/chezmoi): bare repo `~/.cfg` over an isolated HOME (nvim fully
@@ -57,6 +56,4 @@
 ## Gaps
 - With a vault (secrets moved as in `track`) is not tested here (needs an interactive unlock);
   the path is track's own.
-- Gitlinks (submodules) listed by `ls-files` are treated as folders; not tested.
-- Very large unlisted trees under a listed folder's parents (`.local/share`) are walked once
-  per level while collapsing; fine for dotfiles, not optimised.
+- Collapsing walks big unlisted trees (`.local/share`) once per level; not optimised.
