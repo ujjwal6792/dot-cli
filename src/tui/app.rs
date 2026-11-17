@@ -140,6 +140,10 @@ pub enum ActionReq {
     AbortPull,
     Revert(String),
     Push,
+    /// `S`: pull (fast-forward), then plan the rest of the sync for the dialog.
+    SyncPlan,
+    /// `y` in the sync dialog: apply, stage, commit and push as planned.
+    Sync(Box<crate::sync::Plan>),
     /// Add one pending assignment item for these HOME-relative paths.
     Assign(Vec<String>, Vec<crate::machines::Edit>),
     /// Add a pending variant of this HOME-relative file for a target.
@@ -453,6 +457,8 @@ pub enum Dialog {
     ConfirmApply(Option<Vec<String>>),
     /// `P`: y/n before pushing.
     ConfirmPush,
+    /// `S`: the sync plan (spec §6a); y runs it.
+    Sync(Box<crate::sync::Plan>),
     ConfirmRevert(String),
     /// `m`: the assignment editor.
     Assign(AssignEditor),
@@ -939,6 +945,9 @@ impl App {
                         if let Some(results) = report.results {
                             self.dialog = Some(Dialog::Result(results));
                         }
+                        if let Some(plan) = report.sync_plan {
+                            self.dialog = Some(Dialog::Sync(plan));
+                        }
                     }
                     Err(e) => {
                         if e.starts_with("Busy:") {
@@ -1065,6 +1074,11 @@ impl App {
                 KeyCode::Char('y') => self.request_action(ActionReq::ApplyIncoming(sel)),
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmApply(sel)),
+            },
+            Some(Dialog::Sync(plan)) => match key.code {
+                KeyCode::Char('y') => self.request_action(ActionReq::Sync(plan)),
+                KeyCode::Esc | KeyCode::Char('n') => {}
+                _ => self.dialog = Some(Dialog::Sync(plan)),
             },
             Some(Dialog::ConfirmPush) => match key.code {
                 KeyCode::Char('y') => self.request_action(ActionReq::Push),
@@ -1478,6 +1492,7 @@ impl App {
             KeyCode::Char('z') => return self.request_action(ActionReq::Undo),
             KeyCode::Char('p') => return self.request_action(ActionReq::Pull),
             KeyCode::Char('P') => return self.dialog = Some(Dialog::ConfirmPush),
+            KeyCode::Char('S') => return self.request_action(ActionReq::SyncPlan),
             KeyCode::Char('r') if self.focus != Panel::Git => {
                 self.refresh_tracking();
                 self.refresh_hide();
@@ -2291,6 +2306,7 @@ fn report(message: String) -> ActionReport {
         amend_message: None,
         detail: None,
         refused: Vec::new(),
+        sync_plan: None,
     }
 }
 
@@ -2602,6 +2618,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 amend_message: None,
                 detail,
                 refused,
+                sync_plan: None,
             })
         }
         ActionReq::Hide(path, is_dir) => {
@@ -2614,6 +2631,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 amend_message: None,
                 detail: None,
                 refused: Vec::new(),
+                sync_plan: None,
             })
         }
         ActionReq::Drop(id) => {
@@ -2626,6 +2644,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 amend_message: None,
                 detail: None,
                 refused: Vec::new(),
+                sync_plan: None,
             })
         }
         ActionReq::Stage(sel) => {
@@ -2662,6 +2681,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                     amend,
                     dry_run: false,
                     interactive: false,
+                    template: None,
                 },
             )?;
             Ok(report(format!(
@@ -2775,6 +2795,43 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
             }
             Ok(report(msg))
         }
+        ActionReq::SyncPlan => {
+            let opts = crate::sync::Opts::default();
+            let pulled = crate::sync::pull(store, &opts)?;
+            let plan = crate::sync::plan(store, &opts, Some(pulled), crate::sync::PushMode::Run)?;
+            if plan.is_empty() {
+                return Ok(report("Nothing to sync: everything is backed up".into()));
+            }
+            Ok(ActionReport {
+                sync_plan: Some(Box::new(plan)),
+                ..report("Sync plan ready: y runs it".into())
+            })
+        }
+        ActionReq::Sync(plan) => {
+            let opts = crate::sync::Opts::default();
+            let done = crate::sync::run(store, &opts, &plan, crate::sync::PushMode::Run, false);
+            let lines = done.lines();
+            if let Some(stop) = &done.stop {
+                let mut text = lines;
+                text.push(format!("sync stopped: {}", stop.message));
+                anyhow::bail!(text.join("\n"));
+            }
+            Ok(report(if lines.is_empty() {
+                "Synced: nothing to do".into()
+            } else {
+                format!(
+                    "Synced: {} applied, {} staged{}{}",
+                    done.applied.len(),
+                    done.staged.len(),
+                    done.commit
+                        .as_ref()
+                        .map_or(String::new(), |c| format!(", committed {c}")),
+                    done.pushed
+                        .as_ref()
+                        .map_or(String::new(), |p| format!(", pushed {p}"))
+                )
+            }))
+        }
         ActionReq::Assign(paths, edits) => {
             let mut homes = Vec::new();
             for p in &paths {
@@ -2861,6 +2918,7 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                 amend_message: None,
                 detail: None,
                 refused: Vec::new(),
+                sync_plan: None,
             })
         }
     }

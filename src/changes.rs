@@ -1162,6 +1162,8 @@ pub struct CommitOpts {
     pub dry_run: bool,
     /// Whether an editor may be opened (stdin and stdout are terminals).
     pub interactive: bool,
+    /// Text the editor starts with for a new commit.
+    pub template: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1277,7 +1279,7 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
                 .trim()
                 .to_string()
             } else {
-                String::new()
+                opts.template.clone().unwrap_or_default()
             };
             let text = if opts.dry_run {
                 initial

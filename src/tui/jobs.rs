@@ -79,6 +79,8 @@ pub struct ActionReport {
     pub detail: Option<String>,
     /// Paths a toggle refused.
     pub refused: Vec<std::path::PathBuf>,
+    /// The sync plan to open the dialog with.
+    pub sync_plan: Option<Box<crate::sync::Plan>>,
 }
 
 /// Branches, stashes and remotes for the Git panel tabs.

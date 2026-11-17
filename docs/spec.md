@@ -544,7 +544,10 @@ directory) and the number of unbacked changes: Local and New files, staged
 paths, and commits not on the upstream. When unbacked changes exist and the
 oldest is older than the `backup_warn_days` preference (default 7), it is a
 warning: `last pushed 9 days ago · 4 unbacked — run dw sync`. Nothing is shown
-when everything is pushed.
+when everything is pushed. The age of the oldest unbacked change is measured from
+this machine's last push (an upper bound), or, never pushed, from the oldest
+commit no remote holds; the record is `last-push.json` in the state directory,
+written by every successful push.
 
 ### 6a. Sync (ADR 0009)
 
@@ -572,6 +575,12 @@ plan using the last fetch, without network. Staging and the commit are journalle
 like their own commands (§11), so `dw undo` reverts the commit while it is on no
 remote; pulls are not journalled and applied files are recovered from snapshots.
 The exit code is the first stopping step's (§9), else 0.
+
+The plan in a terminal and in the TUI is made after step 1 (a fast-forward pull
+changes no HOME file), so it lists exactly what will be applied and staged;
+declining leaves the pull in place. `--remote` names the remote for both the
+pull and the push. Diverged history exits 1. Incoming files without a Local edit
+are applied before a conflict or locked vault stops sync.
 
 ## 7. Values and vault (ADR 0004)
 

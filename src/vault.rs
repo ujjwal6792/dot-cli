@@ -590,12 +590,10 @@ pub mod session {
     }
 
     fn minutes(store: &Store) -> u64 {
-        std::fs::read_to_string(store.dirs.preferences())
-            .ok()
-            .and_then(|t| toml::from_str::<toml::Table>(&t).ok())
-            .and_then(|t| t.get("vault")?.get("unlock_minutes")?.as_integer())
+        crate::prefs::Prefs::load(store)
+            .uint(&["vault", "unlock_minutes"])
             .filter(|m| *m > 0)
-            .map_or(DEFAULT_MINUTES, |m| m as u64)
+            .unwrap_or(DEFAULT_MINUTES)
     }
 
     pub fn start(store: &Store, id: &x25519::Identity) -> Result<()> {

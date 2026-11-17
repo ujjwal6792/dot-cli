@@ -48,8 +48,8 @@ const HELP: &[(&str, &str)] = &[
         "commit, amend (Ctrl+J: new line), discard; Enter diff",
     ),
     (
-        "f p P z",
-        "fetch, pull, push (y/n); z undoes the last local action",
+        "f p P S z",
+        "fetch, pull, push (y/n), S sync (plan, y/n); z undo",
     ),
     ("Space (Pending)", "check / uncheck the item for the review"),
     ("d (Pending)", "drop the selected pending item"),
@@ -353,6 +353,22 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     let area = f.area();
     app.size = (area.width, area.height);
     let [body, footer] = Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(area);
+    let body = match backup_warning(app) {
+        Some(text) => {
+            let [banner, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(1)]).areas(body);
+            f.render_widget(
+                Paragraph::new(format!(" ⚠ {text} — S sync")).style(
+                    Style::default()
+                        .fg(Color::Yellow)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                banner,
+            );
+            rest
+        }
+        None => body,
+    };
 
     if app.staging.is_some() {
         draw_staging(f, app, body);
@@ -392,14 +408,27 @@ pub fn draw(f: &mut Frame, app: &mut App) {
     }
 }
 
+/// The backup summary when it is a warning (spec §10 "Backup banner").
+fn backup_warning(app: &App) -> Option<String> {
+    match &app.status {
+        Load::Ready(s) => s
+            .backup
+            .as_ref()
+            .filter(|b| b.warning)
+            .and_then(|b| b.summary.clone()),
+        _ => None,
+    }
+}
+
 fn draw_left(f: &mut Frame, app: &mut App, area: Rect) {
+    let status_rows = status_lines(app).len() as u16 + 2;
     let constraints: Vec<Constraint> = Panel::ALL
         .iter()
         .map(|p| {
             if *p == app.focus {
                 Constraint::Min(5)
             } else if *p == Panel::Status {
-                Constraint::Length(6)
+                Constraint::Length(status_rows)
             } else {
                 Constraint::Length(3)
             }
@@ -652,12 +681,26 @@ fn status_lines(app: &App) -> Vec<Line<'static>> {
                 }
                 None => "not initialised".into(),
             };
-            vec![
+            let mut lines = vec![
                 Line::from(machine),
                 Line::from(git),
                 Line::from(format!("vault: {} · pending: {}", s.vault, s.pending)),
                 Line::from(counts_text(app)),
-            ]
+            ];
+            if let Some(b) = &s.backup
+                && let Some(summary) = &b.summary
+            {
+                let colour = if b.warning {
+                    Color::Yellow
+                } else {
+                    Color::DarkGray
+                };
+                lines.push(Line::styled(
+                    format!("backup: {summary}"),
+                    Style::default().fg(colour),
+                ));
+            }
+            lines
         }
     }
 }
@@ -1164,6 +1207,14 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 Line::from("y confirm · n cancel (HOME stays unchanged)"),
             ],
         ),
+        Dialog::Sync(plan) => {
+            let mut l: Vec<Line> = plan.lines().into_iter().map(Line::from).collect();
+            l.push(Line::styled(
+                "y syncs · n / Esc cancels",
+                Style::default().fg(Color::Yellow),
+            ));
+            (" Sync ", l)
+        }
         Dialog::ConfirmPush => (
             " Push ",
             vec![

@@ -65,6 +65,8 @@ pub struct Status {
     pub vault_locked_files: Vec<String>,
     /// The repository's fixed templates are older than this version's.
     pub templates_outdated: bool,
+    /// Last push from this machine and the unbacked changes (spec §6).
+    pub backup: Option<crate::backup::Backup>,
 }
 
 fn trimmed(store: &Store, args: &[&str], cancel: Option<&CancelToken>) -> Option<String> {
@@ -103,6 +105,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             vault: "none".into(),
             vault_locked_files: Vec::new(),
             templates_outdated: false,
+            backup: None,
         });
     }
     let machine = store.local_machine_name()?.map(|name| {
@@ -180,6 +183,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
         }
         None => Vec::new(),
     };
+    let backup = crate::backup::collect(store, &changes, upstream.as_deref(), cancel);
     Ok(Status {
         initialised: true,
         repo_path,
@@ -207,6 +211,7 @@ pub fn collect(store: &Store, cancel: Option<&CancelToken>) -> Result<Status> {
             .unwrap_or_default()
             .into_iter()
             .collect(),
+        backup: Some(backup),
     })
 }
 
@@ -264,6 +269,13 @@ impl Status {
                 } else {
                     r.remotes.join(", ")
                 }
+            ));
+        }
+        if let Some(line) = self.backup.as_ref().and_then(|b| b.line()) {
+            let warn = self.backup.as_ref().is_some_and(|b| b.warning);
+            s.push_str(&format!(
+                "{}{line}\n",
+                if warn { "Warning:    " } else { "Backup:     " }
             ));
         }
         s.push_str(&format!("Pending:    {}\n", self.pending));

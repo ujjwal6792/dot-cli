@@ -576,6 +576,7 @@ pub fn commit_cmd(
             amend,
             dry_run,
             interactive,
+            template: None,
         },
     )?;
     if json {
@@ -1620,6 +1621,71 @@ pub fn push_cmd(
         }
         Ok(ExitCode::SUCCESS)
     })
+}
+
+// ---- sync ------------------------------------------------------------------
+
+pub fn sync_cmd(
+    store: &Store,
+    opts: crate::sync::Opts,
+    yes: bool,
+    dry_run: bool,
+    json: bool,
+) -> Result<ExitCode> {
+    use crate::sync::{self, PushMode};
+    use std::io::{BufRead, IsTerminal, Write};
+    require_initialised(store)?;
+    let tty = !json && std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let agent = changes::agent(store).is_some();
+    let push = if agent || (!tty && !yes) {
+        PushMode::Pending
+    } else {
+        PushMode::Run
+    };
+    if dry_run {
+        let plan = sync::plan(store, &opts, None, push)?;
+        if json {
+            print_json(&json!({"dry_run": true, "plan": plan}))?;
+        } else {
+            println!("Dry run: nothing was changed.");
+            plan.lines().iter().for_each(|l| println!("{l}"));
+        }
+        return Ok(ExitCode::SUCCESS);
+    }
+    if opts.edit && !tty {
+        return Err(DwError::usage("-e needs a terminal; pass -m MESSAGE instead").into());
+    }
+    let pulled = sync::pull(store, &opts)?;
+    let plan = sync::plan(store, &opts, Some(pulled), push)?;
+    if !json {
+        plan.lines().iter().for_each(|l| println!("{l}"));
+    }
+    // A known stop with nothing to apply first needs no question: it stops at once.
+    let work = !plan.apply.is_empty() || (plan.stop.is_none() && !plan.is_empty());
+    if tty && !yes && !agent && work {
+        print!("Proceed? [Y/n] ");
+        std::io::stdout().flush()?;
+        let mut line = String::new();
+        std::io::stdin().lock().read_line(&mut line)?;
+        if !matches!(line.trim(), "" | "y" | "Y" | "yes") {
+            return Err(anyhow::anyhow!(
+                "cancelled; nothing was changed after the pull"
+            ));
+        }
+    }
+    let done = sync::run(store, &opts, &plan, push, tty);
+    if json {
+        print_json(&json!({"plan": plan, "done": done}))?;
+    } else {
+        done.lines().iter().for_each(|l| println!("{l}"));
+        if let Some(s) = &done.stop {
+            eprintln!("sync stopped: {}", s.message.trim_end());
+        }
+    }
+    Ok(done
+        .stop
+        .as_ref()
+        .map_or(ExitCode::SUCCESS, |s| ExitCode::from(s.code)))
 }
 
 // ---- assignments and machines -------------------------------------------------
