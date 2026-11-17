@@ -527,7 +527,7 @@ pub fn compute_guard(store: &Store, ctx: &Ctx, action: &Action) -> Result<Guard>
             g.repo
                 .insert(format!("remote:{name}"), remote_state(store, name));
         }
-        Action::Push { remotes } => {
+        Action::Push { remotes, .. } => {
             for r in remotes {
                 g.repo.insert(format!("remote:{r}"), remote_state(store, r));
             }
@@ -1099,17 +1099,34 @@ pub enum Plan {
     Untrack,
 }
 
-/// Plan every path; if any is refused nothing is planned and all reasons are reported.
+/// A path refused while planning several, with the reason shown to the user.
+#[derive(Debug, Clone, Serialize)]
+pub struct Skipped {
+    pub path: String,
+    pub reason: String,
+}
+
+/// Items planned for the valid paths plus the paths that were refused.
+#[derive(Debug, Default)]
+pub struct Planned {
+    pub items: Vec<Item>,
+    pub skipped: Vec<Skipped>,
+}
+
+/// Plan every path. Refused paths are reported in `skipped` while the valid ones
+/// are planned; when nothing is plannable (or only one path was given) the
+/// refusal is an error.
 pub fn plan_paths(
     store: &Store,
     plan: Plan,
     args: &[String],
     cwd: &Path,
     requester: &str,
-) -> Result<Vec<Item>> {
+) -> Result<Planned> {
     let ctx = Ctx::load(store)?;
     let mut items: Vec<Item> = Vec::new();
     let mut errors: Vec<(Kind, String)> = Vec::new();
+    let mut skipped: Vec<Skipped> = Vec::new();
     let resolved: Vec<Result<HomePath>> = args
         .iter()
         .map(|arg| resolve_home_path(store, arg, cwd))
@@ -1121,7 +1138,7 @@ pub fn plan_paths(
         }
         Plan::Untrack => Vec::new().into_iter(),
     };
-    for hp in resolved {
+    for (arg, hp) in args.iter().zip(resolved) {
         let result = hp.and_then(|hp| match plan {
             Plan::Track => tracked.next().expect("one plan per resolved path"),
             Plan::Untrack => plan_untrack(store, &ctx, &hp, requester),
@@ -1132,10 +1149,19 @@ pub fn plan_paths(
                     items.push(item);
                 }
             }
-            Err(e) => errors.push(crate::error::classify(&e)),
+            Err(e) => {
+                let (kind, message) = crate::error::classify(&e);
+                skipped.push(Skipped {
+                    path: arg.clone(),
+                    reason: message.clone(),
+                });
+                errors.push((kind, message));
+            }
         }
     }
-    if let Some((kind, _)) = errors.first() {
+    if items.is_empty()
+        && let Some((kind, _)) = errors.first()
+    {
         let message = errors
             .iter()
             .map(|(_, m)| m.as_str())
@@ -1143,7 +1169,7 @@ pub fn plan_paths(
             .join("\n");
         return Err(DwError::new(*kind, message).into());
     }
-    Ok(items)
+    Ok(Planned { items, skipped })
 }
 
 // ---- toggling (TUI Space) ------------------------------------------------
@@ -2285,6 +2311,33 @@ pub fn apply_pending(store: &Store, ids: Option<&[u64]>) -> Result<Vec<ItemResul
         .collect();
     if !applied.is_empty() {
         pending::drop_items(store, &lock, &applied)?;
+        for item in items
+            .iter()
+            .filter(|i| i.id.is_some_and(|id| applied.contains(&id)))
+        {
+            let Action::Push { remotes, branch } = &item.action else {
+                continue;
+            };
+            let remotes = if remotes.is_empty() {
+                crate::remote::names(store)?
+            } else {
+                remotes.clone()
+            };
+            let branch = if branch.is_empty() {
+                crate::remote::current_branch(store)?
+            } else {
+                branch.clone()
+            };
+            for gone in crate::remote::drop_satisfied(store, &lock, &branch, &remotes)? {
+                if let Some(r) = results.iter_mut().find(|r| r.id == item.id) {
+                    let note = crate::remote::satisfied_line(&gone);
+                    r.message = Some(match r.message.take() {
+                        Some(m) => format!("{m}; {note}"),
+                        None => note,
+                    });
+                }
+            }
+        }
     }
     drop(lock);
     outcome?;

@@ -311,7 +311,10 @@ pub fn add_locked(
     plan_add(store, name, url)?;
     let warning = ensure_not_public(store, url, confirm)?;
     store.git(&["remote", "add", name, url])?;
-    Ok(warning)
+    Ok(match (warning, https_warning(url)) {
+        (Some(a), Some(b)) => Some(format!("{a}; {b}")),
+        (a, b) => a.or(b),
+    })
 }
 
 /// Remove a remote. The caller holds the mutation lock.
@@ -439,6 +442,7 @@ pub fn plan_push_item(store: &Store, targets: &[String], requester: &str) -> Res
         requester,
         Action::Push {
             remotes: chosen.clone(),
+            branch: current_branch(store)?,
         },
         format!(
             "Push {} to {} (requested by {requester})",
@@ -460,7 +464,7 @@ pub fn exec_action(store: &Store, action: &Action) -> Result<String> {
             remove_locked(store, name)?;
             Ok(format!("removed remote {name}"))
         }
-        Action::Push { remotes } => {
+        Action::Push { remotes, .. } => {
             let done = push(store, remotes)?;
             Ok(done
                 .iter()
@@ -489,10 +493,70 @@ fn net_git(store: &Store) -> Command {
     cmd
 }
 
-fn net_run(store: &Store, args: &[&str], cancel: Option<&CancelToken>) -> Result<exec::Output> {
+/// Run a network git command against `remote`; an HTTPS authentication failure
+/// names the SSH form of the URL.
+fn net_run(
+    store: &Store,
+    remote: &str,
+    args: &[&str],
+    cancel: Option<&CancelToken>,
+) -> Result<exec::Output> {
     let mut cmd = net_git(store);
     cmd.args(args);
-    exec::run_ok(cmd, cancel)
+    exec::run_ok(cmd, cancel).map_err(|e| {
+        let ssh = remote_url(store, remote)
+            .ok()
+            .flatten()
+            .filter(|_| is_auth_failure(&format!("{e:#}")))
+            .and_then(|url| ssh_url(&url));
+        match ssh {
+            Some(ssh) => e.context(format!(
+                "git has no credentials for HTTPS remotes; use the SSH URL {ssh} \
+                 (`dw remote remove {remote}`, then `dw remote add {remote} {ssh}`)"
+            )),
+            None => e,
+        }
+    })
+}
+
+/// Whether git's error output says the server wanted credentials.
+fn is_auth_failure(stderr: &str) -> bool {
+    let e = stderr.to_lowercase();
+    [
+        "authentication failed",
+        "could not read username",
+        "could not read password",
+        "terminal prompts disabled",
+        "invalid username or password",
+        "returned error: 401",
+        "returned error: 403",
+        "http 401",
+        "http 403",
+    ]
+    .iter()
+    .any(|s| e.contains(s))
+}
+
+/// The SSH form (`git@host:owner/repo.git`) of an HTTPS URL on a known host.
+fn ssh_url(url: &str) -> Option<String> {
+    let rest = url.strip_prefix("https://")?;
+    let (authority, path) = rest.split_once('/')?;
+    let host = authority.rsplit('@').next()?.to_ascii_lowercase();
+    let path = path.trim_matches('/');
+    if !KNOWN_HOSTS.contains(&host.as_str()) || path.is_empty() {
+        return None;
+    }
+    let path = path.strip_suffix(".git").unwrap_or(path);
+    Some(format!("git@{host}:{path}.git"))
+}
+
+/// Warning for `remote add` of an HTTPS URL to a known host.
+pub fn https_warning(url: &str) -> Option<String> {
+    let ssh = ssh_url(url)?;
+    Some(format!(
+        "{url} is an HTTPS remote and git has no credentials here, so fetch and push will fail; \
+         use the SSH URL {ssh}"
+    ))
 }
 
 fn text(store: &Store, args: &[&str]) -> Option<String> {
@@ -589,7 +653,7 @@ pub fn fetch(store: &Store, all: bool, cancel: Option<&CancelToken>) -> Result<F
         bail!("no remotes; add one with `dw remote add NAME URL`");
     }
     for r in &remotes {
-        net_run(store, &["fetch", "--quiet", "--", r], cancel)
+        net_run(store, r, &["fetch", "--quiet", "--", r], cancel)
             .with_context(|| format!("fetching {r}"))?;
     }
     let (ahead, behind) = match tracking_ref(store).and_then(|r| counts(store, &r).ok()) {
@@ -746,7 +810,7 @@ pub fn pull(store: &Store, remote: Option<&str>, mode: PullMode) -> Result<Pulle
         None => default_remote(store)?,
     };
     let branch = current_branch(store)?;
-    net_run(store, &["fetch", "--quiet", "--", &remote], None)
+    net_run(store, &remote, &["fetch", "--quiet", "--", &remote], None)
         .with_context(|| format!("fetching {remote}"))?;
     let reference = format!("{remote}/{branch}");
     if store
@@ -949,7 +1013,7 @@ pub fn push(store: &Store, targets: &[String]) -> Result<Vec<Pushed>> {
             args.push("--set-upstream");
         }
         args.extend(["--", r, &branch]);
-        net_run(store, &args, None).with_context(|| {
+        net_run(store, r, &args, None).with_context(|| {
             format!("pushing {branch} to {r} (if it was rejected, `dw pull` first)")
         })?;
         out.push(Pushed {
@@ -961,9 +1025,103 @@ pub fn push(store: &Store, targets: &[String]) -> Result<Vec<Pushed>> {
     Ok(out)
 }
 
+/// Remove the pending push items that a push of `branch` to `remotes` satisfied
+/// (same branch, every remote the item names covered, or all remotes when it
+/// names none). The caller holds the lock; returns the removed items.
+pub fn drop_satisfied(
+    store: &Store,
+    lock: &crate::lock::Lock,
+    branch: &str,
+    remotes: &[String],
+) -> Result<Vec<Item>> {
+    let all = names(store)?;
+    let ids: Vec<u64> = crate::pending::load(store)?
+        .items
+        .iter()
+        .filter(|i| match &i.action {
+            Action::Push {
+                remotes: wanted,
+                branch: b,
+            } => {
+                let needed = if wanted.is_empty() { &all } else { wanted };
+                (b.is_empty() || b == branch) && needed.iter().all(|r| remotes.contains(r))
+            }
+            _ => false,
+        })
+        .filter_map(|i| i.id)
+        .collect();
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+    crate::pending::drop_items(store, lock, &ids)
+}
+
+/// Take the lock and [`drop_satisfied`] for finished pushes; the lines say what was removed.
+pub fn forget_satisfied(store: &Store, pushed: &[Pushed]) -> Vec<String> {
+    let Some(first) = pushed.first() else {
+        return Vec::new();
+    };
+    let remotes: Vec<String> = pushed.iter().map(|p| p.remote.clone()).collect();
+    let dropped = store
+        .lock()
+        .and_then(|lock| drop_satisfied(store, &lock, &first.branch, &remotes));
+    match dropped {
+        Ok(items) => items.iter().map(satisfied_line).collect(),
+        Err(e) => vec![format!("could not remove satisfied pending pushes: {e:#}")],
+    }
+}
+
+pub fn satisfied_line(item: &Item) -> String {
+    format!(
+        "removed pending {}: {} (satisfied by this push)",
+        item.label(),
+        item.summary
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn ssh_urls_for_https_remotes_on_known_hosts() {
+        assert_eq!(
+            ssh_url("https://github.com/me/dots.git").as_deref(),
+            Some("git@github.com:me/dots.git")
+        );
+        assert_eq!(
+            ssh_url("https://user:pw@GitLab.com/me/sub/dots/").as_deref(),
+            Some("git@gitlab.com:me/sub/dots.git")
+        );
+        assert_eq!(
+            ssh_url("https://codeberg.org/me/dots").as_deref(),
+            Some("git@codeberg.org:me/dots.git")
+        );
+        assert_eq!(ssh_url("https://git.example.org/me/dots.git"), None);
+        assert_eq!(ssh_url("git@github.com:me/dots.git"), None);
+        assert_eq!(ssh_url("/srv/dots.git"), None);
+        assert!(https_warning("https://bitbucket.org/me/d.git").is_some());
+        assert!(https_warning("git@bitbucket.org:me/d.git").is_none());
+    }
+
+    #[test]
+    fn auth_failures_are_told_from_other_git_errors() {
+        for e in [
+            "`git fetch` failed (exit status: 128): fatal: could not read Username for 'https://github.com': terminal prompts disabled",
+            "fatal: Authentication failed for 'https://github.com/me/dots.git/'",
+            "fatal: unable to access 'https://gitlab.com/me/d.git/': The requested URL returned error: 403",
+            "remote: Invalid username or password.",
+        ] {
+            assert!(is_auth_failure(e), "{e}");
+        }
+        for e in [
+            "fatal: unable to access 'https://github.com/x': Could not resolve host: github.com",
+            "! [rejected] main -> main (fetch first)",
+            "fatal: repository 'https://github.com/me/nope.git/' not found",
+        ] {
+            assert!(!is_auth_failure(e), "{e}");
+        }
+    }
 
     #[test]
     fn https_probe_urls_come_from_every_url_form() {
