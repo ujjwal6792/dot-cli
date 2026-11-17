@@ -292,8 +292,16 @@ fn shown(c: &Change) -> String {
     }
 }
 
-/// `sync from <machine>: N changed, M new (<first few paths>)`.
+/// `sync from <machine>: N changed, M new (<first few paths>)`. Repository
+/// data (`repo:` paths) is not a file the user changed and is left out.
 pub fn generated_message(machine: &str, entries: &[(String, bool)]) -> String {
+    let entries: Vec<&(String, bool)> = entries
+        .iter()
+        .filter(|(p, _)| !p.starts_with("repo:"))
+        .collect();
+    if entries.is_empty() {
+        return format!("sync from {machine}: repository data");
+    }
     let new = entries.iter().filter(|(_, n)| *n).count();
     let mut paths: Vec<&str> = entries
         .iter()
@@ -377,6 +385,11 @@ pub fn plan(store: &Store, opts: &Opts, pulled: Option<String>, push: PushMode) 
         .filter(|c| c.state == State::Staged)
         .map(shown)
         .collect();
+    let staged_new: Vec<String> = found
+        .iter()
+        .filter(|c| c.state == State::Staged && c.kind == "new")
+        .map(shown)
+        .collect();
     match changes::stage(store, None, true) {
         Ok(d) => {
             plan.stage = d.paths;
@@ -406,7 +419,7 @@ pub fn plan(store: &Store, opts: &Opts, pulled: Option<String>, push: PushMode) 
     let entries: Vec<(String, bool)> = plan
         .staged_before
         .iter()
-        .map(|p| (p.clone(), false))
+        .map(|p| (p.clone(), staged_new.contains(p)))
         .chain(
             plan.stage
                 .iter()
@@ -595,6 +608,7 @@ mod tests {
             generated_message(
                 "alpha",
                 &[
+                    e("repo:home/.chezmoidata/dotwarden.toml", false),
                     e("~/.a", false),
                     e("~/.b (deleted; untracked)", false),
                     e("~/.c", true),
@@ -602,6 +616,10 @@ mod tests {
                 ]
             ),
             "sync from alpha: 2 changed, 2 new (~/.a, ~/.b, ~/.c, …)"
+        );
+        assert_eq!(
+            generated_message("alpha", &[e("repo:home/x", false)]),
+            "sync from alpha: repository data"
         );
     }
 }
