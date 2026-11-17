@@ -1332,6 +1332,7 @@ pub fn commit(store: &Store, opts: &CommitOpts) -> Result<Committed> {
         args.push(format!("Agent: {a}"));
     }
     store.git(&args)?;
+    crate::import::committed(store);
     done.commit = Some(
         store
             .git(&["rev-parse", "--short", "HEAD"])?

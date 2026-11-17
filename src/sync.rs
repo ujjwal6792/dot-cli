@@ -318,6 +318,16 @@ pub fn generated_message(machine: &str, entries: &[(String, bool)]) -> String {
     )
 }
 
+/// The generated message, led by `Import from …` while staged changes come
+/// from applied import items (spec §5a).
+fn message(store: &Store, machine: &str, entries: &[(String, bool)]) -> String {
+    let generated = generated_message(machine, entries);
+    match crate::import::prefix(store, entries.iter().map(|(p, _)| p.as_str())) {
+        Some(label) => format!("{label}\n\n{generated}"),
+        None => generated,
+    }
+}
+
 fn machine_name(store: &Store) -> Result<String> {
     Ok(store
         .local_machine_name()?
@@ -428,7 +438,7 @@ pub fn plan(store: &Store, opts: &Opts, pulled: Option<String>, push: PushMode) 
         .collect();
     if !entries.is_empty() {
         plan.message = Some(if opts.messages.is_empty() {
-            generated_message(&plan.machine, &entries)
+            message(store, &plan.machine, &entries)
         } else {
             opts.messages.join("\n\n")
         });
@@ -539,7 +549,7 @@ fn steps(
         .map(|c| (shown(c), c.kind == "new"))
         .collect();
     if !staged.is_empty() {
-        let generated = generated_message(&plan.machine, &staged);
+        let generated = message(store, &plan.machine, &staged);
         let (messages, template) = if opts.edit {
             (Vec::new(), Some(generated))
         } else if opts.messages.is_empty() {

@@ -486,6 +486,21 @@ come from them, the message `sync` generates and the TUI commit box's prefill
 start with `Import from <DIR> at <hash>`. Agents may import (it only adds
 pending items).
 
+Clarified in T18: a complete folder (every non-hidden file in it listed) that
+holds listed files directly becomes the tracked folder and covers its
+subfolders; a complete folder holding only subfolders gives way to them, so
+"deepest wins" picks e.g. `~/.config/nvim` (not `~/.config/nvim/lua`, and not a
+fully listed `~/.config` that holds no files itself). Lists hold one path per
+line (or NUL-separated); blank lines and lines starting with `#` are ignored;
+relative paths are HOME-relative, `~/x` and absolute paths inside HOME are
+accepted. Stdin is shown as `Import from stdin`. Files flagged as secrets inside
+a collapsed folder are left out of it (as in `track`) and also listed under
+"skipped". Nothing added exits 1. Applied import items record their label and
+paths in `import.json` (state directory); the next commit removes it, and a
+message is prefixed only while one of those paths is staged. The prefixed
+generated message is `Import from … at …`, a blank line, then the usual sync
+line.
+
 ## 6. Git
 
 Covered in CLI and TUI: fetch, pull (fast-forward when possible; otherwise rebase

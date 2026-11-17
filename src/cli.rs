@@ -84,6 +84,29 @@ pub enum Command {
         #[arg(long)]
         dry_run: bool,
     },
+    /// Track the files of an existing dotfiles setup (spec §5a).
+    ///
+    /// Reads the file list of a bare git repository (read-only; it is never
+    /// written) or a path list, and adds track items for the files as they are
+    /// in HOME now; no history is carried over. A folder whose every non-hidden
+    /// file was listed becomes a tracked folder. Missing, hidden and outside-HOME
+    /// paths, and secrets without a vault, are skipped with reasons. Exits 1
+    /// when nothing could be added.
+    #[command(group(clap::ArgGroup::new("source").required(true).args(["bare", "from_file"])))]
+    Import {
+        /// A bare repository whose work tree is HOME (as in `git --git-dir=DIR --work-tree=$HOME`).
+        #[arg(long, value_name = "DIR")]
+        bare: Option<String>,
+        /// A file with one HOME-relative path per line; `-` reads stdin.
+        #[arg(long, value_name = "LIST")]
+        from_file: Option<String>,
+        /// Apply immediately instead of leaving the items in the pending list.
+        #[arg(long)]
+        apply: bool,
+        /// Show the grouping, the items and the skips without adding anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
     /// Add untracking of files or folders to the pending list.
     ///
     /// The files leave the repository (staged in git, not committed); every
@@ -1187,6 +1210,19 @@ fn run(cli: Cli) -> Result<ExitCode> {
         } => {
             cmds::allow_plaintext(&store, allow_plaintext)?;
             return cmds::track_cmd(&store, Plan::Track, &paths, apply, dry_run, json);
+        }
+        Command::Import {
+            bare,
+            from_file,
+            apply,
+            dry_run,
+        } => {
+            let from = match (bare, from_file) {
+                (Some(dir), _) => crate::import::From::Bare(dir),
+                (None, Some(list)) => crate::import::From::List(list),
+                (None, None) => unreachable!("clap requires one source"),
+            };
+            return cmds::import_cmd(&store, &from, apply, dry_run, json);
         }
         Command::Untrack {
             paths,

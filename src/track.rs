@@ -690,6 +690,7 @@ pub(crate) fn new_item(
         summary,
         preview,
         guard,
+        import: None,
     })
 }
 
@@ -1123,9 +1124,33 @@ pub fn plan_paths(
     cwd: &Path,
     requester: &str,
 ) -> Result<Planned> {
+    let (planned, kinds) = plan_each(store, plan, args, cwd, requester)?;
+    if planned.items.is_empty()
+        && let Some(kind) = kinds.first()
+    {
+        let message = planned
+            .skipped
+            .iter()
+            .map(|s| s.reason.as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        return Err(DwError::new(*kind, message).into());
+    }
+    Ok(planned)
+}
+
+/// Like [`plan_paths`], but refusing every path is not an error (`import`
+/// reports it with its own skips). Returns the kind of each refusal.
+pub fn plan_each(
+    store: &Store,
+    plan: Plan,
+    args: &[String],
+    cwd: &Path,
+    requester: &str,
+) -> Result<(Planned, Vec<Kind>)> {
     let ctx = Ctx::load(store)?;
     let mut items: Vec<Item> = Vec::new();
-    let mut errors: Vec<(Kind, String)> = Vec::new();
+    let mut kinds: Vec<Kind> = Vec::new();
     let mut skipped: Vec<Skipped> = Vec::new();
     let resolved: Vec<Result<HomePath>> = args
         .iter()
@@ -1153,23 +1178,13 @@ pub fn plan_paths(
                 let (kind, message) = crate::error::classify(&e);
                 skipped.push(Skipped {
                     path: arg.clone(),
-                    reason: message.clone(),
+                    reason: message,
                 });
-                errors.push((kind, message));
+                kinds.push(kind);
             }
         }
     }
-    if items.is_empty()
-        && let Some((kind, _)) = errors.first()
-    {
-        let message = errors
-            .iter()
-            .map(|(_, m)| m.as_str())
-            .collect::<Vec<_>>()
-            .join("\n");
-        return Err(DwError::new(*kind, message).into());
-    }
-    Ok(Planned { items, skipped })
+    Ok((Planned { items, skipped }, kinds))
 }
 
 // ---- toggling (TUI Space) ------------------------------------------------
@@ -2086,6 +2101,11 @@ fn apply_review(
     let first = out.len();
     let mark = crate::undo::mark(store);
     let outcome = apply_review_items(store, lock, items, out);
+    let imported = items
+        .iter()
+        .zip(&out[first..])
+        .filter(|(_, r)| r.status == Outcome::Applied);
+    crate::import::record_applied(store, imported.map(|(i, _)| i));
     let applied: Vec<&ItemResult> = out[first..]
         .iter()
         .filter(|r| r.status == Outcome::Applied)
