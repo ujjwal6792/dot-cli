@@ -85,6 +85,20 @@ HOME.
 **Apply**:
 Write incoming changes into HOME.
 
+**Sync**:
+One backup round from a machine: take in what other machines shared, then share
+this machine's changes.
+_Avoid_: backup, save, upload
+
+**Unbacked change**:
+A change on this machine, in HOME, staged or committed, that no remote holds yet.
+_Avoid_: unsaved, dirty
+
+**Import**:
+Starting to track the files an existing dotfiles setup kept, as they are in HOME
+now, without its history.
+_Avoid_: migration, conversion
+
 **Pending action**:
 A requested but not yet reviewed operation, such as tracking, assigning or
 encrypting, waiting in the pending list for one combined review.

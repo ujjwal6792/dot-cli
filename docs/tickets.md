@@ -12,9 +12,10 @@ runs; the owner tests Linux on real machines later). Section numbers refer to
 Dotwarden (`dotwarden` / `dw`) replaces dot v1 with a self-contained,
 lazygit-style, multi-machine dotfiles tool on bundled chezmoi + git + delta, with
 an encrypted vault that agents cannot read. Spec: `docs/spec.md` on branch `v2`.
-Glossary: `GLOSSARY.md`. Decisions: `docs/adr/0001`–`0007`.
+Glossary: `GLOSSARY.md`. Decisions: `docs/adr/0001`–`0009`.
 
-Children: #T1–#T15 below. v1 issues are labelled `v1-retired`.
+Children: #T1–#T22 below (order to v1.0.0 in "Road to v1.0.0"). v1 issues are
+labelled `v1-retired`.
 
 ---
 
@@ -182,25 +183,170 @@ Spec §11.
 
 Blocked by T8, T11.
 
+---
+
+## Road to v1.0.0 (macOS)
+
+Agreed order after T13. Each milestone ends with the full suite green.
+
+1. **Backup workflow**: T16, T17, T18. Then the **dogfooding gate**: the owner
+   imports their bare repository and uses `dw sync` daily for 1–2 weeks; problems
+   found become tickets before step 4.
+2. **TUI**: T19, T20, T21.
+3. **Settings**: T14.
+4. **Release**: T22, T15.
+
+Linux x86-64 ships as a prerelease asset from the first rc and becomes stable in
+v1.1 after the owner verifies it on a real machine (spec §2).
+
+## T16: Backup workflow fixes
+
+Spec §5 (several paths, apply), §6 (clone, pending pushes, HTTPS).
+
+- `track` with several paths adds the valid ones and lists skipped paths with
+  reasons; exit 1 only when nothing was added (also `--json`, `--dry-run`).
+- `clone` (human) pushes the registration commit after the privacy check; offline,
+  refused, failed or agent: stays local with the `dw push` hint.
+- A successful push removes the pending push items it satisfied and says so.
+- `apply` lists "replaced existing files" (never written by dotwarden here) with
+  the snapshot id, also in `--dry-run` and the TUI Incoming summary.
+- HTTPS auth failures name the SSH URL; `remote add` warns on HTTPS to known hosts.
+
+Acceptance: one end-to-end test per bullet with real chezmoi/git; the
+two-machine clone test shows the second machine's registration on the remote
+without a manual push.
+
+Blocked by T13.
+
+## T17: Sync and backup state
+
+Spec §6 (backup state), §6a, ADR 0009.
+
+- `dw sync [-m|-e] [--yes] [--dry-run] [--remote]`: pull, safe apply, stage,
+  commit (generated message), push; plan + `Proceed? [Y/n]` in a terminal; stops
+  with the right exit code at conflicts (5), locked vault (4), divergence,
+  public remote (6); agents: push becomes a pending item (exit 3).
+- Last successful push recorded per machine; `dw status` (+ `--json`) shows
+  "last pushed N days ago · M unbacked" and warns past `backup_warn_days`
+  (minimal preferences reader with defaults; T14 extends it).
+- TUI: Status panel line, warning banner, `S` with the plan dialog.
+
+Acceptance: two-machine test where machine B syncs and receives A's edit and A
+then syncs and receives B's; a conflict stops before staging; a flagged secret
+is skipped, never committed; an agent sync leaves a pending push; `undo` reverts
+a sync commit that is on no remote.
+
+Blocked by T16.
+
+## T18: Import from a bare repository or a path list
+
+Spec §5a, ADR 0008.
+
+- `dw import --bare DIR | --from-file LIST|-` with `--dry-run`, `--apply`,
+  `--json`; folder collapsing; skipped list (hidden, secret without vault,
+  missing); with a vault, secrets move to it as in `track`.
+- Items record the source; sync's generated message and the TUI commit prefill
+  start with `Import from <DIR> at <hash>`.
+- Bundled skill: how an agent imports.
+
+Acceptance: a test builds a bare repo over an isolated HOME (nvim folder fully
+listed, another folder partly listed, a `.cache` path, a token file) and checks
+the grouping, skips and that the bare repo is byte-identical afterwards.
+
+Blocked by T16.
+
+## T19: Onboarding
+
+Spec §10 (onboarding and `init` questions).
+
+- TUI without a repository opens the onboarding screen: New / Clone / Import,
+  each running the CLI code paths; vault offered (default yes) with recovery
+  code confirmation; `gh repo create --private` offered when `gh` is available
+  and authenticated, else an SSH URL prompt; first-track suggestions.
+- `dw init` in a terminal asks the vault and remote questions (`--no-vault`,
+  `--no-remote`); agents never get them.
+
+Acceptance: TUI tests (test backend) for each path with a fake `gh` on `PATH`;
+nothing is written before the final confirmation of each step.
+
+Blocked by T17, T18.
+
+## T20: TUI navigation and discoverability
+
+Spec §10 (discoverability and navigation), §5 (hide reload).
+
+- Main-view scrolling (keys and mouse wheel) for diffs, previews and logs.
+- Mouse: click focus/select, double-click Enter. `v` range select in Changes.
+- Per-panel footer key hints fitting 80 columns.
+- Hide rules reloaded in a running TUI after `i` or `dw hide`.
+
+Acceptance: TUI tests at 80×24 and 45×14 for scrolling a 500-line diff, a range
+stage, and a hide added from another process disappearing from Files.
+
+Blocked by T13.
+
+## T21: TUI flows that were CLI-only
+
+Spec §10 (flows), §4 (variants), §7 (values).
+
+- Variant remove (`D`), values wire (`w`, path picker) and unset (`-`).
+- `@` log with Commands and Activity tabs (values masked, filter by actor).
+
+Acceptance: one TUI test per flow; the secret-masking test covers both log tabs.
+
+Blocked by T20.
+
 ## T14: Settings, preferences and integrations
 
 Spec §10, §12.
 
-- Settings screen; preferences file (theme, keymap remapping, intervals,
-  retention, unlock timeout); command log `@`; `e` editor and `G` lazygit handoff
-  with terminal suspend/restore; `y` copy path; `+`/`_` screen modes.
+- Preferences module (all keys, defaults, `toml_edit` writes keeping comments,
+  live reload, `dw doctor` reporting); `dw settings list|get|set|unset|keys`.
+- Repository-wide settings through pending items; agents cannot change identity
+  or signing.
+- Settings screen (`,`); keymap remapping by action name with conflict
+  reporting; themes `dark|light|terminal` + `[theme.colors]` overrides, delta
+  following light/dark.
+- `G` lazygit handoff with terminal suspend/restore; `+`/`_` screen modes.
 
-Blocked by T3.
+Acceptance: a remapped key works and its old key does not; a duplicate binding
+falls back and is reported; a preference edited on disk while the TUI runs takes
+effect; repository-wide edits appear as pending items.
+
+Blocked by T21.
+
+## T22: Documentation
+
+Spec §2 (bundle contents).
+
+- README: what it is, install, 5-minute first backup, new-machine restore,
+  `dw sync`, Intel Mac/Linux status.
+- Guides: "Migrating from a bare git repo" (import, vault, sync) and "Secrets and
+  the vault" (passphrase, recovery code, encrypted files, honest boundary).
+- Man pages and completions generated at build time into the bundle layout.
+
+Blocked by T14.
 
 ## T15: Distribution and multi-machine acceptance
 
 Spec §2, §13.
 
-- Release workflow for macOS arm64, Linux x86-64/arm64 bundles with licences and
-  checksums; `install.sh`; `self-update` and rollback; `.deb`, AUR `dotwarden-bin`,
-  Homebrew tap.
+- GitHub Actions on `v*` tags: fmt, clippy, tests on macOS and Ubuntu; bundles
+  for macOS arm64 (stable + rc) and Linux x86-64 (rc only until v1.1) with
+  licences, man pages, completions and the SHA256 manifest; GitHub Release with
+  `install.sh`.
+- `install.sh` (verify, versioned install, `current` symlink, PATH advice,
+  refuses unpublished targets on stable); `dw self-update [--check|--pre|
+  --rollback|--dry-run]`, disabled for source builds.
+- Version 1.0.0 in `Cargo.toml`; first tag `v1.0.0-rc.1`.
 - Multi-machine acceptance on macOS: isolated HOME/state directories registered as
-  Ubuntu, CachyOS and macOS machines on a shared bare remote, covering assignments, variants, values, vault, incoming, conflicts,
-  retire, archive restore.
+  Ubuntu, CachyOS and macOS machines on a shared bare remote, covering
+  assignments, variants, values, vault, incoming, conflicts, retire, archive
+  restore, import and sync.
+- Going public (owner checklist): the history audit is done (no secrets or
+  dotfiles; the v1 commits' personal e-mail is accepted); skim PR/issue text and
+  Actions logs; tag v1's tip `v1-final`; make `v2` the new `main`; make
+  `dot-cli` public; tag `v1.0.0` after the dogfooding gate.
+- Packages (`.deb`, AUR, Homebrew) are out of scope for v1.0.
 
 Blocked by all others.
