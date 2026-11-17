@@ -87,19 +87,10 @@ const OFFLINE_SIGNS: [&str; 8] = [
     "temporary failure in name resolution",
 ];
 
-/// Whether `https_url` can be read without credentials.
-pub fn probe(store: &Store, https_url: &str) -> Visibility {
-    if let Some(fake) = store.env().get(std::ffi::OsStr::new(PROBE_ENV)) {
-        return match Command::new(fake).arg(https_url).output() {
-            Ok(o) => match o.status.code() {
-                Some(0) => Visibility::Public,
-                Some(1) => Visibility::NotPublic,
-                _ => Visibility::Unreachable("probe command failed".into()),
-            },
-            Err(e) => Visibility::Unreachable(e.to_string()),
-        };
-    }
-    let mut cmd = store.git_command(&store.dirs.home);
+/// The anonymous `git ls-remote` of the probe: no credential helpers from the
+/// user's config, no prompts.
+pub fn probe_command(store: &Store, https_url: &str) -> Command {
+    let mut cmd = store.git_command_anonymous(&store.dirs.home);
     cmd.args([
         "-c",
         "credential.helper=",
@@ -113,6 +104,22 @@ pub fn probe(store: &Store, https_url: &str) -> Visibility {
     .env("GIT_TERMINAL_PROMPT", "0")
     .env("GIT_ASKPASS", "/bin/false")
     .env("SSH_ASKPASS", "/bin/false");
+    cmd
+}
+
+/// Whether `https_url` can be read without credentials.
+pub fn probe(store: &Store, https_url: &str) -> Visibility {
+    if let Some(fake) = store.env().get(std::ffi::OsStr::new(PROBE_ENV)) {
+        return match Command::new(fake).arg(https_url).output() {
+            Ok(o) => match o.status.code() {
+                Some(0) => Visibility::Public,
+                Some(1) => Visibility::NotPublic,
+                _ => Visibility::Unreachable("probe command failed".into()),
+            },
+            Err(e) => Visibility::Unreachable(e.to_string()),
+        };
+    }
+    let cmd = probe_command(store, https_url);
     let cancel = CancelToken::new();
     let (done, wait) = mpsc::channel::<()>();
     let timer = cancel.clone();
@@ -311,7 +318,7 @@ pub fn add_locked(
     plan_add(store, name, url)?;
     let warning = ensure_not_public(store, url, confirm)?;
     store.git(&["remote", "add", name, url])?;
-    Ok(match (warning, https_warning(url)) {
+    Ok(match (warning, https_warning(store, url)) {
         (Some(a), Some(b)) => Some(format!("{a}; {b}")),
         (a, b) => a.or(b),
     })
@@ -511,7 +518,8 @@ fn net_run(
             .and_then(|url| ssh_url(&url));
         match ssh {
             Some(ssh) => e.context(format!(
-                "git has no credentials for HTTPS remotes; use the SSH URL {ssh} \
+                "git has no credentials for this HTTPS remote; set up a credential helper \
+                 (e.g. `gh auth setup-git`) or use the SSH URL {ssh} \
                  (`dw remote remove {remote}`, then `dw remote add {remote} {ssh}`)"
             )),
             None => e,
@@ -551,12 +559,50 @@ fn ssh_url(url: &str) -> Option<String> {
 }
 
 /// Warning for `remote add` of an HTTPS URL to a known host.
-pub fn https_warning(url: &str) -> Option<String> {
+/// Silent when a credential helper from the global git config applies to `url`.
+pub fn https_warning(store: &Store, url: &str) -> Option<String> {
     let ssh = ssh_url(url)?;
+    if credential_helper_applies(&store.git_credential_entries(), url) {
+        return None;
+    }
     Some(format!(
-        "{url} is an HTTPS remote and git has no credentials here, so fetch and push will fail; \
-         use the SSH URL {ssh}"
+        "{url} is an HTTPS remote and no git credential helper applies to it, so fetch and push \
+         will fail; set one up (e.g. `gh auth setup-git`) or use the SSH URL {ssh}"
     ))
+}
+
+/// Whether `credential.helper` / `credential.<url>.helper` entries (in config
+/// order; an empty value resets the list) leave a helper for `url`.
+pub fn credential_helper_applies(entries: &[(String, String)], url: &str) -> bool {
+    let Some((scheme, rest)) = url.split_once("://") else {
+        return false;
+    };
+    let (authority, path) = rest.split_once('/').unwrap_or((rest, ""));
+    let host = authority.rsplit('@').next().unwrap_or(authority);
+    let target = format!("{scheme}://{host}/{path}").to_ascii_lowercase();
+    let mut active = 0usize;
+    for (key, value) in entries {
+        let scope = match key.strip_prefix("credential.") {
+            Some("helper") => None,
+            Some(r) => match r.strip_suffix(".helper") {
+                Some(pattern) => Some(pattern),
+                None => continue,
+            },
+            None => continue,
+        };
+        if let Some(pattern) = scope {
+            let pattern = format!("{}/", pattern.trim_end_matches('/')).to_ascii_lowercase();
+            if !target.starts_with(&pattern) {
+                continue;
+            }
+        }
+        if value.trim().is_empty() {
+            active = 0;
+        } else {
+            active += 1;
+        }
+    }
+    active > 0
 }
 
 fn text(store: &Store, args: &[&str]) -> Option<String> {
@@ -1128,8 +1174,72 @@ mod tests {
         assert_eq!(ssh_url("https://git.example.org/me/dots.git"), None);
         assert_eq!(ssh_url("git@github.com:me/dots.git"), None);
         assert_eq!(ssh_url("/srv/dots.git"), None);
-        assert!(https_warning("https://bitbucket.org/me/d.git").is_some());
-        assert!(https_warning("git@bitbucket.org:me/d.git").is_none());
+    }
+
+    fn entries(pairs: &[(&str, &str)]) -> Vec<(String, String)> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn credential_helpers_apply_by_url_and_order() {
+        let gh = entries(&[
+            ("credential.https://github.com.helper", ""),
+            (
+                "credential.https://github.com.helper",
+                "!gh auth git-credential",
+            ),
+        ]);
+        assert!(credential_helper_applies(
+            &gh,
+            "https://github.com/me/d.git"
+        ));
+        assert!(credential_helper_applies(
+            &gh,
+            "https://me@GitHub.com/me/d.git"
+        ));
+        assert!(!credential_helper_applies(
+            &gh,
+            "https://gitlab.com/me/d.git"
+        ));
+        assert!(!credential_helper_applies(
+            &gh,
+            "https://github.com.evil.org/me/d"
+        ));
+        let global = entries(&[("credential.helper", "osxkeychain")]);
+        assert!(credential_helper_applies(
+            &global,
+            "https://gitlab.com/me/d.git"
+        ));
+        // An empty value resets everything before it.
+        let reset = entries(&[
+            ("credential.helper", "osxkeychain"),
+            ("credential.https://github.com.helper", ""),
+        ]);
+        assert!(!credential_helper_applies(
+            &reset,
+            "https://github.com/me/d.git"
+        ));
+        assert!(credential_helper_applies(
+            &reset,
+            "https://gitlab.com/me/d.git"
+        ));
+        assert!(!credential_helper_applies(
+            &[],
+            "https://github.com/me/d.git"
+        ));
+        // A scope with a path only covers that path.
+        let scoped = entries(&[("credential.https://github.com/me.helper", "x")]);
+        assert!(credential_helper_applies(
+            &scoped,
+            "https://github.com/me/d.git"
+        ));
+        assert!(!credential_helper_applies(
+            &scoped,
+            "https://github.com/you/d.git"
+        ));
     }
 
     #[test]

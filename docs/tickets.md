@@ -189,7 +189,7 @@ Blocked by T8, T11.
 
 Agreed order after T13. Each milestone ends with the full suite green.
 
-1. **Backup workflow**: T16, T17, T18. Then the **dogfooding gate**: the owner
+1. **Backup workflow**: T16, T17, T18, T23. Then the **dogfooding gate**: the owner
    imports their bare repository and uses `dw sync` daily for 1–2 weeks; problems
    found become tickets before step 4.
 2. **TUI**: T19, T20, T21.
@@ -252,6 +252,21 @@ Spec §5a, ADR 0008.
 Acceptance: a test builds a bare repo over an isolated HOME (nvim folder fully
 listed, another folder partly listed, a `.cache` path, a token file) and checks
 the grouping, skips and that the bare repo is byte-identical afterwards.
+
+Blocked by T16.
+
+## T23: HTTPS remotes through credential helpers
+
+Spec §3 item 7, §6; ADR 0002 (reverses the earlier "SSH only" stance).
+
+- Pass `credential.helper`, `credential.<url>.helper`, `useHttpPath` and
+  `<url>.username` from the global git config to every git (order and empty
+  values kept); the public probe stays anonymous.
+- Auth-failure hint mentions `gh auth setup-git`; `dw remote add` warns only when
+  no helper applies; `dw doctor` reports it.
+
+Acceptance: with a helper script in an isolated global config, `git credential
+fill` through dotwarden's git calls it and the probe command does not.
 
 Blocked by T16.
 

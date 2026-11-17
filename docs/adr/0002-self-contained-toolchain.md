@@ -6,3 +6,7 @@ Dotwarden ships pinned chezmoi, portable git (dugite-native) and delta, and keep
 
 - System git: rejected so behaviour and versions are identical on every machine.
 - gitoxide in-process: rejected because its push and merge support is incomplete.
+
+## Consequences
+
+Authentication: SSH remotes use the system `ssh` and agent; HTTPS remotes use the credential helpers (`credential.helper`, `credential.<url>.helper` and related keys) from the user's global git config, passed through in order. The public-remote probe never receives them. Hooks, URL rewrites and aliases stay blocked.

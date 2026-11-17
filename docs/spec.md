@@ -82,8 +82,8 @@ Every chezmoi invocation passes explicit `--config`, `--source`,
 `CHEZMOI_*` variables removed, so a user's own chezmoi installation is neither read
 nor modified. Every git invocation uses the bundled git with
 `GIT_CONFIG_NOSYSTEM=1`; the user's global config is read for `user.name`,
-`user.email` and signing settings, and the system `ssh` with the user's keys and
-agent handles SSH remotes. Settings can override identity per repository.
+`user.email`, signing and credential-helper settings, and the system `ssh` with
+the user's keys and agent handles SSH remotes. Settings can override identity per repository.
 
 Repository layout:
 
@@ -206,9 +206,13 @@ Verified in ticket 1 against the pinned chezmoi v2.73.3 and proven by
    bundled git first on `PATH`) runs with `GIT_CONFIG_NOSYSTEM=1` and
    `GIT_CONFIG_GLOBAL=/dev/null`; only `user.name`, `user.email`,
    `user.signingkey`, `commit.gpgsign`, `gpg.format`, `gpg.program` and
-   `gpg.{openpgp,x509,ssh}.program` are read from the user's global config
-   (honouring `GIT_CONFIG_GLOBAL` if the user set it) and passed on as
-   `GIT_CONFIG_COUNT/KEY/VALUE`. Hooks, `core.fsmonitor`, URL rewrites, aliases
+   `gpg.{openpgp,x509,ssh}.program` plus the credential keys `credential.helper`,
+   `credential.<url>.helper`, `credential.useHttpPath`,
+   `credential.<url>.useHttpPath` and `credential.<url>.username` are read from
+   the user's global config (honouring `GIT_CONFIG_GLOBAL` if the user set it)
+   and passed on as `GIT_CONFIG_COUNT/KEY/VALUE`. Credential entries keep their
+   order and empty values, because an empty `helper` resets the list. The
+   anonymous public-remote probe is the exception: it gets none of them. Hooks, `core.fsmonitor`, URL rewrites, aliases
    and every other global setting are not applied. Other `GIT_*` variables are
    dropped; `GIT_SSH_COMMAND`, `GIT_ASKPASS`, `GIT_TERMINAL_PROMPT` and
    `SSH_AUTH_SOCK` pass through so SSH remotes work.
@@ -548,10 +552,14 @@ prints `run dw push to share this machine with the others` (exit 0).
 push items it satisfied (same branch, the remote it pushed to, or all remotes when
 the item named none) and says so.
 
-**HTTPS remotes** get no credentials (git config is isolated). When an HTTPS fetch
-or push fails with an authentication error, the message names the SSH form of the
-URL (`git@github.com:owner/repo.git` for known hosts) and `dw remote add` warns on
-HTTPS URLs to known hosts.
+**HTTPS remotes** work through the user's own credential helpers from the global
+git config (for example the one `gh auth setup-git` writes), passed through as in
+§3 item 7. Fetch, pull and push never prompt (`GIT_TERMINAL_PROMPT=0`); the public
+probe stays anonymous and gets no helper. When an HTTPS fetch or push fails with an
+authentication error, the message suggests `gh auth setup-git` or the SSH form of
+the URL (`git@github.com:owner/repo.git` for known hosts). `dw remote add` warns on
+HTTPS URLs to known hosts only when no credential helper applies to the URL, and
+`dw doctor` reports whether the default remote is HTTPS and has a helper.
 
 **Backup state.** `dw status` (and `--json`, the TUI Status panel and banner)
 reports the last successful push from this machine (recorded in the state
