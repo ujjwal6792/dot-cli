@@ -438,8 +438,11 @@ pub const TABS: [&str; 4] = ["Local", "Staged", "Incoming", "Conflicts"];
 #[derive(Debug)]
 pub enum Dialog {
     GitCreate(String),
-    /// `n` on the Remotes tab: "NAME URL".
-    RemoteAdd(String),
+    /// `n` on the Remotes tab: the name first, then (`url` is `Some`) the URL.
+    RemoteAdd {
+        name: String,
+        url: Option<String>,
+    },
     GitConfirm {
         op: GitOp,
         preview: String,
@@ -1098,26 +1101,64 @@ impl App {
                 }
                 _ => self.dialog = Some(Dialog::GitCreate(name)),
             },
-            Some(Dialog::RemoteAdd(mut text)) => match key.code {
+            Some(Dialog::RemoteAdd {
+                mut name,
+                url: None,
+            }) => match key.code {
                 KeyCode::Esc => {}
-                KeyCode::Enter => match text.trim().split_once(' ') {
-                    Some((name, url)) if !url.trim().is_empty() => {
-                        self.git_preview(GitOp::RemoteAdd(name.to_string(), url.trim().to_string()))
-                    }
-                    _ => {
-                        self.message = Some("type NAME URL".into());
-                        self.dialog = Some(Dialog::RemoteAdd(text));
-                    }
-                },
+                KeyCode::Enter if name.is_empty() => {
+                    self.message = Some("type a name for the remote".into());
+                    self.dialog = Some(Dialog::RemoteAdd { name, url: None });
+                }
+                KeyCode::Enter => {
+                    self.dialog = Some(Dialog::RemoteAdd {
+                        name,
+                        url: Some(String::new()),
+                    })
+                }
                 KeyCode::Backspace => {
-                    text.pop();
-                    self.dialog = Some(Dialog::RemoteAdd(text));
+                    name.pop();
+                    self.dialog = Some(Dialog::RemoteAdd { name, url: None });
+                }
+                KeyCode::Char(c) if !c.is_whitespace() => {
+                    name.push(c);
+                    self.dialog = Some(Dialog::RemoteAdd { name, url: None });
+                }
+                _ => self.dialog = Some(Dialog::RemoteAdd { name, url: None }),
+            },
+            Some(Dialog::RemoteAdd {
+                name,
+                url: Some(mut url),
+            }) => match key.code {
+                KeyCode::Esc => {}
+                KeyCode::Enter if url.trim().is_empty() => {
+                    self.message = Some(format!("type the URL of {name}"));
+                    self.dialog = Some(Dialog::RemoteAdd {
+                        name,
+                        url: Some(url),
+                    });
+                }
+                KeyCode::Enter => self.git_preview(GitOp::RemoteAdd(name, url.trim().to_string())),
+                KeyCode::Backspace => {
+                    url.pop();
+                    self.dialog = Some(Dialog::RemoteAdd {
+                        name,
+                        url: Some(url),
+                    });
                 }
                 KeyCode::Char(c) => {
-                    text.push(c);
-                    self.dialog = Some(Dialog::RemoteAdd(text));
+                    url.push(c);
+                    self.dialog = Some(Dialog::RemoteAdd {
+                        name,
+                        url: Some(url),
+                    });
                 }
-                _ => self.dialog = Some(Dialog::RemoteAdd(text)),
+                _ => {
+                    self.dialog = Some(Dialog::RemoteAdd {
+                        name,
+                        url: Some(url),
+                    })
+                }
             },
             Some(Dialog::GitConfirm { op, preview, guard }) => match key.code {
                 KeyCode::Char('y') => self.request_action(ActionReq::Git(op, guard)),
@@ -1740,7 +1781,16 @@ impl App {
                     }
                 }
                 KeyCode::Char('n') if self.git_tab == 2 => {
-                    self.dialog = Some(Dialog::RemoteAdd(String::new()))
+                    // The first remote is almost always `origin`.
+                    let name = if self.remotes.is_empty() {
+                        "origin"
+                    } else {
+                        ""
+                    };
+                    self.dialog = Some(Dialog::RemoteAdd {
+                        name: name.into(),
+                        url: None,
+                    })
                 }
                 KeyCode::Char('d') if self.git_tab == 2 => {
                     if let Some(r) = remote {
