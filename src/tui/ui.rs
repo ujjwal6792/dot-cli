@@ -75,7 +75,10 @@ const HELP: &[(&str, &str)] = &[
         "Branches n Enter d D",
         "create, switch, delete, force delete (y/n)",
     ),
-    ("Remotes n d", "add (NAME URL), remove (preview then y/n)"),
+    (
+        "Remotes n d",
+        "add (name, then URL), remove (preview then y/n)",
+    ),
     ("Stash s Enter d", "push, pop, drop (path preview then y/n)"),
     (
         "H (Files, Changes)",
@@ -929,7 +932,7 @@ fn draw_main(f: &mut Frame, app: &App, area: Rect) {
         let text = if app.git_tab == 1 {
             "Branches: n create · Enter switch · d delete · D force delete.\nHOME never changes; staged overlaps refuse the switch.".into()
         } else if app.git_tab == 2 {
-            let keys = "n add (NAME URL) · d remove; preview then y/n.\nPublic remotes are refused; unverifiable hosts need your confirmation.";
+            let keys = "n add (name, then URL) · d remove; preview then y/n.\nPublic remotes are refused; unverifiable hosts need your confirmation.";
             app.remotes
                 .get(app.git_selected)
                 .map_or(keys.to_string(), |r| {
@@ -1188,11 +1191,22 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
                 Line::from("Enter preview · Esc cancel"),
             ],
         ),
-        Dialog::RemoteAdd(text) => (
-            " New remote ",
+        Dialog::RemoteAdd { name, url: None } => (
+            " New remote: name ",
             vec![
-                Line::from(format!("{text}█")),
-                Line::from("NAME URL · Enter preview · Esc cancel"),
+                Line::from(format!("Name: {name}█")),
+                Line::from("Enter next · Esc cancel"),
+            ],
+        ),
+        Dialog::RemoteAdd {
+            name,
+            url: Some(url),
+        } => (
+            " New remote: URL ",
+            vec![
+                Line::from(format!("Name: {name}")),
+                Line::from(format!("URL:  {url}█")),
+                Line::from("Enter preview · Esc cancel"),
             ],
         ),
         Dialog::GitConfirm { preview, .. } => {
