@@ -220,18 +220,31 @@ pub fn walk_folder(
     cancel: Option<&CancelToken>,
 ) -> Result<Walk> {
     let mut w = Walk::default();
-    walk_into(home, rel, rules, cancel, &mut w)?;
+    walk_into(home, rel, rules, cancel, &mut w, &mut |_| false)?;
     w.files.sort_by(|a, b| a.path.cmp(&b.path));
     Ok(w)
 }
 
+/// Whether any file [`walk_folder`] would list below `rel` satisfies `hit`;
+/// the walk stops at the first one.
+pub fn any_file(
+    home: &Path,
+    rel: &str,
+    rules: &HideRules,
+    hit: &mut dyn FnMut(&str) -> bool,
+) -> Result<bool> {
+    walk_into(home, rel, rules, None, &mut Walk::default(), hit)
+}
+
+/// Returns true when `stop` returned true for a file (the walk ends there).
 fn walk_into(
     home: &Path,
     rel: &str,
     rules: &HideRules,
     cancel: Option<&CancelToken>,
     w: &mut Walk,
-) -> Result<()> {
+    stop: &mut dyn FnMut(&str) -> bool,
+) -> Result<bool> {
     if cancel.is_some_and(CancelToken::is_cancelled) {
         bail!("cancelled");
     }
@@ -253,12 +266,15 @@ fn walk_into(
         } else if ft.is_dir() {
             if name == ".git" || crate::assign::validate_target_path(&child).is_err() {
                 w.skipped += 1;
-            } else {
-                walk_into(home, &child, rules, cancel, w)?;
+            } else if walk_into(home, &child, rules, cancel, w, stop)? {
+                return Ok(true);
             }
         } else if (ft.is_file() || ft.is_symlink())
             && crate::assign::validate_target_path(&child).is_ok()
         {
+            if stop(&child) {
+                return Ok(true);
+            }
             w.files.push(TrackFile {
                 path: child,
                 symlink: ft.is_symlink(),
@@ -267,7 +283,7 @@ fn walk_into(
             w.skipped += 1;
         }
     }
-    Ok(())
+    Ok(false)
 }
 
 /// Untracked, unhidden files inside tracked folders: the New changes.
@@ -768,11 +784,8 @@ fn prepare_track(store: &Store, ctx: &Ctx, hp: &HomePath) -> Result<TrackPrep> {
     let meta = fs::symlink_metadata(&hp.abs)
         .map_err(|_| refuse(format!("~/{} does not exist", hp.rel)))?;
     let is_dir = meta.is_dir();
-    if let Some(why) = ctx.rules.why_hidden(&hp.abs, is_dir) {
-        return Err(refuse(format!(
-            "~/{} is hidden and cannot be tracked: {why} (see `dw hide`)",
-            hp.rel
-        )));
+    if let Some(why) = ctx.rules.track_refusal(&hp.abs, &hp.rel, is_dir) {
+        return Err(refuse(why));
     }
     let mut notes = Vec::new();
     let (folder, record_folder, mut files, mut summary) = if is_dir {

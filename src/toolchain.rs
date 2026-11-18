@@ -31,21 +31,25 @@ impl Toolchain {
     }
 
     /// Find libexec: `$DOTWARDEN_LIBEXEC`, then `<exe>/../libexec` (bundle),
-    /// then the source checkout's git-ignored `libexec/` (development builds).
+    /// then the source checkout's git-ignored `libexec/` (debug builds, and
+    /// release builds run from inside the checkout, e.g. `target/release/dw`).
     pub fn resolve(env: &Env) -> Result<Self> {
         let mut tried = Vec::new();
         let mut candidates: Vec<PathBuf> = Vec::new();
         if let Some(v) = env.get(std::ffi::OsStr::new(LIBEXEC_ENV)) {
             candidates.push(PathBuf::from(v));
         }
+        let checkout = Path::new(env!("CARGO_MANIFEST_DIR"));
+        let mut in_checkout = cfg!(debug_assertions);
         if let Ok(exe) = std::env::current_exe() {
             let exe = exe.canonicalize().unwrap_or(exe);
+            in_checkout |= exe.starts_with(checkout);
             if let Some(prefix) = exe.parent().and_then(Path::parent) {
                 candidates.push(prefix.join("libexec"));
             }
         }
-        if cfg!(debug_assertions) {
-            candidates.push(Path::new(env!("CARGO_MANIFEST_DIR")).join("libexec"));
+        if in_checkout {
+            candidates.push(checkout.join("libexec"));
         }
         for c in candidates {
             let t = Self::at(&c);

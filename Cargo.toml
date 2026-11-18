@@ -39,3 +39,13 @@ toml_edit = "0.25.17"
 tempfile = "3.27.0"
 clap_complete = "4.6.11"
 clap_mangen = "0.3.3"
+
+# The vault passphrase KDF is unusably slow unoptimised (a minute per unlock in tests).
+[profile.dev.package.scrypt]
+opt-level = 3
+[profile.dev.package.salsa20]
+opt-level = 3
+[profile.dev.package.pbkdf2]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3

@@ -292,3 +292,51 @@ fn the_tui_commit_box_starts_with_the_import_line() {
         other => panic!("no commit box: {other:?}"),
     }
 }
+
+#[test]
+fn with_an_unlocked_vault_import_moves_secrets_to_it() {
+    let (mut t, bare, _) = old_setup();
+    t.set("DOTWARDEN_TEST_NEW_PASSPHRASE", "correct horse battery");
+    t.dw_ok(&["vault", "init"]);
+    t.set("DOTWARDEN_TEST_PASSPHRASE", "correct horse battery");
+    t.dw_ok(&["vault", "unlock"]);
+    let r = dw(
+        &t,
+        &[
+            "import",
+            "--bare",
+            bare.to_str().unwrap(),
+            "--apply",
+            "--json",
+        ],
+    );
+    assert_eq!(r.code, 0, "{}{}", r.out, r.err);
+    let v: serde_json::Value = serde_json::from_str(&r.out).unwrap();
+    let skipped = v["skipped"].to_string();
+    assert!(!skipped.contains("hosts.yml"), "{skipped}");
+    t.dw_ok(&["commit", "-m", "import"]);
+    let tracked = t.dw_ok(&["ls", ".config/gh"]);
+    assert!(
+        tracked
+            .lines()
+            .any(|l| l.starts_with("tracked") && l.ends_with("hosts.yml")),
+        "{tracked}"
+    );
+    let repo = t.dirs().repo();
+    assert!(
+        !all_bytes(&repo).contains(TOKEN),
+        "the token is in the repository"
+    );
+    assert!(
+        fs::read_to_string(t.home.join(".config/gh/hosts.yml"))
+            .unwrap()
+            .contains(TOKEN),
+        "HOME keeps the token"
+    );
+    assert!(
+        t.dw_json(&["status"])["changes"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}

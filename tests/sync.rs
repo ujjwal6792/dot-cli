@@ -336,6 +336,16 @@ fn tui_s_shows_the_plan_and_y_syncs() {
     };
     assert_eq!(plan.stage, ["~/.zshrc"]);
     assert_eq!(plan.push_commits, 1);
+    // HOME changes while the dialog is open: y shows the new plan instead.
+    let before = head(&a);
+    write(&a, ".vimrc", "v2\n");
+    press(&mut app, 'y');
+    settle(&mut app);
+    let Some(Dialog::Sync(plan)) = &app.dialog else {
+        panic!("no new plan: {:?}", app.message);
+    };
+    assert_eq!(plan.stage, ["~/.vimrc", "~/.zshrc"]);
+    assert_eq!(head(&a), before, "nothing ran");
     press(&mut app, 'y');
     settle(&mut app);
     assert!(app.dialog.is_none(), "{:?}", app.dialog);
@@ -343,5 +353,86 @@ fn tui_s_shows_the_plan_and_y_syncs() {
     assert!(
         a.git(&repo(&a), &["log", "-1", "--format=%s"])
             .starts_with("sync from alpha")
+    );
+}
+
+/// Run dw on a pseudo-terminal (stdin, stdout and stderr), with `input` typed ahead.
+fn dw_tty(t: &TestEnv, args: &[&str], input: &str) -> (bool, String) {
+    use std::io::{Read, Write};
+    use std::os::fd::{FromRawFd, OwnedFd};
+    use std::process::{Command, Stdio};
+    let (mut m, mut s) = (0, 0);
+    let none = std::ptr::null_mut();
+    let r = unsafe {
+        libc::openpty(
+            &mut m,
+            &mut s,
+            none,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    };
+    assert_eq!(r, 0);
+    let mut master = unsafe { fs::File::from_raw_fd(m) };
+    let slave = unsafe { OwnedFd::from_raw_fd(s) };
+    let mut child = Command::new(env!("CARGO_BIN_EXE_dotwarden"))
+        .args(args)
+        .env_clear()
+        .envs(&t.env)
+        .current_dir(&t.home)
+        .stdin(Stdio::from(slave.try_clone().unwrap()))
+        .stdout(Stdio::from(slave.try_clone().unwrap()))
+        .stderr(Stdio::from(slave))
+        .spawn()
+        .unwrap();
+    master.write_all(input.as_bytes()).unwrap();
+    let mut reader = master.try_clone().unwrap();
+    let out = std::thread::spawn(move || {
+        let (mut buf, mut chunk) = (Vec::new(), [0u8; 4096]);
+        while let Ok(n @ 1..) = reader.read(&mut chunk) {
+            buf.extend_from_slice(&chunk[..n]);
+        }
+        String::from_utf8_lossy(&buf).into_owned()
+    });
+    let ok = child.wait().unwrap().success();
+    drop(master);
+    (ok, out.join().unwrap())
+}
+
+#[test]
+fn in_a_terminal_sync_shows_the_plan_and_asks_first() {
+    let (a, remote) = machine_a();
+    write(&a, ".zshrc", "z2\n");
+    let before = head(&a);
+    let (ok, out) = dw_tty(&a, &["sync"], "n\n");
+    assert!(
+        !ok && out.contains("~/.zshrc") && out.contains("Proceed? [Y/n]"),
+        "{out}"
+    );
+    assert_eq!(head(&a), before, "n changes nothing after the pull");
+
+    let (ok, out) = dw_tty(&a, &["sync"], "\n");
+    assert!(ok, "{out}");
+    assert_ne!(head(&a), before);
+    assert_eq!(
+        head(&a),
+        a.git(&remote, &["rev-parse", "main"]),
+        "Enter means yes"
+    );
+}
+
+#[test]
+fn sync_e_writes_the_message_in_the_editor() {
+    let (mut a, _remote) = machine_a();
+    let editor = a.root.path().join("editor.sh");
+    fs::write(&editor, "#!/bin/sh\nprintf 'from the editor\\n' > \"$1\"\n").unwrap();
+    fs::set_permissions(&editor, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    a.set("EDITOR", &editor);
+    write(&a, ".zshrc", "z2\n");
+    let (ok, out) = dw_tty(&a, &["sync", "-e"], "y\n");
+    assert!(ok, "{out}");
+    assert_eq!(
+        a.git(&repo(&a), &["log", "-1", "--format=%s"]),
+        "from the editor"
     );
 }

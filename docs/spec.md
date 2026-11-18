@@ -77,6 +77,12 @@ Machine-local (never committed):
 | `$XDG_STATE_HOME/dotwarden/machine.toml` | This machine's registry name and remote-privacy confirmations |
 | `~/.config/dotwarden/config.toml` | Preferences: an ordinary, trackable dotfile |
 
+Clarified in T24: when `XDG_DATA_HOME` moves the repository away from
+`~/.local/share/dotwarden/repo` and a repository exists there (typically a
+wrapper such as an agent sandbox set XDG for its own tools), commands that need
+a repository, `status` and `doctor` name it and how to use it, and `init`,
+`clone` and archive import refuse to create a second one.
+
 Every chezmoi invocation passes explicit `--config`, `--source`,
 `--persistent-state`, `--cache` and `--destination`, and an environment with
 `CHEZMOI_*` variables removed, so a user's own chezmoi installation is neither read
@@ -453,7 +459,7 @@ Actions:
 - **Apply** incoming changes: per file or all; snapshot before overwriting. When
   the HOME file being replaced was never written by dotwarden on this machine
   (typically the first apply after `clone`), apply still overwrites it, and the
-  output (and `--dry-run` up front) lists every such file under "replaced
+  output (and `--dry-run` and the TUI apply prompt up front) lists every such file under "replaced
   existing files" with the snapshot id and `dw snapshot restore` to undo.
 - **Conflicts**: 3-way view (last applied / HOME / incoming) with per-hunk
   local/incoming choice; `e` opens `$EDITOR` (nvim diff mode when the editor is
@@ -467,9 +473,14 @@ Actions:
   HOME) under "skipped"; it exits 1 only when nothing was added. The same rule
   holds for `import` (§5a) and for staging in `sync` (§6a).
 - Symlinks are tracked as symlinks.
+- **Modes**: chezmoi stores whether a file is executable, private or read-only,
+  not its exact mode. A HOME file with the stored content whose mode differs only
+  in bits chezmoi cannot store (0744 stored as 0755) is no change (T24).
 - **Hide rules** (`hide`, shared, gitignore syntax) remove noise from the browser
   and refuse tracking. Sensible defaults (caches, histories, `node_modules`,
   `Library` except explicitly un-hidden paths, …) are written at repo creation.
+  Refusing a path hidden by a rule names the rule and the `dw hide add '!/…'`
+  command that un-hides exactly that path.
   A running TUI reloads them when `hide` changes (from `i` or `dw hide`).
 
 ### 5a. Import (ADR 0008)
@@ -550,7 +561,8 @@ prints `run dw push to share this machine with the others` (exit 0).
 
 **Pending pushes are satisfied by a push.** A successful push removes the pending
 push items it satisfied (same branch, the remote it pushed to, or all remotes when
-the item named none) and says so.
+the item named none) and says so. Likewise a human adding a remote directly
+removes pending requests to add the same remote (name and URL) (T24).
 
 **HTTPS remotes** work through the user's own credential helpers from the global
 git config (for example the one `gh auth setup-git` writes), passed through as in
@@ -603,7 +615,9 @@ The exit code is the first stopping step's (§9), else 0.
 
 The plan in a terminal and in the TUI is made after step 1 (a fast-forward pull
 changes no HOME file), so it lists exactly what will be applied and staged;
-declining leaves the pull in place. `--remote` names the remote for both the
+declining leaves the pull in place. After `y` the plan is made again (without
+another pull); if HOME or the repository changed meanwhile, the new plan is shown
+and asked again instead of running (T24). `--remote` names the remote for both the
 pull and the push. Diverged history exits 1. Incoming files without a Local edit
 are applied before a conflict or locked vault stops sync.
 

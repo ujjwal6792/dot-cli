@@ -67,6 +67,19 @@ fn a_committed_untouched_machine_has_no_changes() {
 }
 
 #[test]
+fn a_mode_chezmoi_cannot_store_is_no_change_but_dropping_the_exec_bit_is() {
+    let t = setup();
+    write(&t, ".x", "#!/bin/sh\n");
+    let x = t.home.join(".x");
+    fs::set_permissions(&x, fs::Permissions::from_mode(0o744)).unwrap();
+    t.dw_ok(&["track", ".x", "--apply"]);
+    t.dw_ok(&["commit", "-m", "x"]);
+    assert!(changes(&t).is_empty(), "{:?}", changes(&t));
+    fs::set_permissions(&x, fs::Permissions::from_mode(0o644)).unwrap();
+    assert_eq!(changes(&t), [".x:local:modified"]);
+}
+
+#[test]
 fn edits_deletions_mode_and_symlink_changes_are_local() {
     let t = setup();
     write(&t, ".c", "c\n");

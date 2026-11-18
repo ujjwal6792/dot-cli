@@ -191,7 +191,7 @@ Agreed order after T13. Each milestone ends with the full suite green.
 
 1. **Backup workflow**: T16, T17, T18, T23. Then the **dogfooding gate**: the owner
    imports their bare repository and uses `dw sync` daily for 1–2 weeks; problems
-   found become tickets before step 4.
+   found become tickets before step 4 (round 1: T24).
 2. **TUI**: T19, T20, T21.
 3. **Settings**: T14.
 4. **Release**: T22, T15.
@@ -269,6 +269,31 @@ Acceptance: with a helper script in an isolated global config, `git credential
 fill` through dotwarden's git calls it and the probe command does not.
 
 Blocked by T16.
+
+## T24: Dogfooding round 1 and backup-workflow gaps
+
+Found importing the owner's `mac-configs` bare repository (2026-11-18), plus the
+open gaps of the T16–T18 reports. Spec §3, §5, §5a, §6, §6a.
+
+- A release build run from the checkout (`target/release/dw`) finds the
+  checkout's `libexec/` like a debug build does.
+- Refusing a hidden path names the `dw hide add '!/…'` command that un-hides it
+  (track and import); import skipped three `~/Library` configs with only "hidden".
+- A file whose mode chezmoi cannot store (0744, stored as 0755) is no change
+  right after tracking; it showed as Incoming and sync chmodded it.
+- `XDG_DATA_HOME` set by a wrapper (opencode) pointed dotwarden at an empty
+  location: name the existing default repository and refuse to create a second.
+- A human adding a remote directly removes the agent's pending request for the
+  same remote (it was left stale).
+- TUI remote add asks for the name, then the URL (done on
+  `fix/tui-remote-add-steps`).
+- Gaps: the TUI apply prompt lists replaced existing files up front (T16); a
+  sync plan that changed after it was shown is shown again instead of run, in the
+  terminal and the TUI (T17); the `Proceed?` prompt and `-e` are tested on a pty
+  (T17); import with an unlocked vault is tested (T18); folder grouping stops
+  walking at the first unlisted file (T18).
+
+Acceptance: one test per bullet where it can fail; the full suite stays green.
 
 ## T19: Onboarding
 

@@ -17,9 +17,11 @@ use crate::track::{self, Ctx, ItemResult, Outcome, Plan};
 
 pub fn require_initialised(store: &Store) -> Result<()> {
     if !store.is_initialised() {
-        return Err(
-            DwError::usage("not initialised; run `dw init` or `dw clone <url>` first").into(),
-        );
+        return Err(DwError::usage(match store.dirs.repo_elsewhere() {
+            Some(why) => format!("not initialised here: {why}"),
+            None => "not initialised; run `dw init` or `dw clone <url>` first".into(),
+        })
+        .into());
     }
     Ok(())
 }
@@ -1167,15 +1169,19 @@ pub fn remote_add(
     require_initialised(store)?;
     let item = remote::plan_add_item(store, name, url, &pending::requester(store))?;
     gated(store, item, yes, dry_run, json, || {
-        let _lock = store.lock()?;
+        let lock = store.lock()?;
         let warning = remote::add_locked(store, name, url, Some(&remote::ask_tty))?;
+        let removed = remote::forget_added(store, &lock, name, url);
         if json {
-            print_json(&json!({"added": name, "url": url, "warning": warning}))?;
+            print_json(
+                &json!({"added": name, "url": url, "warning": warning, "pending_removed": removed}),
+            )?;
         } else {
             println!("Added remote {name} ({url})");
             if let Some(w) = warning {
                 println!("warning: {w}");
             }
+            removed.iter().for_each(|l| println!("{l}"));
         }
         Ok(ExitCode::SUCCESS)
     })
@@ -1740,13 +1746,16 @@ pub fn sync_cmd(
         return Err(DwError::usage("-e needs a terminal; pass -m MESSAGE instead").into());
     }
     let pulled = sync::pull(store, &opts)?;
-    let plan = sync::plan(store, &opts, Some(pulled), push)?;
+    let mut plan = sync::plan(store, &opts, Some(pulled), push)?;
     if !json {
         plan.lines().iter().for_each(|l| println!("{l}"));
     }
-    // A known stop with nothing to apply first needs no question: it stops at once.
-    let work = !plan.apply.is_empty() || (plan.stop.is_none() && !plan.is_empty());
-    if tty && !yes && !agent && work {
+    loop {
+        // A known stop with nothing to apply first needs no question: it stops at once.
+        let work = !plan.apply.is_empty() || (plan.stop.is_none() && !plan.is_empty());
+        if !tty || yes || agent || !work {
+            break;
+        }
         print!("Proceed? [Y/n] ");
         std::io::stdout().flush()?;
         let mut line = String::new();
@@ -1755,6 +1764,14 @@ pub fn sync_cmd(
             return Err(anyhow::anyhow!(
                 "cancelled; nothing was changed after the pull"
             ));
+        }
+        match sync::changed_since(store, &opts, &plan, push)? {
+            None => break,
+            Some(now) => {
+                println!("\nHOME changed since this plan was made; the plan is now:");
+                now.lines().iter().for_each(|l| println!("{l}"));
+                plan = now;
+            }
         }
     }
     let done = sync::run(store, &opts, &plan, push, tty);

@@ -82,6 +82,9 @@ pub fn require_empty_repo_location(store: &Store) -> Result<()> {
             repo.display()
         );
     }
+    if let Some(why) = store.dirs.repo_elsewhere() {
+        bail!("refusing to create a second repository: {why}");
+    }
     Ok(())
 }
 

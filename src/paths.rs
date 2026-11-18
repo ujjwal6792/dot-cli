@@ -56,6 +56,21 @@ impl Dirs {
     pub fn repo(&self) -> PathBuf {
         self.data_dir().join("repo")
     }
+    /// When `XDG_DATA_HOME` moves the repository away from its default location
+    /// and a repository exists there, why that one is not used. Wrappers such as
+    /// agent sandboxes often set XDG variables for their own tools.
+    pub fn repo_elsewhere(&self) -> Option<String> {
+        let default = self.home.join(".local/share/dotwarden/repo");
+        if default == self.repo() || !default.join("dotwarden.toml").is_file() {
+            return None;
+        }
+        Some(format!(
+            "a repository exists at ~/.local/share/dotwarden/repo, but XDG_DATA_HOME points \
+             dotwarden at {}; to use it, run dotwarden with XDG_DATA_HOME and XDG_STATE_HOME \
+             unset (`env -u XDG_DATA_HOME -u XDG_STATE_HOME dw …`)",
+            self.data.display()
+        ))
+    }
     /// Generated chezmoi configuration.
     pub fn chezmoi_config(&self) -> PathBuf {
         self.data_dir().join("chezmoi.toml")
