@@ -186,11 +186,8 @@ fn sort_out(store: &Store, ctx: &Ctx, listed: &[String]) -> (BTreeSet<String>, V
             skipped.push(skip(format!("~/{} does not exist", hp.rel)));
             continue;
         };
-        if let Some(why) = ctx.rules.why_hidden(&hp.abs, meta.is_dir()) {
-            skipped.push(skip(format!(
-                "~/{} is hidden and cannot be tracked: {why} (see `dw hide`)",
-                hp.rel
-            )));
+        if let Some(why) = ctx.rules.track_refusal(&hp.abs, &hp.rel, meta.is_dir()) {
+            skipped.push(skip(why));
         } else if meta.is_dir() {
             match track::walk_folder(home, &hp.rel, &ctx.rules, None) {
                 Ok(w) => files.extend(w.files.into_iter().map(|f| f.path)),
@@ -239,8 +236,8 @@ fn group(home: &Path, ctx: &Ctx, listed: &BTreeSet<String>) -> Grouping {
     let mut memo: HashMap<String, bool> = HashMap::new();
     let mut complete = |d: &str| -> bool {
         *memo.entry(d.to_string()).or_insert_with(|| {
-            track::walk_folder(home, d, &ctx.rules, None)
-                .is_ok_and(|w| w.files.iter().all(|f| listed.contains(&f.path)))
+            track::any_file(home, d, &ctx.rules, &mut |f| !listed.contains(f))
+                .is_ok_and(|unlisted| !unlisted)
         })
     };
     let mut out = Grouping::default();

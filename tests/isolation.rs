@@ -139,3 +139,22 @@ fn a_fresh_home_gets_no_chezmoi_directories() {
             .exists()
     );
 }
+
+#[test]
+fn a_wrapper_moving_xdg_data_is_pointed_at_the_existing_repository() {
+    let mut t = TestEnv::new();
+    t.dw_ok(&["init", "--name", "testbox"]);
+    let elsewhere = t.root.path().join("wrapper");
+    t.set("XDG_DATA_HOME", elsewhere.join("share"));
+    t.set("XDG_STATE_HOME", elsewhere.join("state"));
+    for args in [&["status"][..], &["init", "--name", "other"]] {
+        let o = t.dw(args);
+        let err = String::from_utf8_lossy(&o.stderr);
+        assert!(!o.status.success(), "dw {args:?} succeeded");
+        assert!(
+            err.contains("~/.local/share/dotwarden/repo") && err.contains("XDG_DATA_HOME"),
+            "dw {args:?}: {err}"
+        );
+    }
+    assert!(!elsewhere.join("share/dotwarden/repo").exists());
+}

@@ -83,6 +83,21 @@ impl HideRules {
         })
     }
 
+    /// Why `path` (HOME-relative `rel`) cannot be tracked, with the `dw hide add`
+    /// command that un-hides it when a hide rule (not dotwarden itself) hides it.
+    pub fn track_refusal(&self, path: &Path, rel: &str, is_dir: bool) -> Option<String> {
+        let why = self.why_hidden(path, is_dir)?;
+        let fix = if self.always_hidden.iter().any(|h| path.starts_with(h)) {
+            "see `dw hide`".to_string()
+        } else {
+            let rule = format!("!{}", pattern_for_path(rel, is_dir)).replace('\'', r"'\''");
+            format!("to track it, un-hide it with `dw hide add '{rule}'`")
+        };
+        Some(format!(
+            "~/{rel} is hidden and cannot be tracked: {why}; {fix}"
+        ))
+    }
+
     /// Always hide these absolute paths and everything below them.
     pub fn always_hide(mut self, paths: impl IntoIterator<Item = PathBuf>) -> Self {
         self.always_hidden.extend(paths);
@@ -303,6 +318,23 @@ mod tests {
                 .unwrap()
                 .contains("own directories")
         );
+    }
+
+    #[test]
+    fn the_suggested_hide_rule_un_hides_the_refused_path() {
+        let d = tempfile::tempdir().unwrap();
+        let root = d.path();
+        let rel = "Library/LaunchAgents/com.me.agent's.plist";
+        std::fs::create_dir_all(root.join("Library/LaunchAgents")).unwrap();
+        std::fs::write(root.join(rel), "x").unwrap();
+        let r = HideRules::defaults(root).unwrap();
+        let why = r.track_refusal(&root.join(rel), rel, false).unwrap();
+        let quoted = why.split("dw hide add ").nth(1).unwrap().trim_matches('`');
+        let rule = quoted[1..quoted.len() - 1].replace(r"'\''", "'");
+        let text = format!("{}\n{rule}\n", DEFAULT_RULES);
+        let r = HideRules::parse(root, &text).unwrap();
+        assert!(!r.is_hidden(&root.join(rel), false), "{rule}");
+        assert!(r.is_hidden(&root.join("Library/LaunchAgents/other.plist"), false));
     }
 
     fn rules(text: &str) -> HideRules {

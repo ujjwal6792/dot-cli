@@ -456,8 +456,12 @@ pub enum Dialog {
     Commit(CommitBox),
     /// `d` in Changes: y/n before overwriting these HOME paths.
     ConfirmDiscard(Vec<String>),
-    /// Enter / Space / `a` on the Incoming tab: y/n before writing to HOME.
-    ConfirmApply(Option<Vec<String>>),
+    /// Enter / Space / `a` on the Incoming tab: y/n before writing to HOME,
+    /// listing the existing files it replaces that dotwarden never wrote here.
+    ConfirmApply {
+        sel: Option<Vec<String>>,
+        replaced: Vec<String>,
+    },
     /// `P`: y/n before pushing.
     ConfirmPush,
     /// `S`: the sync plan (spec §6a); y runs it.
@@ -786,6 +790,10 @@ impl App {
                 }
                 Err(e) => self.message = Some(e),
             },
+            Payload::ApplyPreview { sel, replaced } => match replaced {
+                Ok(replaced) => self.dialog = Some(Dialog::ConfirmApply { sel, replaced }),
+                Err(e) => self.message = Some(e),
+            },
             Payload::Commits(r) => match r {
                 Ok(commits) => {
                     let open = self
@@ -1073,10 +1081,10 @@ impl App {
                 KeyCode::Esc | KeyCode::Char('n') => {}
                 _ => self.dialog = Some(Dialog::ConfirmDiscard(paths)),
             },
-            Some(Dialog::ConfirmApply(sel)) => match key.code {
+            Some(Dialog::ConfirmApply { sel, replaced }) => match key.code {
                 KeyCode::Char('y') => self.request_action(ActionReq::ApplyIncoming(sel)),
                 KeyCode::Esc | KeyCode::Char('n') => {}
-                _ => self.dialog = Some(Dialog::ConfirmApply(sel)),
+                _ => self.dialog = Some(Dialog::ConfirmApply { sel, replaced }),
             },
             Some(Dialog::Sync(plan)) => match key.code {
                 KeyCode::Char('y') => self.request_action(ActionReq::Sync(plan)),
@@ -1415,7 +1423,7 @@ impl App {
             }
             KeyCode::Enter if tab == 2 => {
                 if let Some(c) = selected {
-                    self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path])));
+                    self.apply_preview(Some(vec![c.path]));
                 }
             }
             KeyCode::Enter if tab == 3 => {
@@ -1440,14 +1448,14 @@ impl App {
                     self.message = Some("repository files are unstaged together: press a".into())
                 }
                 (1, Some(c)) => self.request_action(ActionReq::Unstage(Some(vec![c.path]))),
-                (2, Some(c)) => self.dialog = Some(Dialog::ConfirmApply(Some(vec![c.path]))),
+                (2, Some(c)) => self.apply_preview(Some(vec![c.path])),
                 (3, Some(_)) => self.message = Some(CONFLICT_BLOCKED.into()),
                 _ => {}
             },
             KeyCode::Char('a') => match tab {
                 0 => self.request_action(ActionReq::Stage(None)),
                 1 => self.request_action(ActionReq::Unstage(None)),
-                2 if rows > 0 => self.dialog = Some(Dialog::ConfirmApply(None)),
+                2 if rows > 0 => self.apply_preview(None),
                 2 => {}
                 _ => self.message = Some(CONFLICT_BLOCKED.into()),
             },
@@ -1841,6 +1849,16 @@ impl App {
             KeyCode::Char('l') | KeyCode::Right => self.focus = self.focus.shifted(1),
             _ => {}
         }
+    }
+
+    fn apply_preview(&mut self, sel: Option<Vec<String>>) {
+        let store = Arc::clone(&self.store);
+        self.jobs.spawn("apply-preview", move |_| {
+            let replaced = changes::apply_incoming(&store, sel.as_deref(), true)
+                .map(|a| a.replaced_existing)
+                .map_err(|e| format!("{e:#}"));
+            Payload::ApplyPreview { sel, replaced }
+        });
     }
 
     fn git_preview(&mut self, op: GitOp) {
@@ -2494,15 +2512,21 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
                         pending::add(store, &lock, vec![item], &track::stale_checker(store, &ctx))?;
                         return Ok(report("Queued for human approval".into()));
                     }
-                    let _lock = store.lock()?;
+                    let lock = store.lock()?;
                     return Ok(report(match &op {
                         GitOp::RemoteAdd(name, url) => {
                             // The y on the preview is the human confirming an unverifiable host.
-                            match crate::remote::add_locked(store, name, url, Some(&|_| Ok(true)))?
-                            {
+                            let w =
+                                crate::remote::add_locked(store, name, url, Some(&|_| Ok(true)))?;
+                            let mut text = match w {
                                 Some(w) => format!("Added remote {name}; {w}"),
                                 None => format!("Added remote {name}"),
+                            };
+                            for line in crate::remote::forget_added(store, &lock, name, url) {
+                                text.push_str("; ");
+                                text.push_str(&line);
                             }
+                            text
                         }
                         GitOp::RemoteRemove(name) => {
                             crate::remote::remove_locked(store, name)?;
@@ -2873,6 +2897,14 @@ fn run_action(store: &Store, req: ActionReq) -> anyhow::Result<ActionReport> {
         }
         ActionReq::Sync(plan) => {
             let opts = crate::sync::Opts::default();
+            if let Some(now) =
+                crate::sync::changed_since(store, &opts, &plan, crate::sync::PushMode::Run)?
+            {
+                return Ok(ActionReport {
+                    sync_plan: Some(Box::new(now)),
+                    ..report("HOME changed since the plan was shown: review the new plan".into())
+                });
+            }
             let done = crate::sync::run(store, &opts, &plan, crate::sync::PushMode::Run, false);
             let lines = done.lines();
             if let Some(stop) = &done.stop {

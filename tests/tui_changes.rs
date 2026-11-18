@@ -460,7 +460,7 @@ fn incoming_files_are_applied_after_a_y_n_prompt_with_a_snapshot() {
         "{screen}"
     );
     tui.press(' ');
-    assert!(matches!(tui.app.dialog, Some(Dialog::ConfirmApply(_))));
+    assert!(matches!(tui.app.dialog, Some(Dialog::ConfirmApply { .. })));
     tui.press('n');
     assert_eq!(tui.changes(), [".a:incoming"]);
     assert_eq!(fs::read_to_string(tui.t.home.join(".a")).unwrap(), "one\n");
@@ -475,6 +475,28 @@ fn incoming_files_are_applied_after_a_y_n_prompt_with_a_snapshot() {
     assert_eq!(
         tui.t.dw_json(&["snapshot", "list", ".a"])[0]["reason"],
         "apply"
+    );
+}
+
+#[test]
+fn the_apply_prompt_names_existing_files_dotwarden_never_wrote() {
+    let t = edited();
+    t.dw_ok(&["discard", ".a", "--yes"]);
+    write(&t, ".n", "mine\n");
+    let repo = t.dirs().repo();
+    fs::write(repo.join("home/dot_a"), "remote\n").unwrap();
+    fs::write(repo.join("home/dot_n"), "theirs\n").unwrap();
+    t.git(&repo, &["add", "-A"]);
+    t.git(&repo, &["commit", "-qm", "from elsewhere"]);
+    let mut tui = open(t);
+    tui.press(']');
+    tui.press(']');
+    tui.press('a');
+    let screen = tui.screen();
+    assert!(screen.contains("never wrote here"), "{screen}");
+    assert!(
+        screen.contains("~/.n") && !screen.contains("  ~/.a"),
+        "{screen}"
     );
 }
 

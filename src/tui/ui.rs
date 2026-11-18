@@ -1169,21 +1169,36 @@ fn draw_dialog(f: &mut Frame, dialog: &Dialog, area: Rect) {
             ));
             (if b.amend { " Amend " } else { " Commit " }, l)
         }
-        Dialog::ConfirmApply(sel) => (
-            " Apply ",
-            vec![
+        Dialog::ConfirmApply { sel, replaced } => {
+            let mut l = vec![
                 Line::from(match sel {
                     Some(p) if p.len() == 1 => format!("Write ~/{} to HOME?", p[0]),
                     Some(p) => format!("Write {} files to HOME?", p.len()),
                     None => "Write every incoming file to HOME?".to_string(),
                 }),
                 Line::from("A snapshot is taken first."),
-                Line::styled(
-                    "y applies · n / Esc cancels",
+            ];
+            if !replaced.is_empty() {
+                l.push(Line::styled(
+                    "Replaces existing files dotwarden never wrote here:",
                     Style::default().fg(Color::Yellow),
-                ),
-            ],
-        ),
+                ));
+                l.extend(
+                    replaced
+                        .iter()
+                        .take(8)
+                        .map(|p| Line::from(format!("  ~/{p}"))),
+                );
+                if replaced.len() > 8 {
+                    l.push(Line::from(format!("  … and {} more", replaced.len() - 8)));
+                }
+            }
+            l.push(Line::styled(
+                "y applies · n / Esc cancels",
+                Style::default().fg(Color::Yellow),
+            ));
+            (" Apply ", l)
+        }
         Dialog::GitCreate(name) => (
             " New branch ",
             vec![

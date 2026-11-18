@@ -147,11 +147,18 @@ pub fn run(store: &Store) -> Report {
     }
 
     if !store.is_initialised() {
-        checks.push(check(
-            "repository state",
-            true,
-            "not initialised (run `dw init` or `dw clone <url>`)",
-        ));
+        checks.push(match store.dirs.repo_elsewhere() {
+            Some(why) => check(
+                "repository state",
+                false,
+                format!("not initialised here: {why}"),
+            ),
+            None => check(
+                "repository state",
+                true,
+                "not initialised (run `dw init` or `dw clone <url>`)",
+            ),
+        });
     } else {
         match status::collect(store, None) {
             Ok(s) => {

@@ -501,6 +501,18 @@ fn apply_stop(conflicts: &[String], locked: &[String]) -> Option<anyhow::Error> 
 
 /// Run steps 2–5 (step 1 ran before the plan). `interactive` allows the
 /// editor for `-e`.
+/// The plan made again (after the same pull), when HOME or the repository changed
+/// since `shown` was made, so what runs is what was confirmed.
+pub fn changed_since(
+    store: &Store,
+    opts: &Opts,
+    shown: &Plan,
+    push: PushMode,
+) -> Result<Option<Plan>> {
+    let now = plan(store, opts, Some(shown.pull.clone()), push)?;
+    Ok((now.lines() != shown.lines()).then_some(now))
+}
+
 pub fn run(store: &Store, opts: &Opts, plan: &Plan, push: PushMode, interactive: bool) -> Done {
     let mut done = Done::default();
     if let Some(stop) = &plan.stop

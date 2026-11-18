@@ -250,7 +250,7 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
 
     for (rel, t) in &targets {
         let (c1, c2) = columns.get(rel).copied().unwrap_or((' ', ' '));
-        if c2 == ' ' {
+        if c2 == ' ' || differs_only_in_unstorable_mode(&home.join(rel), t) {
             continue;
         }
         let missing = fs::symlink_metadata(home.join(rel)).is_err();
@@ -293,6 +293,18 @@ pub fn scan(store: &Store, ctx: &Ctx) -> Result<Scan> {
         locked,
         targets,
     })
+}
+
+/// Whether the HOME file has the target's content and differs only in mode bits
+/// chezmoi cannot store: it keeps executable, private and read-only, so a 0744
+/// file is stored (and written) as 0755. Re-adding it would store the same thing.
+fn differs_only_in_unstorable_mode(path: &Path, t: &Target) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    let attrs = |m: u32| (m & 0o100 != 0, m & 0o077 == 0, m & 0o200 == 0);
+    !t.link
+        && fs::symlink_metadata(path)
+            .is_ok_and(|m| m.is_file() && attrs(m.permissions().mode()) == attrs(t.perm as u32))
+        && fs::read(path).is_ok_and(|b| b == t.text.as_bytes())
 }
 
 /// The tracked path a repository file stands for: a source file, or a variant

@@ -230,8 +230,16 @@ fn an_unverifiable_host_needs_a_human_confirmation_stored_per_url() {
     );
 
     dotwarden::remote::confirm_private(&t.store(), url).unwrap();
-    t.dw_ok(&["remote", "add", "origin", url, "--yes"]);
+    let out = t.dw_ok(&["remote", "add", "origin", url, "--yes"]);
     assert_eq!(remotes(&t), ["origin"]);
+    // The queued request for the same remote is done now, not left stale.
+    assert!(out.contains("removed pending #1"), "{out}");
+    assert!(
+        t.dw_json(&["pending", "list"])["items"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
     // Another repository on the same host is not covered, and the machine name survived.
     let other = dw(
         &t,

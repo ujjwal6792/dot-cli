@@ -1130,6 +1130,30 @@ pub fn drop_satisfied(
     crate::pending::drop_items(store, lock, &ids)
 }
 
+/// Remove pending requests to add exactly this remote, now that a human added
+/// it directly; the lines say what was removed. The caller holds the lock.
+pub fn forget_added(store: &Store, lock: &crate::lock::Lock, name: &str, url: &str) -> Vec<String> {
+    let ids: Vec<u64> = match crate::pending::load(store) {
+        Ok(list) => list
+            .items
+            .iter()
+            .filter(|i| matches!(&i.action, Action::RemoteAdd { name: n, url: u } if n == name && u == url))
+            .filter_map(|i| i.id)
+            .collect(),
+        Err(e) => return vec![format!("could not read the pending list: {e:#}")],
+    };
+    if ids.is_empty() {
+        return Vec::new();
+    }
+    match crate::pending::drop_items(store, lock, &ids) {
+        Ok(items) => items
+            .iter()
+            .map(|i| format!("removed pending {}: {} (done)", i.label(), i.summary))
+            .collect(),
+        Err(e) => vec![format!("could not remove the pending request: {e:#}")],
+    }
+}
+
 /// Take the lock and [`drop_satisfied`] for finished pushes; the lines say what was removed.
 pub fn forget_satisfied(store: &Store, pushed: &[Pushed]) -> Vec<String> {
     let Some(first) = pushed.first() else {

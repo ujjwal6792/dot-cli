@@ -97,6 +97,11 @@ pub enum Payload {
         op: super::app::GitOp,
         preview: Result<(String, String), String>,
     },
+    /// The files an apply would replace that dotwarden never wrote here.
+    ApplyPreview {
+        sel: Option<Vec<String>>,
+        replaced: Result<Vec<String>, String>,
+    },
     Commits(Result<Vec<crate::history::Commit>, String>),
     /// The files of one commit (hash first), for the Git panel drill-in.
     CommitFiles(String, Result<Vec<(String, String)>, String>),

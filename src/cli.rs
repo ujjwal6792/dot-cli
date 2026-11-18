@@ -1184,6 +1184,9 @@ fn run(cli: Cli) -> Result<ExitCode> {
             dry_run,
         } => cmd_clone(&store, &url, name, adopt, dry_run, json)?,
         Command::Status => {
+            if store.dirs.repo_elsewhere().is_some() {
+                cmds::require_initialised(&store)?;
+            }
             let s = status::collect(&store, None)?;
             if json {
                 println!("{}", serde_json::to_string_pretty(&s)?);
@@ -1595,12 +1598,7 @@ fn run(cli: Cli) -> Result<ExitCode> {
             return cmds::skill_cmd(install.as_deref(), force, json);
         }
         Command::Tui => {
-            if !store.is_initialised() {
-                return Err(DwError::usage(
-                    "not initialised; run `dw init` or `dw clone <url>` first",
-                )
-                .into());
-            }
+            cmds::require_initialised(&store)?;
             tui::run(store)?;
         }
     }
