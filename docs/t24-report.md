@@ -33,10 +33,7 @@
   setting is still honoured when no default repository exists.
 - Re-plan compares the rendered plan lines, i.e. exactly what was shown.
 
-## Spec
-
-Clarifications added to §3 (XDG), §5 (modes, hide refusal, apply prompt),
-§6 (remote add clears its request), §6a (re-plan after `y`). No deviations.
+Spec: clarifications in §3, §5, §6, §6a; no deviations.
 
 ## Tests
 
